@@ -285,11 +285,40 @@ input:focus-visible,
   flex: none;
 }
 .row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
   font-family: var(--mono);
   font-size: 12.5px;
   color: var(--ink-mute);
   margin-top: 2px;
   letter-spacing: .03em;
+}
+.row-meta-text { min-width: 0; overflow-wrap: anywhere; }
+.channel-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  letter-spacing: 0;
+  white-space: nowrap;
+  color: var(--ink-dim);
+  background: var(--bg-2);
+}
+.channel-zai {
+  color: #96c4f5;
+  border-color: rgba(109, 168, 232, .38);
+  background: rgba(109, 168, 232, .08);
+}
+.channel-bigmodel {
+  color: var(--amber);
+  border-color: rgba(232, 163, 61, .38);
+  background: rgba(232, 163, 61, .08);
 }
 
 .row-actions {

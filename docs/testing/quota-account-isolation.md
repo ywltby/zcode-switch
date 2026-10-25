@@ -24,12 +24,13 @@
 | `npm ci` | 通过；停止本次测试遗留的 Vite 进程后恢复依赖 |
 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` | beta.3 修复后 49 通过，0 失败（初次实现为 47 项） |
 | `npm test` | 6 通过，0 失败 |
-| `npm run check:i18n` | 中英文各 212 个键，通过 |
+| `npm run check:i18n` | 中英文各 215 个键，通过（beta.4 增加 3 个渠道标签键） |
 | `npm run build` | Vite 构建通过 |
 | `cargo build --manifest-path src-tauri/Cargo.toml` | Windows debug 构建通过，CLI 已运行 |
 | `npm run tauri build -- --debug --no-bundle` | 独立 Windows 程序构建通过，包含前端资源；未生成或运行安装器 |
 | `npm run dist`（1.7.0-beta.2） | Windows release 构建及 NSIS 安装包通过，另产出便携版和 SHA-256 校验文件 |
 | `npm run dist`（1.7.0-beta.3） | 修正安装包及便携版通过，内嵌版本和发布版隔离 CLI 检查通过，已生成 SHA-256 |
+| `npm run dist`（1.7.0-beta.4） | 渠道标识版安装包及便携版通过，版本号和隔离 CLI 检查通过，已生成 SHA-256 |
 | `git diff --check` | 通过；仅有已有换行配置的 LF/CRLF 提示 |
 
 独立程序：`src-tauri/target/debug/zcode-switch.exe`。Tauri 构建保留了现有 bundle identifier 以 `.app` 结尾的 macOS 建议提示；本轮未改动该配置。该构建的原生界面尚未完成真实账号验收，不应直接作为已验证发布包。
@@ -80,6 +81,10 @@ CI 已增加 Node 22 的依赖安装、Node 测试、i18n 与前端构建，保�
 修复后 11 份副本重测：10 个 `complete`，1 个 `partial/network_error`，没有 `project_key_missing`；原存储、live 文件、副本的内容及文件集合不变，临时凭据已删除。脱敏结果保存在忽略目录 `src-tauri/target/quota-live-summary-beta3-fix.json`。有有效 Coding Plan 的分支由人工回归固定验证，真实接口的网络失败不视为通过。
 
 对该网络错误账号单独复查一次仍超时，未继续自动重试；保留已确认的 Start Plan。beta.3 安装包约 3.22 MiB，便携版约 13.50 MiB；未运行安装器或改动当前安装。
+
+## beta.4：账号渠道展示
+
+账号资料行增加常驻渠道徽标：`z.ai · 国际` 与 `bigmodel.cn · 国内`。直接使用后端提供的账号身份渠道，未知值显示“渠道未知”，重命名期间仍保留标识。既有浏览器回归、6 项 Node 测试和双语文案检查通过；已查看两种渠道的页面截图，以及 520px 窄窗口截图，无横向溢出。
 
 ## 后续验收边界
 

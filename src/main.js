@@ -57,6 +57,13 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
+function channelBadge(provider) {
+  const family = provider === "zai" || provider === "bigmodel" ? provider : "unknown";
+  const label = family === "zai" ? t("m.channelZai")
+    : family === "bigmodel" ? t("m.channelBigmodel") : t("m.channelUnknown");
+  return `<span class="channel-badge channel-${family}">${esc(label)}</span>`;
+}
+
 async function refresh() {
   const sequence = ++stateSequence;
   const next = await invoke("get_state");
@@ -794,7 +801,7 @@ function render() {
         <div class="row-main">
           <input class="rename-input" value="${esc(a.name)}" maxlength="40"
             keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
-          <div class="row-meta">${t("btn.renameMeta")}</div>
+          <div class="row-meta">${channelBadge(a.identity?.provider)}<span class="row-meta-text">${t("btn.renameMeta")}</span></div>
         </div>
         <div class="row-actions">
           <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
@@ -817,7 +824,7 @@ function render() {
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
           <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
-          <div class="row-meta">${meta}</div>
+          <div class="row-meta">${channelBadge(a.identity?.provider)}${meta ? `<span class="row-meta-text">${meta}</span>` : ""}</div>
         </div>
         <div class="row-actions">
           <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
