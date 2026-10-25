@@ -3,13 +3,16 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { createQuotaState, syncQuotaAccounts, beginQuotaRequest, settleQuotaRequest } from "./quota-state.js";
 
 const $app = document.getElementById("app");
 let state = null;
 let renaming = null;
 let busy = false;
 let appVer = "";
-let acctQuota = {};
+let quotaState = createQuotaState();
+let acctQuota = quotaState.entries;
+let stateSequence = 0;
 let claimable = {};
 let claimAllRunning = false;
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
@@ -55,8 +58,40 @@ function idLabel(id) {
 }
 
 async function refresh() {
-  state = await invoke("get_state");
+  const sequence = ++stateSequence;
+  const next = await invoke("get_state");
+  if (sequence === stateSequence) applyState(next);
+}
+
+function setQuotaState(next) {
+  quotaState = next;
+  acctQuota = next.entries;
+}
+
+function applyState(next) {
+  for (const account of next?.accounts || []) {
+    if (acctQuota[account.id]?.revision !== account.quota_revision) pokeAccount(account.id);
+  }
+  state = next;
   if (state?.language) init(state.language);
+  setQuotaState(syncQuotaAccounts(quotaState, state?.accounts || []));
+  enrollAccounts();
+}
+
+function invalidateQuotaFor(id) {
+  ++stateSequence;
+  const entries = { ...quotaState.entries };
+  delete entries[id];
+  setQuotaState({ ...quotaState, entries });
+}
+
+function quotaErrorMessage(code) {
+  const key = `q.error.${code}`;
+  return has(key) ? t(key) : t("q.refreshFailed");
+}
+
+function quotaErrors(data) {
+  return [...new Set((data.errors || []).map(e => quotaErrorMessage(e.code)))].join(" · ");
 }
 
 function uiLocked() {
@@ -76,15 +111,18 @@ async function guard(fn) {
 }
 
 async function loadAcctQuota(id) {
-  const cur = acctQuota[id] || {};
-  if (cur.busy) return;
-  acctQuota[id] = { busy: true };
+  const pending = beginQuotaRequest(quotaState, id);
+  if (!pending.ticket) return;
+  const ticket = pending.ticket;
+  setQuotaState(pending.model);
   if (!uiLocked()) render();
   try {
-    const data = await invoke("get_account_quota", { id });
-    acctQuota[id] = { data, err: null, busy: false };
+    const data = await invoke("get_account_quota", { id, revision: ticket.revision });
+    if (data.account_id !== id || data.revision !== ticket.revision) throw new Error("scope_changed");
+    const error = data.completion === "unavailable" ? quotaErrors(data) || t("q.refreshFailed") : null;
+    setQuotaState(settleQuotaRequest(quotaState, ticket, { data, error }));
   } catch (e) {
-    acctQuota[id] = { data: null, err: stripErr(e), busy: false };
+    setQuotaState(settleQuotaRequest(quotaState, ticket, { error: quotaErrorMessage(String(e)) }));
   }
   if (!uiLocked()) render();
 }
@@ -194,6 +232,7 @@ const actions = {
   async doDelete(id) {
     await guard(async () => {
       await invoke("delete_account", { id });
+      invalidateQuotaFor(id);
       toast(t("m.toastDeleted"));
       await refresh(); render();
     });
@@ -243,6 +282,7 @@ const actions = {
   async updateFromLive(id) {
     await guard(async () => {
       const r = await invoke("update_account_from_live", { id });
+      invalidateQuotaFor(id);
       toast(t("m.toastSynced", { name: r.name }), "ok", t("m.toastSyncedDetail"));
       await refresh(); render();
     });
@@ -614,7 +654,7 @@ function tierBadgeFor(id) {
   const plans = q.data.plans || [];
   const pairs = plans.map((p) => [p.tier, p.tier_code]);
   const list = (pairs.length ? pairs : q.data.plan_tier ? [[q.data.plan_tier, null]] : []).slice(0, 2);
-  if (!list.length) return `<span class="tier-b free">Free</span>`;
+  if (!list.length) return q.data.completion === "complete" && q.data.is_empty ? `<span class="tier-b free">Free</span>` : "";
   return list.map(([tier, code]) => tierChipHtml(tier, code)).join("");
 }
 
@@ -649,13 +689,7 @@ function slotRowsHtml(items) {
   const list = items || [];
   const isWin = (it) => itemKind(it) !== "raw";
   const wins = list.filter(isWin);
-  const best = new Map();
-  for (const it of list) {
-    if (isWin(it)) continue;
-    const cur = best.get(it.name);
-    if (!cur || (it.total || 0) > (cur.total || 0)) best.set(it.name, it);
-  }
-  const pools = [...best.values()].sort((a, b) => (b.total || 0) - (a.total || 0));
+  const pools = list.filter(it => !isWin(it)).sort((a, b) => (b.total || 0) - (a.total || 0));
   return [
     ...wins.map((it) => winRowHtml(it, " mini")),
     ...pools.map(balRowHtml),
@@ -680,6 +714,7 @@ function planGroupHtml(p) {
     <div class="pg-head">
       ${p.tier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
+      ${p.scope_label ? `<span class="pg-scope">${esc(p.scope_label)}</span>` : ""}
       ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
     ${slotRowsHtml(p.items)}
@@ -689,26 +724,23 @@ function planGroupHtml(p) {
 function acctQuotaSlot(id) {
   const strip = claimStripHtml(id);
   const q = acctQuota[id];
+  const messages = [];
   let inner = "";
-  if (q?.busy) {
-    inner = `<span class="aq-loading">${t("q.loading")}</span>`;
-  } else if (q?.err) {
-    const msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
-    inner = `<span class="aq-err">${esc(msg)}</span>`;
-  } else if (q?.data) {
+  if (q?.busy) messages.push(`<span class="aq-loading">${t("q.loading")}</span>`);
+  if (q?.data) {
     const plans = q.data.plans || [];
-    if (plans.length >= 2) {
-      inner = plans.map(planGroupHtml).join("");
-    } else {
-      const items = q.data.items || [];
-      const wins = items.filter((it) => itemKind(it) === "prompt_count");
-      if (wins.length) {
-        inner = wins.map((it) => winRowHtml(it, " mini")).join("");
-      } else {
-        inner = slotRowsHtml(items);
-      }
+    inner = plans.length ? plans.map(planGroupHtml).join("") : slotRowsHtml(q.data.items);
+    if (q.data.completion === "complete" && q.data.is_empty) messages.push(`<span class="aq-status">${t("q.noPlan")}</span>`);
+    if (q.data.completion === "partial") {
+      messages.push(`<span class="aq-err">${esc(t("q.partial"))} · ${esc(quotaErrors(q.data))}</span>`);
     }
   }
+  if (q?.err) messages.push(`<span class="aq-err" title="${esc(q.err)}">${esc(q.err)}</span>`);
+  if (q?.data?.refreshed_at) {
+    const time = new Date(q.data.refreshed_at).toLocaleString(localeTag());
+    messages.push(`<span class="aq-status">${esc(t(q.err ? "q.staleAt" : "q.updatedAt", { time }))}</span>`);
+  }
+  inner += messages.length ? `<div class="aq-status-list">${messages.join("")}</div>` : "";
   if (!strip && !inner) return `<div class="row-quota-slot"></div>`;
   return `<div class="row-quota-slot">${strip}${inner}</div>`;
 }
@@ -981,7 +1013,7 @@ async function sweepTick() {
     enrollAccounts();
     sweepTick();
     setInterval(() => {
-      invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+      refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);

@@ -12,6 +12,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod tests;
+
+// Protect only snapshot capture / save and cache registration, never network I/O.
+static QUOTA_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn no_window(prog: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
@@ -161,6 +167,7 @@ impl Settings {
 #[derive(Serialize, Clone, Debug)]
 pub struct AccountSummary {
     pub id: String,
+    pub quota_revision: String,
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
@@ -527,10 +534,14 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
 }
 
 pub fn save_account(paths: &Paths, acc: &Account) -> Result<(), String> {
+    let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     paths.ensure_dirs()?;
     let path = paths.accounts_dir().join(format!("{}.json", acc.id));
     let body = serde_json::to_string_pretty(acc).unwrap_or_default() + "\n";
-    atomic_write(&path, &body)
+    atomic_write(&path, &body)?;
+    crate::project_token::service().retain_revision(&acc.id,
+        &crate::quota_auth::quota_revision(acc, &zcrypto::default_secret(&paths.home)));
+    Ok(())
 }
 
 pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -793,24 +804,12 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     }
 }
 
-fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Option<crate::probe::ProbeOutcome> {
+pub(crate) fn run_switch_probe(paths: &Paths, id: &str) -> Option<crate::probe::ProbeOutcome> {
+    let target = read_quota_account(paths, id).ok()?;
     if in_sandbox() || !is_logged_in(&target.credentials) {
         return None;
     }
-    let cfg = probe_config_base(paths, target);
-    crate::probe::switch_probe(
-        &target.credentials,
-        cfg.as_ref(),
-        &zcrypto::default_secret(&paths.home),
-        mid,
-        new_gen_provider_config(&paths.data_root),
-    )
-}
-
-fn probe_config_base(paths: &Paths, target: &Account) -> Option<Value> {
-    if target.config.is_none() { return None; }
-    if new_gen_provider_config(&paths.data_root) { target.config.clone() }
-    else { read_live_config(paths).or_else(|| target.config.clone()) }
+    crate::probe::switch_probe(paths, id)
 }
 
 pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
@@ -868,7 +867,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
         ensure_virtual_arms_uid_locked(paths, &target.id)?;
-        let probe = run_switch_probe(paths, &target, Some(mid));
+        let probe = None;
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -933,7 +932,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         }
     }
 
-    let probe = run_switch_probe(paths, &target, Some(mid));
+    let probe = None;
 
     Ok(SwitchResult {
         switched: true,
@@ -1068,6 +1067,7 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
 }
 
 pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
+    let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(tr("err.store.bad_id"));
     }
@@ -1075,7 +1075,9 @@ pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
     if !path.exists() {
         return Err(tr("err.store.no_account"));
     }
-    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))
+    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))?;
+    crate::project_token::service().invalidate(id);
+    Ok(())
 }
 
 pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -1101,21 +1103,88 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
     Ok(acc)
 }
 
-fn live_quota_config(paths: &Paths) -> Option<Value> {
-    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
+// Quota reads bypass helpers which repair hashes or initialize devices.
+fn read_quota_account(paths: &Paths, id: &str) -> Result<Account, String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(tr("err.store.bad_id"));
+    }
+    let raw = fs::read_to_string(paths.accounts_dir().join(format!("{id}.json")))
+        .map_err(|_| "scope_changed".to_string())?;
+    let account: Account = serde_json::from_str(&raw).map_err(|_| "invalid_response".to_string())?;
+    if account.id != id { return Err("identity_conflict".into()); }
+    Ok(account)
+}
+
+fn read_live_quota_snapshot(paths: &Paths) -> Result<Account, String> {
+    let creds = read_live(paths)?.ok_or_else(|| tr("err.live.no_file"))?;
+    let mid = fs::read_to_string(paths.live_telemetry()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from));
+    Ok(crate::quota_auth::login_snapshot("live", creds, mid))
+}
+
+fn query_snapshot_via(
+    snapshot: Account, secret: &str, version: &str,
+    http: &dyn crate::quota_http::Transport,
+    service: &crate::project_token::TokenService,
+    current: impl Fn() -> Result<Account, String> + Sync,
+) -> Result<quota::QuotaOverview, String> {
+    use crate::quota_auth::{quota_revision, resolve_account_context, QuotaError};
+    let revision = quota_revision(&snapshot, secret);
+    let context = resolve_account_context(&snapshot, secret, version);
+    let is_current = || current().ok().is_some_and(|latest| quota_revision(&latest, secret) == revision);
+    {
+        let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !is_current() { return Err(QuotaError::ScopeChanged.to_string()); }
+        match &context {
+            Ok(ctx) => service.activate(&ctx.scope),
+            Err(_) => service.invalidate(&snapshot.id),
+        }
+    }
+    let result = match context {
+        Ok(ctx) => {
+            let check = || {
+                if !is_current() {
+                    service.invalidate_if_current(&ctx.scope);
+                    return Err(QuotaError::ScopeChanged);
+                }
+                service.assert_current(&ctx.scope)
+            };
+            let guarded = |request| {
+                check()?;
+                let result = http.send(request);
+                check()?;
+                result
+            };
+            let result = quota::query_with_service(&ctx, &guarded, service);
+            check().map_err(|e| e.to_string())?;
+            result
+        },
+        Err(code) => quota::unavailable(&snapshot.id, &revision, code),
+    };
+    if current().ok().is_none_or(|latest| quota_revision(&latest, secret) != revision) {
+        return Err(QuotaError::ScopeChanged.to_string());
+    }
+    Ok(result)
 }
 
 pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
-    let creds = read_live(paths)?.ok_or(tr("err.live.no_file"))?;
-    if !is_logged_in(&creds) {
-        return Err(tr("err.live.quota"));
-    }
-    quota::quota_for_live(&paths.home, &creds, live_quota_config(paths).as_ref())
+    query_snapshot_via(read_live_quota_snapshot(paths)?, &zcrypto::default_secret(&paths.home),
+        &quota::zcode_app_version(), &crate::quota_http::HttpTransport, crate::project_token::service(), || read_live_quota_snapshot(paths))
 }
 
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
-    let acc = load_account(paths, id)?;
-    quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
+    account_quota_revision(paths, id, None)
+}
+
+pub fn account_quota_revision(paths: &Paths, id: &str, expected: Option<&str>) -> Result<quota::QuotaOverview, String> {
+    let snapshot = read_quota_account(paths, id)?;
+    let secret = zcrypto::default_secret(&paths.home);
+    if expected.is_some_and(|revision| crate::quota_auth::quota_revision(&snapshot, &secret) != revision) {
+        return Err("scope_changed".into());
+    }
+    query_snapshot_via(snapshot, &secret, &quota::zcode_app_version(), &crate::quota_http::HttpTransport,
+        crate::project_token::service(), || read_quota_account(paths, id))
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
@@ -1476,7 +1545,14 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
 }
 
 pub fn get_state(paths: &Paths) -> Result<AppState, String> {
-    let accounts = list_accounts(paths)?;
+    let accounts = {
+        let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let accounts = list_accounts(paths)?;
+        let secret = zcrypto::default_secret(&paths.home);
+        let revisions = accounts.iter().map(|a| (a.id.clone(),crate::quota_auth::quota_revision(a,&secret))).collect::<Vec<_>>();
+        crate::project_token::service().reconcile(&revisions);
+        accounts
+    };
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);
     let live_logged_in = live.as_ref().map(is_logged_in).unwrap_or(false);
@@ -1493,6 +1569,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         .iter()
         .map(|a| AccountSummary {
             id: a.id.clone(),
+            quota_revision: crate::quota_auth::quota_revision(a, &zcrypto::default_secret(&paths.home)),
             name: a.name.clone(),
             created_at: a.created_at.clone(),
             updated_at: a.updated_at.clone(),

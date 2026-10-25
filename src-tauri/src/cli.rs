@@ -139,7 +139,8 @@ pub fn run(args: &[String]) -> (String, i32) {
                 settings.hot_switch()
             };
             match switch_to(&paths, &id, force, restart, hot) {
-                Ok(r) => {
+                Ok(mut r) => {
+                    r.probe = run_switch_probe(&paths, &id);
                     if let Some(p) = &r.probe {
                         let msg = crate::probe::probe_message(p);
                         if !msg.is_empty() {

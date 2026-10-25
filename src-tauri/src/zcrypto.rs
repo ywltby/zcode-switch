@@ -135,48 +135,20 @@ impl Identity {
 }
 
 pub fn identity_with_secret(creds: &Value, secret: &str) -> Identity {
-    let mut id = Identity { provider: "bigmodel".into(), ..Default::default() };
-    let map = match creds.as_object() {
-        Some(m) => m,
-        None => return id,
+    let snapshot = crate::quota_auth::login_snapshot("identity", creds.clone(), None);
+    let context = match crate::quota_auth::resolve_account_context(&snapshot, secret, "") {
+        Ok(context) => context,
+        Err(_) => return Identity::default(),
     };
-    if let Some(ap) = map.get("oauth:active_provider").and_then(|v| v.as_str()) {
-        let plain = if is_encrypted(ap) { decrypt_with_secret(ap, secret).ok() } else { Some(ap.to_string()) };
-        if let Some(p) = plain.filter(|p| !p.is_empty()) {
-            id.provider = p;
-        }
+    let provider = context.scope.family.as_str().to_string();
+    let ui = creds.get(format!("oauth:{provider}:user_info")).and_then(Value::as_str)
+        .and_then(|value| decrypt_json_opt(Some(value), secret)).unwrap_or(Value::Null);
+    Identity {
+        provider, user_id: Some(context.scope.zcode_subject),
+        username: ui.get("username").and_then(Value::as_str).map(String::from),
+        display_name: ui.get("displayName").or_else(|| ui.get("name")).and_then(Value::as_str).map(String::from),
+        email: ui.get("email").or_else(|| ui.pointer("/rawProfile/email")).and_then(Value::as_str).map(String::from),
     }
-    let ui_key = format!("oauth:{}:user_info", id.provider);
-    let ui = map
-        .get(ui_key.as_str())
-        .and_then(|v| v.as_str())
-        .and_then(|v| decrypt_json_opt(Some(v), secret));
-    if let Some(ui) = ui {
-        id.username = ui.get("username").and_then(|v| v.as_str()).map(String::from);
-        id.display_name = ui.get("displayName").and_then(|v| v.as_str()).map(String::from);
-        id.email = ui
-            .get("email")
-            .and_then(|v| v.as_str())
-            .or_else(|| ui.get("rawProfile").and_then(|r| r.get("email")).and_then(|v| v.as_str()))
-            .map(String::from);
-        if let Some(uid) = ui.get("id").filter(|v| !v.is_null()) {
-            id.user_id = uid.as_str().map(String::from).or_else(|| serde_json::to_string(uid).ok());
-        }
-    }
-    if id.user_id.is_none() {
-        let at_key = format!("oauth:{}:access_token", id.provider);
-        if let Some(at) = map.get(at_key.as_str()).and_then(|v| v.as_str()) {
-            let plain = if is_encrypted(at) { decrypt_with_secret(at, secret).ok() } else { Some(at.to_string()) };
-            if let Some(jwt) = plain.as_deref().and_then(decode_jwt) {
-                id.user_id = jwt
-                    .get("user_id")
-                    .or_else(|| jwt.get("sub"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-        }
-    }
-    id
 }
 
 pub fn account_identity(creds: &Value, home: &Path) -> Identity {

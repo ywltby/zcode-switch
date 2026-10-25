@@ -1,5 +1,7 @@
 
 use crate::quota;
+#[cfg(test)]
+mod tests;
 use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
@@ -98,18 +100,8 @@ pub fn failure_payload(
     })
 }
 
-fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<String, String> {
-    let jwt = creds
-        .get("zcodejwttoken")
-        .and_then(|v| v.as_str())
-        .and_then(|v| decrypt_credential(v, secret));
-    if let Some(t) = jwt.filter(|t| t.trim().len() > 20) {
-        return Ok(t);
-    }
-    if let Some(t) = quota::zai_billing_token(creds, config, secret) {
-        return Ok(t);
-    }
-    Err(crate::i18n::tr("err.claim.no_jwt"))
+fn claim_token(creds: &Value, _config: Option<&Value>, secret: &str) -> Result<String, String> {
+    crate::quota_auth::strict_zcode_jwt(creds, secret).map_err(|_| crate::i18n::tr("err.claim.no_jwt"))
 }
 
 fn decrypt_credential(v: &str, secret: &str) -> Option<String> {

@@ -1036,3 +1036,6 @@ input:focus-visible,
 .pv-item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .pv-item .pv-arrow { color: var(--ink-mute); font-family: var(--mono); }
 .pv-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+.aq-status-list { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+.aq-status { font-size: 11px; opacity: .7; }
+.pg-scope { font-size: 11px; opacity: .65; overflow-wrap: anywhere; }

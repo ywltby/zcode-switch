@@ -23,9 +23,17 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **No account loss**: the current login is auto-preserved before switching if not yet saved; file writes go through a temp file + atomic rename
 - **Path traversal protection**: account id whitelist (`[A-Za-z0-9-]`); delete/read cannot escape the account store directory
 - **Encrypted export**: PBKDF2-HMAC-SHA256 (100k iterations) + AES-256-GCM, random salt/nonce; wrong password simply fails, no plaintext traces
-- **Credentials decrypted locally only**: decryption is used solely to display username/email; export files are password-encrypted
+- **Credentials decrypted locally**: used to display account details and authenticate that account's official API requests; export files are password-encrypted
 
 ## CLI
+
+### Quota compatibility
+
+Quota queries implement the ZCode 3.16.x login and project-token protocol. Existing snapshots and older `.zsb` bundles remain readable without a bulk migration. Historical provider keys are excluded from quota requests. Missing login, device, or project initialization material produces an explicit status. Full compatibility with the 3.11–3.14 query protocols is not guaranteed.
+
+Queries bind to one account, login revision, and project, using that account's existing device ID. Coding Plan reuses an existing API Key ID and **POSTs to issue a short-lived project token**, held only in memory. Queries do not create organizations, projects, or long-lived API keys, claim plans, or write account, live credential, configuration, or device files. Team projects remain separate; partial failures retain confirmed plans. Responses from changed or deleted logins are discarded.
+
+See the [quota isolation verification record](docs/testing/quota-account-isolation.md) for local and live verification status. Offline tests alone do not establish successful verification of all real accounts.
 
 ```
 zcode-switch.exe --cli state|list

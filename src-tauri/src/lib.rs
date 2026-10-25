@@ -6,8 +6,13 @@ mod flowlog;
 mod oauth;
 mod probe;
 mod quota;
+mod quota_auth;
+mod quota_http;
+mod project_token;
 mod store;
 mod zcrypto;
+#[cfg(test)]
+mod test_support;
 
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -195,22 +200,31 @@ async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account,
 
 #[tauri::command]
 async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Result<SwitchResult, String> {
-    let _guard = store_guard();
-    let paths = Paths::detect();
-    let hot = load_settings(&paths).hot_switch();
-    let r = store::switch_to(&paths, &id, force, restart, hot);
+    let r = tauri::async_runtime::spawn_blocking(move || {
+        let paths = Paths::detect();
+        let mut result = {
+            let _guard = store_guard();
+            let hot = load_settings(&paths).hot_switch();
+            store::switch_to(&paths, &id, force, restart, hot)?
+        };
+        result.probe = store::run_switch_probe(&paths, &id);
+        Ok::<_, String>(result)
+    }).await.map_err(|_| "quota_worker_failed".to_string())?;
     rebuild_tray(&app);
     r
 }
 
 #[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
-    store::live_quota(&Paths::detect())
+    tauri::async_runtime::spawn_blocking(|| store::live_quota(&Paths::detect()))
+        .await.map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[tauri::command]
-async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
-    store::account_quota(&Paths::detect(), &id)
+async fn get_account_quota(id: String, revision: Option<String>) -> Result<quota::QuotaOverview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        store::account_quota_revision(&Paths::detect(), &id, revision.as_deref())
+    }).await.map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[tauri::command]
