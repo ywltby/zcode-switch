@@ -151,7 +151,7 @@ export const en = {
   "q.error.login_required": "Login expired. Update this account's login.",
   "q.error.device_identity_missing": "Device information is missing. Capture or switch to this account again.",
   "q.error.project_unavailable": "The plan project could not be confirmed. Check the plan in ZCode.",
-  "q.error.project_key_missing": "Initialize this plan in ZCode first.",
+  "q.error.project_key_missing": "Coding Plan quota could not be confirmed. Check the plan connection in ZCode.",
   "q.error.token_disabled": "Plan access is disabled. Check the plan in ZCode.",
   "q.error.rate_limited": "Too many requests. Refresh again later.",
   "q.error.network_error": "Network connection failed. Refresh again later.",

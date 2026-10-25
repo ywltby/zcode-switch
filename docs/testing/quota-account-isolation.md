@@ -22,13 +22,14 @@
 | 命令/检查 | 本机结果 |
 | --- | --- |
 | `npm ci` | 通过；停止本次测试遗留的 Vite 进程后恢复依赖 |
-| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 47 通过，0 失败 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | beta.3 修复后 49 通过，0 失败（初次实现为 47 项） |
 | `npm test` | 6 通过，0 失败 |
 | `npm run check:i18n` | 中英文各 212 个键，通过 |
 | `npm run build` | Vite 构建通过 |
 | `cargo build --manifest-path src-tauri/Cargo.toml` | Windows debug 构建通过，CLI 已运行 |
 | `npm run tauri build -- --debug --no-bundle` | 独立 Windows 程序构建通过，包含前端资源；未生成或运行安装器 |
 | `npm run dist`（1.7.0-beta.2） | Windows release 构建及 NSIS 安装包通过，另产出便携版和 SHA-256 校验文件 |
+| `npm run dist`（1.7.0-beta.3） | 修正安装包及便携版通过，内嵌版本和发布版隔离 CLI 检查通过，已生成 SHA-256 |
 | `git diff --check` | 通过；仅有已有换行配置的 LF/CRLF 提示 |
 
 独立程序：`src-tauri/target/debug/zcode-switch.exe`。Tauri 构建保留了现有 bundle identifier 以 `.app` 结尾的 macOS 建议提示；本轮未改动该配置。该构建的原生界面尚未完成真实账号验收，不应直接作为已验证发布包。
@@ -64,17 +65,27 @@ CI 已增加 Node 22 的依赖安装、Node 测试、i18n 与前端构建，保�
 | 03、06、07、08、10、11 | partial | 各 1 | project_key_missing |
 | 09 | partial | 0 | network_error |
 
-合计：3 个查询完整完成，7 个缺少可复用项目 Key，1 个遇到网络错误；6 个部分成功账号仍保留已确认的套餐。`partial` 且 0 个套餐不代表已确认未开通。7 个缺 Key 账号没有自动创建 Key，也没有尝试旧密钥取得替代结果。
+初次返回合计：3 个查询完整完成，7 个返回 `project_key_missing`，1 个遇到网络错误；6 个部分成功账号仍保留已确认的套餐。`partial` 且 0 个套餐不代表已确认未开通。后续排查确认这些缺 Key 错误含有本程序的误判，不能作为服务端确实缺 Key 的证据，见下节。查询没有自动创建 Key，也没有尝试旧密钥取得替代结果。
 
 11 个结果都携带各自匿名账号 ID 和 revision。检查前后对原账号存储、选定 live 文件及副本进行字节摘要和文件集合比较：均未变化。临时凭据目录已删除。脱敏汇总保留在忽略目录 `src-tauri/target/quota-live-summary.json`；一次性运行器同样未纳入提交。
 
 人工传输测试可直接断言每个请求的凭据来源；实际检查没有记录真实请求头，因此不把匿名结果归属检查表述为完整网络流量审计。真实额度的数值准确性仍需官方界面对照。
 
+## beta.3：修复项目 Key 初始化误报
+
+用户反馈无论是否开通 Coding Plan 都会提示初始化。只读 GET 排查发现，对应项目内已有 `zcode-api-key` 和有效 ID，但部分返回 `usageScene=-1`；beta.2 仅允许 `usageScene=1`，错误拒绝已有 Key。官方 `project-access-token-client.ts` 的既有 Key 复用逻辑不检查这个创建用途字段。
+
+新增两组测试，先确认旧代码分别返回 `ProjectKeyMissing` 和错误的 `partial`，再移除这一额外筛选条件。项目发现、账号登录代次、指定 Key 名称和团队 Key 类型校验继续保留，套餐权益仍以订阅接口响应为准。确实缺少 Key 时，提示改为无法确认 Coding Plan 额度，不再断言套餐尚未初始化。
+
+修复后 11 份副本重测：10 个 `complete`，1 个 `partial/network_error`，没有 `project_key_missing`；原存储、live 文件、副本的内容及文件集合不变，临时凭据已删除。脱敏结果保存在忽略目录 `src-tauri/target/quota-live-summary-beta3-fix.json`。有有效 Coding Plan 的分支由人工回归固定验证，真实接口的网络失败不视为通过。
+
+对该网络错误账号单独复查一次仍超时，未继续自动重试；保留已确认的 Start Plan。beta.3 安装包约 3.22 MiB，便携版约 13.50 MiB；未运行安装器或改动当前安装。
+
 ## 后续验收边界
 
 1. 在隔离的客户端环境中，将代表账号及其余账号与 ZCode 3.16.x 官方界面逐项对照套餐、额度、计量窗口与到期时间。本次未改动当前 ZCode 登录状态，未执行此项。
 2. 使用账号副本验证原生 Tauri 窗口与真实后端的刷新、更新、删除及切换。当前已覆盖真实 CLI 后端与浏览器模拟 IPC，二者不能替代这一项。
-3. 缺 Key 的账号应先由用户在 ZCode 中完成对应套餐初始化；网络错误账号需在接口可用时复查。未完成前保持明确错误提示。
+3. 对实际返回的权限或网络错误继续按账号复查，不再根据旧版 `project_key_missing` 结果要求用户初始化套餐。未完成前保持明确错误提示。
 4. 推送后记录 Windows/macOS/Linux CI 的实际结果；本机 Windows 结果不外推为其他平台通过。
 
 不需要迁移或清理真实账号文件。本次额度验收未安装或替换当前 1.6.0；安装包发布记录以 GitHub Releases 为准。

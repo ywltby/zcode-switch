@@ -104,12 +104,35 @@ fn location_team_skips_malformed_matching_keys_before_valid_candidate() {
     let loc = locate_key(&ctx, &project(true), &|_: Request| {
         Ok(json!({"code":0,"data":[
             {"name":"zcode-team-api-key","keyType":2},
-            {"name":"zcode-team-api-key","keyType":2,"apiKey":"wrong-scene","usageScene":2},
+            {"name":"zcode-team-api-key","keyType":2,"apiKey":"   ","usageScene":1},
             {"name":"zcode-team-api-key","keyType":2,"apiKey":"valid-id","usageScene":1}
         ]}))
     })
     .unwrap();
     assert_eq!(loc.api_key_id, "valid-id");
+}
+
+#[test]
+fn location_legacy_key_scene_does_not_reject_existing_scoped_key() {
+    for family in ["zai", "bigmodel"] {
+        for team in [false, true] {
+            for scene in [json!(-1), json!(3), json!(null), json!(1), json!(2)] {
+                let ctx = context("a", family);
+                let loc = locate_key(&ctx, &project(team), &|req: Request| {
+                    assert_eq!(req.method, "GET");
+                    assert!(req.url.starts_with(ctx.scope.family.origin()));
+                    Ok(json!({"code":0,"data":[{
+                        "name": if team { "zcode-team-api-key" } else { "zcode-api-key" },
+                        "keyType": if team { 2 } else { 1 },
+                        "apiKey":"existing-own-id", "usageScene":scene,
+                    }]}))
+                })
+                .unwrap();
+                assert_eq!(loc.api_key_id, "existing-own-id");
+                assert_eq!(loc.project, project(team));
+            }
+        }
+    }
 }
 
 #[test]

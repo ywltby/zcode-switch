@@ -151,7 +151,7 @@ export const zh = {
   "q.error.login_required": "登录已失效，请更新账号登录",
   "q.error.device_identity_missing": "缺少设备信息，请重新捕获或切换此账号",
   "q.error.project_unavailable": "无法确认套餐项目，请在 ZCode 中检查套餐",
-  "q.error.project_key_missing": "套餐尚未初始化，请先在 ZCode 中启用该套餐",
+  "q.error.project_key_missing": "暂时无法确认 Coding Plan 额度，请在 ZCode 中检查套餐连接",
   "q.error.token_disabled": "套餐访问已停用，请在 ZCode 中检查",
   "q.error.rate_limited": "请求过于频繁，请稍后刷新",
   "q.error.network_error": "网络连接失败，请稍后刷新",

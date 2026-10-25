@@ -472,19 +472,19 @@ pub(crate) fn locate_key(
     } else {
         "zcode-api-key"
     };
+    // Match the official existing-key contract. usageScene is a creation field;
+    // existing keys can return legacy sentinels such as -1. It must not decide
+    // whether an account has Coding Plan or whether its scoped key can be reused.
     let key = list
         .iter()
         .find(|key| {
             key.get("name").and_then(Value::as_str) == Some(name)
                 && (!project.team
                     || (key.get("keyType").and_then(Value::as_i64) == Some(2)
-                        && required_string(key, "apiKey").is_ok()
-                        && key.get("usageScene").is_none_or(|v| v.as_i64() == Some(1))))
+                        && required_string(key, "apiKey").is_ok()))
         })
         .ok_or(QuotaError::ProjectKeyMissing)?;
-    if key.get("usageScene").is_some_and(|v| v.as_i64() != Some(1))
-        || (!project.team && key.get("keyType").and_then(Value::as_i64) == Some(2))
-    {
+    if !project.team && key.get("keyType").and_then(Value::as_i64) == Some(2) {
         return Err(QuotaError::ProjectKeyMissing);
     }
     let api_key_id = required_string(key, "apiKey").map_err(|_| QuotaError::ProjectKeyMissing)?;

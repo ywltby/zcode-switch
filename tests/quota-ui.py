@@ -81,7 +81,7 @@ def main():
         expect(row("a")).to_contain_text("Synthetic Coding Pro")
         quota("b")
         expect(row("b")).to_contain_text("部分额度查询未完成")
-        expect(row("b")).to_contain_text("套餐尚未初始化")
+        expect(row("b")).to_contain_text("暂时无法确认 Coding Plan 额度")
         quota("c")
         expect(row("c")).to_contain_text("Synthetic Coding Pro")
         page.screenshot(path=str(output / "partial.png"), full_page=True)
@@ -91,7 +91,7 @@ def main():
         quota("a")
         expect(row("a")).to_contain_text("刷新失败，显示")
         expect(row("a")).to_contain_text("Synthetic Coding Pro")
-        expect(row("b")).to_contain_text("套餐尚未初始化")
+        expect(row("b")).to_contain_text("暂时无法确认 Coding Plan 额度")
 
         # Updating credentials while a request is pending discards the old success.
         page.evaluate("delete quotaFixture.failures['account-a']; quotaFixture.hold['account-a'] = true")

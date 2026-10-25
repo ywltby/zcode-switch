@@ -266,6 +266,38 @@ fn full_query_keeps_two_team_projects_and_uses_scoped_project_tokens() {
 }
 
 #[test]
+fn legacy_key_scene_distinguishes_active_and_absent_coding_plan() {
+    for family in ["zai", "bigmodel"] {
+        for subscribed in [false, true] {
+            let ctx = resolve_account_context(&account("a", family), SECRET, "3.16.3").unwrap();
+            let quota_calls = Mutex::new(0);
+            let result = query_context_via(&ctx, &|req: Request| {
+                let mut response = crate::test_support::quota_response(&req);
+                if req.url.contains("billing/balance") {
+                    response = json!({"code":0,"data":{"plans":[],"balances":[]}});
+                } else if req.url.ends_with("/api_keys") {
+                    for key in response["data"].as_array_mut().unwrap() {
+                        key["usageScene"] = json!(-1);
+                    }
+                } else if req.url.ends_with("querySubscribeDetail") {
+                    response = json!({"code":0,"data":{"hasSubscription":false}});
+                } else if req.url.ends_with("subscription/list") && !subscribed {
+                    response = json!({"code":0,"data":[]});
+                } else if req.url.contains("quota/limit") {
+                    *quota_calls.lock().unwrap() += 1;
+                }
+                Ok(response)
+            });
+            assert_eq!(result.completion, "complete");
+            assert!(result.errors.is_empty());
+            assert_eq!(result.is_empty, !subscribed);
+            assert_eq!(result.plans.len(), usize::from(subscribed));
+            assert_eq!(*quota_calls.lock().unwrap(), usize::from(subscribed));
+        }
+    }
+}
+
+#[test]
 fn full_query_distinguishes_confirmed_empty_from_unknown_subscription() {
     let ctx = resolve_account_context(&account("a", "zai"), SECRET, "3.16.3").unwrap();
     for malformed in [false, true] {
