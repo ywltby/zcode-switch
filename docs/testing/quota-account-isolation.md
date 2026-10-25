@@ -28,9 +28,12 @@
 | `npm run build` | Vite 构建通过 |
 | `cargo build --manifest-path src-tauri/Cargo.toml` | Windows debug 构建通过，CLI 已运行 |
 | `npm run tauri build -- --debug --no-bundle` | 独立 Windows 程序构建通过，包含前端资源；未生成或运行安装器 |
+| `npm run dist`（1.7.0-beta.2） | Windows release 构建及 NSIS 安装包通过，另产出便携版和 SHA-256 校验文件 |
 | `git diff --check` | 通过；仅有已有换行配置的 LF/CRLF 提示 |
 
 独立程序：`src-tauri/target/debug/zcode-switch.exe`。Tauri 构建保留了现有 bundle identifier 以 `.app` 结尾的 macOS 建议提示；本轮未改动该配置。该构建的原生界面尚未完成真实账号验收，不应直接作为已验证发布包。
+
+1.7.0-beta.2 发布产物保存在忽略目录 `release/`：安装包约 3.23 MiB，便携版约 13.52 MiB，两者内嵌版本均为 `1.7.0-beta.2`。发布版 CLI 已用临时 home 中的人工账号验证：正常启动，缺登录材料明确返回 `unavailable/login_required`，账号文件字节及文件集合不变。未运行安装器或替换现有应用。
 
 主要覆盖：混入外账号旧凭据仍只请求自身；同命名空间身份冲突在联网前失败；业务身份与 ZCode 身份不同仍合法；人工加密登录对可解密；坏业务 Token 不阻塞自身 Start JWT；A→B→A 使用各自设备 ID；个人/团队项目选择、平台鉴权格式、既有 Key 选择；两个同平台账号实际并发签发、同范围并发合并、项目隔离；更新/删除期间旧签发失效；过期、禁用、401、429 与网络失败；同产品不同项目/有效期及重复窗口；旧 bundle 导入；查询前后文件字节与集合不变；UI 旧响应拒收。
 
@@ -74,4 +77,4 @@ CI 已增加 Node 22 的依赖安装、Node 测试、i18n 与前端构建，保�
 3. 缺 Key 的账号应先由用户在 ZCode 中完成对应套餐初始化；网络错误账号需在接口可用时复查。未完成前保持明确错误提示。
 4. 推送后记录 Windows/macOS/Linux CI 的实际结果；本机 Windows 结果不外推为其他平台通过。
 
-不需要迁移或清理真实账号文件。安装、替换当前 1.6.0 及版本发布均未执行。
+不需要迁移或清理真实账号文件。本次额度验收未安装或替换当前 1.6.0；安装包发布记录以 GitHub Releases 为准。
