@@ -22,6 +22,7 @@ fn session(claim_id: &str, scope: &str, plan_id: &str) -> ClaimSession {
         created_at: now_ms(),
         updated_at: now_ms(),
         phase: ClaimPhase::Preparing,
+        submitted: false,
         replaces: None,
         material: ClaimMaterial {
             credentials: json!({"zcodejwttoken": "synthetic-secret-token"}),
@@ -222,6 +223,70 @@ fn a_definite_outcome_clears_the_unknown_it_replaced() {
     assert!(!registry.blocks("zai:one", "p1"));
     assert!(registry.status("old").is_none(), "the superseded unknown is gone");
     assert_eq!(registry.status("new").unwrap().status, "succeeded");
+}
+
+#[test]
+fn a_pre_submit_failure_keeps_the_unknown_it_replaced() {
+    let mut registry = ClaimRegistry::load(temp_file());
+    verifying(&mut registry, "old", "zai:one", "p1");
+    registry.begin_submit("old").unwrap();
+    registry.finish("old", ClaimPhase::Unknown, None);
+    assert!(registry.allow_manual_retry("old"));
+    let replaced = match registry.gate("manual", "zai:one", "p1") {
+        StartGate::Allowed(replaced) => replaced,
+        _ => panic!("explicit retry should be permitted"),
+    };
+    let mut retry = session("retry", "zai:one", "p1");
+    retry.replaces = replaced;
+    registry.try_start(retry).unwrap();
+    // Preview/network failure before begin_submit: the original POST is still unknown.
+    assert!(registry.finish("retry", ClaimPhase::Failed, None));
+    assert!(
+        registry.blocks("zai:one", "p1"),
+        "a failed preview cannot establish the old POST outcome"
+    );
+    assert_eq!(registry.gate("auto", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(registry.status("old").unwrap().status, "unknown");
+}
+
+#[test]
+fn a_post_submit_rejection_does_supersede_the_replaced_unknown() {
+    let mut registry = ClaimRegistry::load(temp_file());
+    verifying(&mut registry, "old", "zai:one", "p1");
+    registry.begin_submit("old").unwrap();
+    registry.finish("old", ClaimPhase::Unknown, None);
+    assert!(registry.allow_manual_retry("old"));
+    let replaced = match registry.gate("manual", "zai:one", "p1") {
+        StartGate::Allowed(replaced) => replaced,
+        _ => panic!("explicit retry should be permitted"),
+    };
+    let mut retry = session("retry", "zai:one", "p1");
+    retry.replaces = replaced;
+    registry.try_start(retry).unwrap();
+    assert!(registry.mark_verifying("retry"));
+    registry.begin_submit("retry").unwrap();
+    registry.finish("retry", ClaimPhase::Failed, Some(json!({"code": 1005})));
+    assert!(!registry.blocks("zai:one", "p1"));
+    assert!(registry.status("old").is_none(), "the rejected retry is the new outcome");
+}
+
+#[test]
+fn identity_scope_matches_a_uniquely_inferred_provider() {
+    let explicit = crate::test_support::account("review", "zai");
+    let mut inferred = explicit.credentials.clone();
+    inferred
+        .as_object_mut()
+        .unwrap()
+        .remove("oauth:active_provider");
+    assert!(
+        crate::quota_auth::strict_zcode_jwt(&inferred, SECRET).is_ok(),
+        "the claim path infers the channel from unique credentials"
+    );
+    assert_eq!(
+        identity_scope(&explicit.credentials, SECRET),
+        identity_scope(&inferred, SECRET),
+        "the same validated account must retain its unconfirmed-claim scope"
+    );
 }
 
 #[test]

@@ -379,6 +379,7 @@ async fn claim_start(
         created_at: now,
         updated_at: now,
         phase: claim_session::ClaimPhase::Preparing,
+        submitted: false,
         replaces: None,
         material: claim_session::ClaimMaterial {
             credentials: snapshot.account.credentials.clone(),
@@ -432,12 +433,19 @@ async fn claim_start(
         }
     };
     let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
-    {
+    let verifying = {
         let mut registry = claim_registry_guard();
-        if let Some(registry) = registry.as_mut() {
-            registry.update_plan_name(&claim_id, &display);
-            registry.mark_verifying(&claim_id);
+        match registry.as_mut() {
+            Some(registry) => {
+                registry.update_plan_name(&claim_id, &display);
+                registry.mark_verifying(&claim_id)
+            }
+            None => false,
         }
+    };
+    if !verifying {
+        // The session was cancelled while preparing: never open a window for it.
+        return Err(i18n::tr("err.claim.cancelled"));
     }
     if let Err(error) = open_captcha_window(&app, &claim_id, is_auto) {
         finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);

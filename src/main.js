@@ -235,6 +235,8 @@ async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, ret
       await refresh();
       return performClaim(id, plan, { mode, timeoutMs, retried: true });
     }
+    // The backend may still hold an unknown claim; never let local state drift.
+    await syncUnknownClaims();
     const error = stripErr(e);
     toast(t("m.claimAccountErr", { name: account.name, err: error }), "err");
     return { status: "failed", error };
@@ -259,6 +261,18 @@ async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, ret
   });
 }
 
+async function syncUnknownClaims() {
+  try {
+    const result = await invoke("claim_sessions");
+    const next = new Map();
+    for (const session of result?.sessions || []) {
+      if (session?.status === "unknown") next.set(session.claimId, session);
+    }
+    claimUnknown = next;
+    if (result?.recovery) claimRecovery = result.recovery;
+  } catch { }
+}
+
 async function recoverClaimSessions() {
   try {
     const result = await invoke("claim_sessions");
@@ -266,9 +280,10 @@ async function recoverClaimSessions() {
     if (claimRecovery.ok === false) {
       toast(t("m.claimRecoveryPaused"), "err", t("m.claimRecoveryPausedDetail"));
     }
+    const next = new Map();
     for (const session of result?.sessions || []) {
       if (session?.status === "unknown") {
-        claimUnknown.set(session.claimId, session);
+        next.set(session.claimId, session);
         continue;
       }
       if (session?.status === "submitting") {
@@ -287,6 +302,7 @@ async function recoverClaimSessions() {
           .then(() => { if (!uiLocked()) render(); });
       }
     }
+    claimUnknown = next;
   } catch {
     claimRecovery = { ok: true };
   }

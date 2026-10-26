@@ -75,6 +75,8 @@ pub struct ClaimSession {
     pub created_at: i64,
     pub updated_at: i64,
     pub phase: ClaimPhase,
+    /// True once the submission marker was persisted and the POST may have run.
+    pub submitted: bool,
     /// Unknown claim this session explicitly replaces after a manual acknowledgement.
     pub replaces: Option<String>,
     pub material: ClaimMaterial,
@@ -333,11 +335,13 @@ impl ClaimRegistry {
         };
         if let Some(session) = self.active.as_mut() {
             session.phase = ClaimPhase::Submitting;
+            session.submitted = true;
             session.updated_at = now_ms();
         }
         if self.persist().is_err() {
             if let Some(session) = self.active.as_mut() {
                 session.phase = ClaimPhase::Verifying;
+                session.submitted = false;
             }
             return Err(SubmitError::PersistFailed);
         }
@@ -353,12 +357,15 @@ impl ClaimRegistry {
             return false;
         }
         let replaced = active.replaces.clone();
+        // Only a definite result of an attempt that actually sent the POST may
+        // supersede the unresolved record it replaced.
+        let supersedes = phase == ClaimPhase::Succeeded
+            || (phase == ClaimPhase::Failed && active.submitted);
         let mut summary = active.summary();
         summary.status = phase.as_str().to_string();
         summary.result = result;
         summary.updated_at = now_ms();
-        if matches!(phase, ClaimPhase::Succeeded | ClaimPhase::Failed) {
-            // A definite outcome supersedes the unknown attempt it replaced.
+        if supersedes {
             if let Some(old) = replaced {
                 self.unknown.retain(|record| record.claim_id != old);
             }
@@ -548,27 +555,37 @@ pub fn attempts_path(store_dir: &Path) -> PathBuf {
     store_dir.join("claim-attempts.json")
 }
 
-/// Channel + validated ZCode subject digest. Deliberately independent of the
-/// mutable access token so a credential refresh cannot unblock an unresolved claim.
+/// Channel + validated ZCode subject digest. Uses the same validated context as
+/// authentication, so a provider inferred from unique credentials and one written
+/// explicitly produce the same scope. Deliberately independent of the mutable
+/// access token so a credential refresh cannot unblock an unresolved claim.
 pub fn identity_scope(credentials: &Value, secret: &str) -> String {
     use sha2::{Digest, Sha256};
-    let family = credentials
-        .get("oauth:active_provider")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let subject = crate::quota_auth::strict_zcode_jwt(credentials, secret)
-        .ok()
-        .and_then(|token| crate::zcrypto::decode_jwt(&token))
-        .and_then(|payload| {
-            ["id", "user_id", "sub"]
-                .iter()
-                .find_map(|key| payload.get(*key).and_then(crate::quota_auth::normalized_id))
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    format!(
-        "{:x}",
-        Sha256::digest(format!("{family}:{subject}").as_bytes())
-    )
+    let snapshot = crate::quota_auth::login_snapshot("claim", credentials.clone(), None);
+    let material = match crate::quota_auth::resolve_account_context(&snapshot, secret, "") {
+        Ok(context) => format!(
+            "{}:{}",
+            context.scope.family.as_str(),
+            context.scope.zcode_subject
+        ),
+        Err(_) => {
+            let family = credentials
+                .get("oauth:active_provider")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let subject = crate::quota_auth::strict_zcode_jwt(credentials, secret)
+                .ok()
+                .and_then(|token| crate::zcrypto::decode_jwt(&token))
+                .and_then(|payload| {
+                    ["id", "user_id", "sub"]
+                        .iter()
+                        .find_map(|key| payload.get(*key).and_then(crate::quota_auth::normalized_id))
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{family}:{subject}")
+        }
+    };
+    format!("{:x}", Sha256::digest(material.as_bytes()))
 }
 
 #[cfg(test)]
