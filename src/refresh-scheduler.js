@@ -17,6 +17,7 @@ const quotaKey = (ticket) => JSON.stringify(["quota", ticket.id, ticket.revision
 
 export function createQuotaScheduler({
   invoke,
+  queue: sharedQueue = null,
   now = () => Date.now(),
   random = () => Math.random(),
   limit = 3,
@@ -26,7 +27,7 @@ export function createQuotaScheduler({
   errorText = (error) => String(error),
   onChange = () => {},
 }) {
-  const queue = createRequestQueue(limit);
+  const queue = sharedQueue || createRequestQueue(limit);
   let model = createQuotaState();
   const due = new Map();
   const stamps = new Map();

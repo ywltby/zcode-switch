@@ -26,7 +26,7 @@ export function quotaPayload(id, revision, overrides = {}) {
 
 const tick = () => new Promise(setImmediate);
 
-export function createHarness({ accounts = [], limit = 3, now } = {}) {
+export function createHarness({ accounts = [], limit = 3, queue, now } = {}) {
   const clock = { value: 0 };
   const control = {
     accounts: accounts.map((a) => ({ ...a })),
@@ -64,6 +64,7 @@ export function createHarness({ accounts = [], limit = 3, now } = {}) {
 
   const scheduler = createQuotaScheduler({
     invoke,
+    queue,
     now: now || (() => clock.value),
     limit,
     periodMs: PERIOD,

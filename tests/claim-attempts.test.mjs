@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   ATTEMPT_TTL_MS,
+  cancelAttempt,
   closeWaiter,
   createClaimAttempts,
   finishWaiter,
@@ -113,6 +114,21 @@ test("closing a waiter twice is harmless and does not discard the attempt", asyn
   assert.equal(await waiter, null);
   assert.equal(model.attempts.has("c1"), true);
   assert.equal(settleAttempt(model, "c1", payload()).status, "accepted");
+});
+
+test("a backend cancellation ends its own attempt without a claim outcome", async () => {
+  const model = base();
+  register(model);
+  const waiter = waitForAttempt(model, "c1", { timeoutMs: 1000 });
+  const result = cancelAttempt(model, "c1");
+  assert.equal(result.status, "accepted");
+  assert.equal(result.refresh, true, "the cancelled account row still matches");
+  finishWaiter(model, "c1", result.payload);
+  const cancelled = await waiter;
+  assert.equal(cancelled.cancelled, true);
+  assert.equal(cancelled.ok, false);
+  assert.equal(settleAttempt(model, "c1", payload("c1")).status, "duplicate");
+  assert.equal(cancelAttempt(model, "missing").status, "unknown_claim");
 });
 
 test("finished attempts are pruned by age and count while pending ones survive", () => {

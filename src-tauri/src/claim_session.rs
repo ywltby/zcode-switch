@@ -75,6 +75,8 @@ pub struct ClaimSession {
     pub created_at: i64,
     pub updated_at: i64,
     pub phase: ClaimPhase,
+    /// Unknown claim this session explicitly replaces after a manual acknowledgement.
+    pub replaces: Option<String>,
     pub material: ClaimMaterial,
 }
 
@@ -91,7 +93,7 @@ pub struct ClaimSummary {
     pub auto: bool,
     pub created_at: i64,
     pub updated_at: i64,
-    pub acknowledged: bool,
+    pub manual_retry: bool,
     #[serde(skip)]
     pub identity_scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +103,13 @@ pub struct ClaimSummary {
 #[derive(Debug, PartialEq)]
 pub enum StartError {
     Busy,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StartGate {
+    /// Allowed to reserve a session; the value is the unknown claim it replaces.
+    Allowed(Option<String>),
+    Unconfirmed,
 }
 
 #[derive(Debug, PartialEq)]
@@ -132,7 +141,7 @@ impl ClaimSession {
             auto: self.auto,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            acknowledged: false,
+            manual_retry: false,
             identity_scope: self.identity_scope.clone(),
             result: None,
         }
@@ -157,8 +166,8 @@ struct StoredAttempt {
     plan_id: String,
     phase: String,
     updated_at: i64,
-    #[serde(default)]
-    acknowledged: bool,
+    #[serde(default, alias = "acknowledged")]
+    manual_retry: bool,
     #[serde(default)]
     result: Option<Value>,
 }
@@ -173,7 +182,7 @@ impl StoredAttempt {
             plan_id: session.plan_id.clone(),
             phase: phase.as_str().to_string(),
             updated_at: session.updated_at,
-            acknowledged: false,
+            manual_retry: false,
             result: None,
         }
     }
@@ -190,7 +199,7 @@ impl StoredAttempt {
             auto: false,
             created_at: self.updated_at,
             updated_at: self.updated_at,
-            acknowledged: self.acknowledged,
+            manual_retry: self.manual_retry,
             identity_scope: self.scope.clone(),
             result: self.result.clone(),
         }
@@ -343,10 +352,17 @@ impl ClaimRegistry {
             self.active = Some(active);
             return false;
         }
+        let replaced = active.replaces.clone();
         let mut summary = active.summary();
         summary.status = phase.as_str().to_string();
         summary.result = result;
         summary.updated_at = now_ms();
+        if matches!(phase, ClaimPhase::Succeeded | ClaimPhase::Failed) {
+            // A definite outcome supersedes the unknown attempt it replaced.
+            if let Some(old) = replaced {
+                self.unknown.retain(|record| record.claim_id != old);
+            }
+        }
         if phase == ClaimPhase::Unknown {
             self.unknown.push(summary.clone());
         } else {
@@ -423,11 +439,13 @@ impl ClaimRegistry {
         out
     }
 
-    pub fn acknowledge_unknown(&mut self, claim_id: &str) -> bool {
+    /// Grants one explicit manual retry for this unknown attempt. Automatic and
+    /// batch claims stay blocked until a new claim reaches a definite outcome.
+    pub fn allow_manual_retry(&mut self, claim_id: &str) -> bool {
         let mut changed = false;
         for summary in self.unknown.iter_mut().filter(|s| s.claim_id == claim_id) {
-            if !summary.acknowledged {
-                summary.acknowledged = true;
+            if !summary.manual_retry {
+                summary.manual_retry = true;
                 changed = true;
             }
         }
@@ -437,11 +455,39 @@ impl ClaimRegistry {
         changed
     }
 
+    /// Consumes the one-shot manual permit. Returns the unknown claim it replaces.
+    pub fn consume_manual_retry(&mut self, identity_scope: &str, plan_id: &str) -> Option<String> {
+        let record = self
+            .unknown
+            .iter_mut()
+            .find(|s| s.manual_retry && s.plan_id == plan_id && s.identity_scope == identity_scope)?;
+        record.manual_retry = false;
+        record.updated_at = now_ms();
+        let replaced = record.claim_id.clone();
+        let _ = self.persist();
+        Some(replaced)
+    }
+
     /// True when this identity and plan already have an unresolved submission.
     pub fn blocks(&self, identity_scope: &str, plan_id: &str) -> bool {
         self.unknown
             .iter()
-            .any(|s| !s.acknowledged && s.plan_id == plan_id && s.identity_scope == identity_scope)
+            .any(|s| s.plan_id == plan_id && s.identity_scope == identity_scope)
+    }
+
+    /// Automatic and batch claims are always refused while a result is unresolved.
+    /// A manual claim needs a one-shot acknowledgement from the user.
+    pub fn gate(&mut self, mode: &str, identity_scope: &str, plan_id: &str) -> StartGate {
+        if !self.blocks(identity_scope, plan_id) {
+            return StartGate::Allowed(None);
+        }
+        if mode != "manual" {
+            return StartGate::Unconfirmed;
+        }
+        match self.consume_manual_retry(identity_scope, plan_id) {
+            Some(replaced) => StartGate::Allowed(Some(replaced)),
+            None => StartGate::Unconfirmed,
+        }
     }
 
     fn prune(&mut self) {
@@ -472,7 +518,7 @@ impl ClaimRegistry {
                 plan_id: summary.plan_id.clone(),
                 phase: summary.status.clone(),
                 updated_at: summary.updated_at,
-                acknowledged: summary.acknowledged,
+                manual_retry: summary.manual_retry,
                 result: summary.result.clone(),
             });
         }
@@ -485,7 +531,7 @@ impl ClaimRegistry {
                 plan_id: summary.plan_id.clone(),
                 phase: summary.status.clone(),
                 updated_at: summary.updated_at,
-                acknowledged: summary.acknowledged,
+                manual_retry: summary.manual_retry,
                 result: summary.result.clone(),
             });
         }
@@ -516,8 +562,7 @@ pub fn identity_scope(credentials: &Value, secret: &str) -> String {
         .and_then(|payload| {
             ["id", "user_id", "sub"]
                 .iter()
-                .find_map(|key| payload.get(*key).and_then(|v| v.as_str()))
-                .map(String::from)
+                .find_map(|key| payload.get(*key).and_then(crate::quota_auth::normalized_id))
         })
         .unwrap_or_else(|| "unknown".to_string());
     format!(

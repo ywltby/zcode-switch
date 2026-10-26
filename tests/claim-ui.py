@@ -3,6 +3,7 @@
 Run against a local Vite server (http://127.0.0.1:5173). No real account,
 credential, captcha, or official API request is made.
 """
+import re
 import time
 from pathlib import Path
 
@@ -49,11 +50,12 @@ MOCK = r"""
       if (command === 'reveal_main') return;
       if (command === 'get_account_quota') return fixture.quota(args.id, args.revision);
       if (command === 'claim_preview' || command === 'claim_refresh') {
+        const delay = 300;
         if (args.id === 'account-7' && !fixture.retriedAccount7) {
-          await new Promise(resolve => setTimeout(resolve, 60));
+          await new Promise(resolve => setTimeout(resolve, delay));
           throw 'refresh_failed';
         }
-        await new Promise(resolve => setTimeout(resolve, 60));
+        await new Promise(resolve => setTimeout(resolve, delay));
         return { accountId: args.id, revision: args.revision, plans: fixture.plans(args.id),
           ...(command === 'claim_refresh' ? { activated: true, activationError: null } : {}) };
       }
@@ -63,17 +65,16 @@ MOCK = r"""
         const account = fixture.accounts.find(a => a.id === args.id);
         const summary = { ...fixture.session(args.claimId, args.id, 'verifying'), planName: account?.name || args.id };
         // Emit asynchronously, as the real backend does after the captcha window.
+        const emit = (extra) => setTimeout(() => window.__emitToPage('claim://result', {
+          claimId: args.claimId, accountId: args.id, accountName: summary.accountName,
+          revision: args.revision, planId: args.planId, planName: summary.planName, ...extra }), 0);
+        fixture.account5Starts = fixture.account5Starts || 0;
         if (args.id === 'account-0') {
-          setTimeout(() => window.__emitToPage('claim://result', { ok: false, claimId: args.claimId, accountId: args.id,
-            accountName: summary.accountName, revision: args.revision, planId: args.planId, planName: summary.planName,
-            code: 1005, message: 'synthetic rejection' }), 0);
-        } else if (args.id === 'account-2') {
-          setTimeout(() => window.__emitToPage('claim://result', { ok: true, claimId: args.claimId, accountId: args.id,
-            accountName: summary.accountName, revision: args.revision, planId: args.planId, planName: summary.planName,
-            startsAt: null, endsAt: null }), 0);
+          emit({ ok: false, code: 1005, message: 'synthetic rejection' });
+        } else if (args.id === 'account-5' && fixture.account5Starts++ === 0) {
+          // First attempt: no event; the test closes the captcha window instead.
         } else {
-          setTimeout(() => window.__emitToPage('claim://result', { ok: true, claimId: args.claimId, accountId: args.id,
-            accountName: summary.accountName, revision: args.revision, planId: args.planId, planName: summary.planName }), 0);
+          emit({ ok: true, startsAt: null, endsAt: null });
         }
         return summary;
       }
@@ -87,8 +88,8 @@ MOCK = r"""
       if (command === 'claim_cancel') return { phase: 'cancelled', cancelled: true, submissionInFlight: false };
       if (command === 'claim_acknowledge_unknown') { fixture.acknowledged.push(args.claimId); return true; }
       if (command === 'claim_sessions') {
-        return { sessions: [fixture.session('old-2', 'account-2', 'unknown'), fixture.session('sub-3', 'account-3', 'submitting')],
-          recovery: { ok: true } };
+        return { sessions: [fixture.session('old-2', 'account-2', 'unknown'), fixture.session('old-4', 'account-4', 'unknown'),
+          fixture.session('sub-3', 'account-3', 'submitting')], recovery: { ok: true } };
       }
       if (command === 'set_behavior') return;
       throw new Error(`Unexpected synthetic command: ${command}`);
@@ -117,6 +118,7 @@ def main():
         expect(row(2)).to_contain_text("领取结果待确认")
         expect(row(2)).to_contain_text("检查领取结果")
         expect(row(2)).not_to_contain_text("领取失败")
+        expect(row(4)).to_contain_text("领取结果待确认")
         expect(row(3)).to_contain_text("已提交，正在确认结果")
         page.screenshot(path=str(output / "recovered.png"), full_page=True)
         # The recovered submission finishes, which releases the claim mutex.
@@ -126,7 +128,7 @@ def main():
         refresh_button = page.locator(".toolbar button").filter(has_text="刷新资格").first
         started = time.monotonic()
         refresh_button.click()
-        expect(page.locator(".toolbar")).to_contain_text("刷新资格 1/11", timeout=10000)
+        expect(page.locator(".toolbar")).to_contain_text(re.compile(r"刷新资格 \d+/11"), timeout=10000)
         expect(row(7)).to_contain_text("refresh_failed", timeout=10000)
         expect(row(7)).to_contain_text("重试本账号")
         elapsed = time.monotonic() - started
@@ -159,12 +161,22 @@ def main():
         new_ids = page.evaluate("claimFixture.claimIds")
         assert len(new_ids) == 1 and new_ids[0] != "old-2", new_ids
 
+        # Closing the captcha window cancels the backend session; the row must not
+        # wait for the frontend timeout when claim://cancelled arrives.
+        row(5).get_by_role("button", name="领取").click()
+        page.wait_for_function("claimFixture.claimIds.length === 2", timeout=10000)
+        cancelled_id = page.evaluate("claimFixture.claimIds[1]")
+        page.evaluate(f"window.__emitToPage('claim://cancelled', {{ claimId: '{cancelled_id}' }})")
+        expect(row(5).get_by_role("button", name="领取")).to_be_enabled(timeout=5000)
+
         # Batch claim: a failed first account does not stop the next one.
         starts_before_batch = page.evaluate("claimFixture.startCount")
         page.locator(".toolbar .claim-all").click()
         page.wait_for_function(f"claimFixture.startCount >= {starts_before_batch + 2}", timeout=10000)
         ids = page.evaluate("claimFixture.calls.filter(c => c.command === 'claim_start').map(c => c.args.id)")
         assert ids[starts_before_batch:starts_before_batch + 2] == ["account-0", "account-1"], ids
+        assert "account-4" not in ids[starts_before_batch:], "unconfirmed accounts never join a batch"
+        expect(row(4)).to_contain_text("领取结果待确认")
         expect(page.locator(".toolbar .claim-all")).to_be_enabled(timeout=40000)
         assert "old-2" not in page.locator("#app").inner_text()
         assert "plan-1" not in page.locator("#app").inner_text()

@@ -7,6 +7,7 @@ import { createQuotaScheduler } from "./refresh-scheduler.js";
 import { createClaimFlow, parseScopeError } from "./claim-flow.js";
 import { createRequestQueue } from "./request-queue.js";
 import {
+  cancelAttempt,
   closeWaiter,
   createClaimAttempts,
   finishWaiter,
@@ -224,7 +225,7 @@ async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, ret
       revision: account.quota_revision,
       planId: plan.plan_id,
       claimId,
-      auto: mode === "auto",
+      mode,
     });
   } catch (e) {
     const scope = parseScopeError(e);
@@ -545,6 +546,10 @@ const actions = {
       toast(t("m.claimBusy"), "warn");
       return;
     }
+    if (unknownClaimFor(id)) {
+      toast(t("m.claimUnconfirmed", { name: accountName(id) }), "warn", t("m.claimCheckFirstDetail"));
+      return;
+    }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
     if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
@@ -558,11 +563,15 @@ const actions = {
   },
 
   async claimAll() {
+    const pending = (state?.accounts || []).map((a) => a.id).filter((id) => unknownClaimFor(id));
     const ids = (state?.accounts || [])
       .map((a) => a.id)
-      .filter((id) => (claimable[id]?.plans || []).length > 0);
+      .filter((id) => !unknownClaimFor(id) && (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
     if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) return;
+    if (pending.length) {
+      toast(t("m.claimBatchSkipped", { n: pending.length }), "warn", t("m.claimBatchSkippedDetail"));
+    }
     claimAllRunning = true;
     claimActive = true;
     try {
@@ -1118,6 +1127,15 @@ listen("tray-action", (ev) => {
 
 listen("claim://result", (ev) => {
   handleClaimResult(ev.payload || {});
+});
+
+listen("claim://cancelled", (ev) => {
+  const claimId = ev.payload?.claimId;
+  if (!claimId) return;
+  const result = cancelAttempt(claimAttempts, claimId);
+  if (result.status !== "accepted") return;
+  finishWaiter(claimAttempts, claimId, result.payload);
+  if (!uiLocked()) render();
 });
 
 listen("captcha://setup-failed", (ev) => {

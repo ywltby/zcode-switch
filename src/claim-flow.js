@@ -117,8 +117,11 @@ export function createClaimFlow({
     const promise = queue.enqueue(key, () => run(ticket), { priority: rank }).then(async (outcome) => {
       const pending = inFlight.get(id);
       if (pending?.key === key) inFlight.delete(id);
-      if (outcome.status === "scope_changed" && outcome.notStarted && !retried && live.some((a) => a.id === id)) {
+      if (outcome.status === "scope_changed" || outcome.status === "skipped") {
+        // Never leave the row busy when the request ended without a result.
         setModel(releaseClaimRequest(model, ticket));
+      }
+      if (outcome.status === "scope_changed" && outcome.notStarted && !retried && live.some((a) => a.id === id)) {
         await refreshState();
         return start(id, kind, { retried: true, priority: rank });
       }
@@ -151,12 +154,13 @@ export function createClaimFlow({
 
   async function refreshMany(ids, { onItem = () => {} } = {}) {
     let done = 0;
-    for (const id of ids) {
+    const total = ids.length;
+    return Promise.all(ids.map(async (id) => {
       const outcome = await refresh(id).catch((error) => ({ status: "failed", error: errorText(error) }));
       done += 1;
-      onItem({ id, done, total: ids.length, outcome });
-    }
-    return done;
+      onItem({ id, done, total, outcome });
+      return outcome;
+    }));
   }
 
   function invalidate(id) {

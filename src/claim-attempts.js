@@ -100,6 +100,24 @@ export function finishWaiter(model, claimId, payload = null) {
   return true;
 }
 
+/**
+ * Backend-side cancellation: the session is closed without a claim outcome.
+ * Recorded like any other result so a late event cannot deliver it twice.
+ */
+export function cancelAttempt(model, claimId) {
+  const attempt = model.attempts.get(claimId);
+  if (!attempt) return { status: "unknown_claim", refresh: false, attempt: null, payload: null };
+  const payload = {
+    claimId,
+    accountId: attempt.accountId,
+    revision: attempt.revision,
+    cancelled: true,
+    ok: false,
+  };
+  const settled = settleAttempt(model, claimId, payload);
+  return { ...settled, payload };
+}
+
 export function closeWaiter(model, claimId) {
   const attempt = model.attempts.get(claimId);
   if (!attempt) return false;

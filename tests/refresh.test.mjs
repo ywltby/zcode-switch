@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PERIOD, account, createClaimHarness, createHarness, tick } from "./ui-harness.mjs";
+import { createRequestQueue } from "../src/request-queue.js";
 
 const ids = (n) => Array.from({ length: n }, (_, i) => account(`a${i}`));
 
@@ -199,7 +200,7 @@ test("a failing account does not stop the batch and progress counts each item on
   const done = await h.flow.refreshMany(["c0", "c1", "c2"], {
     onItem: ({ id, done, total, outcome }) => progress.push({ id, done, total, status: outcome.status }),
   });
-  assert.equal(done, 3);
+  assert.equal(done.length, 3);
   assert.deepEqual(progress.map((p) => p.done), [1, 2, 3]);
   assert.deepEqual(progress.map((p) => p.status), ["ok", "failed", "ok"]);
   assert.equal(h.state("c1").err, "Error: network_error");
@@ -233,6 +234,61 @@ test("a second scope_changed is reported instead of retrying forever", async () 
   assert.equal(outcome.status, "scope_changed");
   assert.equal(h.control.refreshStateCalls, 1);
   assert.equal(h.callsTo("c0").length, 2);
+});
+
+test("quota and claim eligibility share the same three slots", async () => {
+  const queue = createRequestQueue(3);
+  const h = createHarness({ accounts: ids(6), queue });
+  const c = createClaimHarness({ accounts: [account("c0"), account("c1")], queue });
+  h.holdAll();
+  for (const id of ["c0", "c1"]) c.control.hold.add(id);
+  h.scheduler.sweep();
+  assert.equal(queue.activeCount(), 3, "quota fills the shared slots");
+  const claim = c.flow.refresh("c0");
+  assert.equal(queue.activeCount(), 3);
+  assert.equal(c.callsTo("c0").length, 0, "the claim waits behind quota instead of opening a fourth slot");
+  assert.ok(queue.queuedCount() >= 4, "three quota tasks and the claim are queued");
+  h.release("a0");
+  await tick();
+  assert.equal(queue.activeCount(), 3, "the freed slot starts the claim refresh");
+  assert.equal(c.callsTo("c0").length, 1);
+  assert.equal(h.callsTo("a3").length, 0, "the manual claim took the freed slot");
+  c.release("c0");
+  await claim;
+  await h.drain();
+  assert.ok(queue.activeCount() <= 3);
+  assert.equal(queue.activeCount(), 0);
+});
+
+test("batch eligibility refresh runs three accounts at a time", async () => {
+  const h = createClaimHarness({ accounts: claimIds(6) });
+  for (const id of ["c0", "c1", "c2", "c3", "c4", "c5"]) h.control.hold.add(id);
+  const progress = [];
+  const batch = h.flow.refreshMany(["c0", "c1", "c2", "c3", "c4", "c5"], {
+    onItem: ({ done, total, outcome }) => progress.push({ done, total, status: outcome.status }),
+  });
+  assert.equal(h.control.pending.length, 3, "three refreshes start together");
+  while (h.control.pending.length) {
+    h.release(h.control.pending[0].id);
+    await tick();
+  }
+  const outcomes = await batch;
+  assert.equal(outcomes.length, 6);
+  assert.deepEqual(progress.map((p) => p.done), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(progress.map((p) => p.total), [6, 6, 6, 6, 6, 6]);
+  assert.equal(progress.filter((p) => p.status === "ok").length, 6);
+});
+
+test("two consecutive scope_changed results never leave the row busy", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.failures.set("c0", [h.scopeError(), h.scopeError()]);
+  const outcome = await h.flow.refresh("c0");
+  assert.equal(outcome.status, "scope_changed");
+  assert.equal(h.state("c0").busy, false, "the failed attempt releases its ownership");
+  const next = await h.flow.refresh("c0");
+  assert.equal(next.status, "ok", "a later refresh still works");
+  assert.equal(h.callsTo("c0").length, 3);
+  assert.equal(h.control.refreshStateCalls, 1);
 });
 
 test("a claim completion invalidates a preview started before submission", async () => {

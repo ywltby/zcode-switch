@@ -344,13 +344,18 @@ async fn claim_start(
     revision: Option<String>,
     plan_id: String,
     claim_id: Option<String>,
-    auto: Option<bool>,
+    mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let claim_id = claim_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let is_auto = auto.unwrap_or(false);
+    let mode = match mode.as_deref() {
+        Some("auto") => "auto",
+        Some("all") => "all",
+        _ => "manual",
+    };
+    let is_auto = mode == "auto";
     let paths = Paths::detect();
     let snapshot = {
         let _guard = store_guard();
@@ -362,7 +367,7 @@ async fn claim_start(
     let secret = zcrypto::default_secret(&paths.home);
     let scope = claim_session::identity_scope(&snapshot.account.credentials, &secret);
     let now = claim_now_ms();
-    let session = claim_session::ClaimSession {
+    let mut session = claim_session::ClaimSession {
         claim_id: claim_id.clone(),
         account_id: id.clone(),
         account_name: snapshot.account.name.clone(),
@@ -374,6 +379,7 @@ async fn claim_start(
         created_at: now,
         updated_at: now,
         phase: claim_session::ClaimPhase::Preparing,
+        replaces: None,
         material: claim_session::ClaimMaterial {
             credentials: snapshot.account.credentials.clone(),
             config: snapshot.account.config.clone(),
@@ -385,8 +391,12 @@ async fn claim_start(
         let Some(registry) = registry.as_mut() else {
             return Err(i18n::tr("err.claim.none_pending"));
         };
-        if is_auto && registry.blocks(&scope, &plan_id) {
-            return Err(i18n::tr("err.claim.unconfirmed"));
+        if registry.blocks(&scope, &plan_id) {
+            // An unresolved submission only permits one acknowledged manual retry.
+            match registry.gate(mode, &scope, &plan_id) {
+                claim_session::StartGate::Allowed(replaced) => session.replaces = replaced,
+                claim_session::StartGate::Unconfirmed => return Err(i18n::tr("err.claim.unconfirmed")),
+            }
         }
         match registry.try_start(session) {
             Ok(_) => {}
@@ -603,7 +613,7 @@ async fn claim_sessions() -> Result<serde_json::Value, String> {
 async fn claim_acknowledge_unknown(claim_id: String) -> Result<bool, String> {
     let mut registry = claim_registry_guard();
     match registry.as_mut() {
-        Some(registry) => Ok(registry.acknowledge_unknown(&claim_id)),
+        Some(registry) => Ok(registry.allow_manual_retry(&claim_id)),
         None => Ok(false),
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::SECRET;
 use serde_json::json;
 use std::fs;
 
@@ -21,6 +22,7 @@ fn session(claim_id: &str, scope: &str, plan_id: &str) -> ClaimSession {
         created_at: now_ms(),
         updated_at: now_ms(),
         phase: ClaimPhase::Preparing,
+        replaces: None,
         material: ClaimMaterial {
             credentials: json!({"zcodejwttoken": "synthetic-secret-token"}),
             config: None,
@@ -168,15 +170,75 @@ fn unknown_blocks_same_identity_and_plan_only() {
 }
 
 #[test]
-fn acknowledging_unknown_allows_an_explicit_manual_retry() {
+fn only_an_acknowledged_manual_claim_passes_the_unconfirmed_gate() {
     let mut registry = ClaimRegistry::load(temp_file());
     verifying(&mut registry, "c1", "zai:one", "p1");
     registry.begin_submit("c1").unwrap();
     registry.finish("c1", ClaimPhase::Unknown, None);
-    assert!(registry.acknowledge_unknown("c1"));
+    assert_eq!(registry.gate("auto", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(registry.gate("all", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(registry.gate("manual", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert!(registry.allow_manual_retry("c1"));
+    assert_eq!(registry.gate("auto", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(registry.gate("all", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(
+        registry.gate("manual", "zai:one", "p1"),
+        StartGate::Allowed(Some("c1".into()))
+    );
+    assert_eq!(registry.gate("manual", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(registry.gate("manual", "zai:two", "p1"), StartGate::Allowed(None));
+    assert_eq!(registry.gate("manual", "zai:one", "p2"), StartGate::Allowed(None));
+}
+
+#[test]
+fn acknowledging_unknown_never_unblocks_automatic_claims() {
+    let mut registry = ClaimRegistry::load(temp_file());
+    verifying(&mut registry, "c1", "zai:one", "p1");
+    registry.begin_submit("c1").unwrap();
+    registry.finish("c1", ClaimPhase::Unknown, None);
+    assert!(registry.blocks("zai:one", "p1"));
+    assert!(registry.allow_manual_retry("c1"));
+    assert!(registry.blocks("zai:one", "p1"), "an acknowledgement is not an automatic permit");
+    assert_eq!(registry.consume_manual_retry("zai:one", "p1"), Some("c1".to_string()));
+    assert_eq!(registry.consume_manual_retry("zai:one", "p1"), None, "the permit is one-shot");
+    assert!(registry.blocks("zai:one", "p1"), "the unresolved record still blocks automatic claims");
+    assert!(!registry.allow_manual_retry("missing"));
+}
+
+#[test]
+fn a_definite_outcome_clears_the_unknown_it_replaced() {
+    let mut registry = ClaimRegistry::load(temp_file());
+    verifying(&mut registry, "old", "zai:one", "p1");
+    registry.begin_submit("old").unwrap();
+    registry.finish("old", ClaimPhase::Unknown, None);
+    assert!(registry.allow_manual_retry("old"));
+
+    let mut replacement = session("new", "zai:one", "p1");
+    replacement.replaces = Some("old".into());
+    registry.try_start(replacement).unwrap();
+    assert!(registry.mark_verifying("new"));
+    registry.begin_submit("new").unwrap();
+    registry.finish("new", ClaimPhase::Succeeded, Some(json!({"ok": true})));
     assert!(!registry.blocks("zai:one", "p1"));
-    assert_eq!(registry.status("c1").unwrap().status, "unknown");
-    assert!(!registry.acknowledge_unknown("missing"));
+    assert!(registry.status("old").is_none(), "the superseded unknown is gone");
+    assert_eq!(registry.status("new").unwrap().status, "succeeded");
+}
+
+#[test]
+fn identity_scope_accepts_numeric_and_string_subjects_without_merging_accounts() {
+    use crate::test_support::jwt;
+    let with_id = |family: &str, id: serde_json::Value| {
+        json!({
+            "oauth:active_provider": family,
+            "zcodejwttoken": jwt(json!({"id": id})),
+        })
+    };
+    let numeric = identity_scope(&with_id("zai", json!(12345)), SECRET);
+    let textual = identity_scope(&with_id("zai", json!("12345")), SECRET);
+    let other = identity_scope(&with_id("zai", json!(12346)), SECRET);
+    assert_eq!(numeric, textual, "the same subject must map to one scope");
+    assert_ne!(numeric, other, "different numeric subjects must not share a scope");
+    assert_ne!(numeric, identity_scope(&with_id("bigmodel", json!(12345)), SECRET));
 }
 
 #[test]
