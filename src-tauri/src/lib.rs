@@ -2,6 +2,7 @@ pub mod cipher;
 pub mod cli;
 pub mod i18n;
 mod claim;
+mod claim_session;
 mod flowlog;
 mod oauth;
 mod probe;
@@ -27,23 +28,37 @@ const TRAY_ID: &str = "main";
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
-struct PendingClaim {
-    account_id: String,
-    account_name: String,
-    plan_id: String,
-    plan_name: String,
-    credentials: Value,
-    config: Option<Value>,
-    device_mid: String,
-}
+static CLAIM_REGISTRY: Mutex<Option<claim_session::ClaimRegistry>> = Mutex::new(None);
 
-static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
-
-fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
-    match PENDING_CLAIM.lock() {
+fn claim_registry_guard() -> std::sync::MutexGuard<'static, Option<claim_session::ClaimRegistry>> {
+    let mut guard = match CLAIM_REGISTRY.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_none() {
+        let paths = Paths::detect();
+        *guard = Some(claim_session::ClaimRegistry::load(
+            claim_session::attempts_path(&paths.store_dir()),
+        ));
     }
+    guard
+}
+
+fn claim_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn finish_claim(claim_id: &str, phase: claim_session::ClaimPhase, result: Option<Value>) -> bool {
+    claim_registry_guard()
+        .as_mut()
+        .map(|registry| registry.finish(claim_id, phase, result))
+        .unwrap_or(false)
+}
+
+fn claim_summary_json(claim_id: &str) -> Option<Value> {
+    let registry = claim_registry_guard();
+    let summary = registry.as_ref()?.status(claim_id)?;
+    serde_json::to_value(summary).ok()
 }
 
 fn store_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -326,101 +341,275 @@ async fn claim_refresh(id: String, revision: Option<String>) -> Result<ClaimRefr
 async fn claim_start(
     app: AppHandle,
     id: String,
+    revision: Option<String>,
     plan_id: String,
+    claim_id: Option<String>,
     auto: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let claim_id = claim_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let is_auto = auto.unwrap_or(false);
     let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
-    let plan = plans
-        .iter()
-        .find(|p| p.plan_id == plan_id)
-        .ok_or_else(|| i18n::tr("err.claim.gone"))?;
-    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+    let snapshot = {
+        let _guard = store_guard();
+        store::claim_snapshot_locked(&paths, &id, revision.as_deref())?
+    };
+    if snapshot.device_initialized && revision.is_some() {
+        return Err(claim::scope_payload(&id, &snapshot.revision, true));
+    }
+    let secret = zcrypto::default_secret(&paths.home);
+    let scope = claim_session::identity_scope(&snapshot.account.credentials, &secret);
+    let now = claim_now_ms();
+    let session = claim_session::ClaimSession {
+        claim_id: claim_id.clone(),
+        account_id: id.clone(),
+        account_name: snapshot.account.name.clone(),
+        revision: snapshot.revision.clone(),
+        identity_scope: scope.clone(),
+        plan_id: plan_id.clone(),
+        plan_name: String::new(),
+        auto: is_auto,
+        created_at: now,
+        updated_at: now,
+        phase: claim_session::ClaimPhase::Preparing,
+        material: claim_session::ClaimMaterial {
+            credentials: snapshot.account.credentials.clone(),
+            config: snapshot.account.config.clone(),
+            device_mid: snapshot.account.virtual_device_mid.clone().unwrap_or_default(),
+        },
+    };
+    {
+        let mut registry = claim_registry_guard();
+        let Some(registry) = registry.as_mut() else {
+            return Err(i18n::tr("err.claim.none_pending"));
+        };
+        if is_auto && registry.blocks(&scope, &plan_id) {
+            return Err(i18n::tr("err.claim.unconfirmed"));
+        }
+        match registry.try_start(session) {
+            Ok(_) => {}
+            Err(claim_session::StartError::Busy) => return Err(i18n::tr("err.claim.busy")),
+        }
+    }
 
-    *pending_guard() = Some(PendingClaim {
-        account_id: acc.id.clone(),
-        account_name: acc.name.clone(),
-        plan_id: plan.plan_id.clone(),
-        plan_name: display.clone(),
-        credentials: acc.credentials,
-        config: acc.config,
-        device_mid: mid,
-    });
-    open_captcha_window(&app, auto.unwrap_or(false))?;
-    Ok(json!({ "account": acc.name, "plan": display }))
+    let home = paths.home.clone();
+    let credentials = snapshot.account.credentials.clone();
+    let config = snapshot.account.config.clone();
+    let mid = snapshot.account.virtual_device_mid.clone();
+    let wanted = plan_id.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        claim::preview_plans(&home, &credentials, config.as_ref(), mid)
+    })
+    .await;
+    let plans = match prepared {
+        Ok(Ok(plans)) => plans,
+        Ok(Err(error)) => {
+            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
+            return Err(error);
+        }
+        Err(_) => {
+            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
+            return Err("quota_worker_failed".to_string());
+        }
+    };
+    let plan = match plans.iter().find(|p| p.plan_id == wanted) {
+        Some(plan) => plan,
+        None => {
+            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
+            return Err(i18n::tr("err.claim.gone"));
+        }
+    };
+    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+    {
+        let mut registry = claim_registry_guard();
+        if let Some(registry) = registry.as_mut() {
+            registry.update_plan_name(&claim_id, &display);
+            registry.mark_verifying(&claim_id);
+        }
+    }
+    if let Err(error) = open_captcha_window(&app, &claim_id, is_auto) {
+        finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
+        return Err(error);
+    }
+    claim_summary_json(&claim_id).ok_or_else(|| i18n::tr("err.claim.none_pending"))
 }
 
 #[tauri::command]
 async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
-    claim::fetch_captcha_config()
+    tauri::async_runtime::spawn_blocking(claim::fetch_captcha_config)
+        .await
+        .map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[tauri::command]
 async fn claim_captcha_submit(
     app: AppHandle,
+    claim_id: String,
     param: String,
     region: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
+    let summary = {
+        let registry = claim_registry_guard();
+        registry.as_ref().and_then(|r| r.status(&claim_id))
+    }
+    .ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
+    let material = {
+        let mut registry = claim_registry_guard();
+        let Some(registry) = registry.as_mut() else {
+            return Err(i18n::tr("err.claim.none_pending"));
+        };
+        match registry.begin_submit(&claim_id) {
+            Ok(material) => material,
+            Err(claim_session::SubmitError::PersistFailed) => {
+                registry.finish(&claim_id, claim_session::ClaimPhase::Failed, None);
+                return Err(i18n::tr("err.claim.marker_failed"));
+            }
+            Err(claim_session::SubmitError::NotReady) => {
+                return Err(i18n::tr("err.claim.already_submitted"))
+            }
+            Err(_) => return Err(i18n::tr("err.claim.none_pending")),
+        }
+    };
+
     let paths = Paths::detect();
-    let res = claim::submit_claim(
-        &paths.home,
-        &pending.credentials,
-        pending.config.as_ref(),
-        &pending.plan_id,
-        &param,
-        region.as_deref(),
-        Some(pending.device_mid),
-    );
-    close_captcha_window(&app);
-    let payload = match res {
-        Ok(v) => {
+    let home = paths.home.clone();
+    let plan_id = summary.plan_id.clone();
+    let submitted = tauri::async_runtime::spawn_blocking(move || {
+        claim::submit_claim(
+            &home,
+            &material.credentials,
+            material.config.as_ref(),
+            &plan_id,
+            &param,
+            region.as_deref(),
+            Some(material.device_mid),
+        )
+    })
+    .await;
+
+    let payload = match submitted {
+        Ok(Ok(value)) => {
             let ms = |k: &str| -> Option<i64> {
-                v.pointer(&format!("/data/plan/{k}"))
+                value
+                    .pointer(&format!("/data/plan/{k}"))
                     .and_then(|x| x.as_i64())
                     .map(|s| s * 1000)
             };
-            let server_time = v
+            let server_time = value
                 .pointer("/data/server_time")
                 .and_then(|x| x.as_i64())
                 .map(|s| s * 1000);
-            let outcome = claim::ClaimOutcome {
-                account_id: pending.account_id.clone(),
-                account_name: pending.account_name.clone(),
-                plan_name: pending.plan_name.clone(),
-                starts_at: ms("starts_at"),
-                ends_at: ms("ends_at"),
-                server_time,
-            };
-            let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
-            let _ = app.emit("claim://result", &p);
-            p
+            let payload = json!({
+                "ok": true,
+                "claimId": claim_id,
+                "accountId": summary.account_id,
+                "accountName": summary.account_name,
+                "revision": summary.revision,
+                "planId": summary.plan_id,
+                "planName": summary.plan_name,
+                "startsAt": ms("starts_at"),
+                "endsAt": ms("ends_at"),
+                "serverTime": server_time,
+            });
+            finish_claim(&claim_id, claim_session::ClaimPhase::Succeeded, Some(payload.clone()));
+            payload
         }
-        Err(e) => {
-            let p = claim::failure_payload(
-                &pending.account_id,
-                &pending.account_name,
-                &pending.plan_name,
-                &e,
+        Ok(Err(error)) => {
+            let mut payload = claim::failure_payload(
+                &summary.account_id,
+                &summary.account_name,
+                &summary.plan_name,
+                &error,
             );
-            let _ = app.emit("claim://result", &p);
-            return Ok(p);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("claimId".into(), json!(claim_id));
+                object.insert("planId".into(), json!(summary.plan_id));
+                object.insert("revision".into(), json!(summary.revision));
+                object.insert("unknown".into(), json!(error.unknown));
+            }
+            let phase = if error.unknown {
+                claim_session::ClaimPhase::Unknown
+            } else {
+                claim_session::ClaimPhase::Failed
+            };
+            finish_claim(&claim_id, phase, Some(payload.clone()));
+            payload
+        }
+        Err(_) => {
+            let payload = json!({
+                "ok": false,
+                "claimId": claim_id,
+                "accountId": summary.account_id,
+                "accountName": summary.account_name,
+                "revision": summary.revision,
+                "planId": summary.plan_id,
+                "planName": summary.plan_name,
+                "code": -1,
+                "message": i18n::tr("err.claim.unknown"),
+                "unknown": true,
+            });
+            finish_claim(&claim_id, claim_session::ClaimPhase::Unknown, Some(payload.clone()));
+            payload
         }
     };
+    close_captcha_window(&app, &claim_id);
+    let _ = app.emit("claim://result", &payload);
     Ok(payload)
 }
 
 #[tauri::command]
-async fn claim_cancel(app: AppHandle) -> Result<(), String> {
-    *pending_guard() = None;
-    close_captcha_window(&app);
-    Ok(())
+async fn claim_cancel(app: AppHandle, claim_id: String) -> Result<serde_json::Value, String> {
+    let outcome = {
+        let mut registry = claim_registry_guard();
+        match registry.as_mut() {
+            Some(registry) => registry.cancel(&claim_id),
+            None => claim_session::CancelOutcome {
+                phase: claim_session::ClaimPhase::Cancelled.as_str().to_string(),
+                cancelled: false,
+                submission_in_flight: false,
+            },
+        }
+    };
+    if outcome.cancelled {
+        close_captcha_window(&app, &claim_id);
+        let _ = app.emit("claim://cancelled", json!({ "claimId": claim_id }));
+    }
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
 }
 
-fn close_captcha_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("captcha") {
+#[tauri::command]
+async fn claim_status(claim_id: String) -> Result<serde_json::Value, String> {
+    Ok(claim_summary_json(&claim_id).unwrap_or(Value::Null))
+}
+
+#[tauri::command]
+async fn claim_sessions() -> Result<serde_json::Value, String> {
+    let registry = claim_registry_guard();
+    let Some(registry) = registry.as_ref() else {
+        return Ok(json!({ "sessions": [], "recovery": { "ok": true } }));
+    };
+    Ok(json!({
+        "sessions": registry.sessions(),
+        "recovery": {
+            "ok": registry.recovery_error().is_none(),
+            "error": registry.recovery_error(),
+        }
+    }))
+}
+
+#[tauri::command]
+async fn claim_acknowledge_unknown(claim_id: String) -> Result<bool, String> {
+    let mut registry = claim_registry_guard();
+    match registry.as_mut() {
+        Some(registry) => Ok(registry.acknowledge_unknown(&claim_id)),
+        None => Ok(false),
+    }
+}
+
+fn close_captcha_window(app: &AppHandle, claim_id: &str) {
+    if let Some(w) = app.get_webview_window(&captcha_label(claim_id)) {
         let _ = w.close();
     }
 }
@@ -869,9 +1058,14 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
     });
 }
 
-fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
+fn captcha_label(claim_id: &str) -> String {
+    format!("captcha-{claim_id}")
+}
+
+fn open_captcha_window(app: &AppHandle, claim_id: &str, auto: bool) -> Result<(), String> {
     let (w, h) = (380.0, 320.0);
-    if let Some(win) = app.get_webview_window("captcha") {
+    let label = captcha_label(claim_id);
+    if let Some(win) = app.get_webview_window(&label) {
         let _ = win.eval("location.reload()");
         center_over_main(app, &win, w, h);
         if auto {
@@ -884,8 +1078,8 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     }
     let win = tauri::WebviewWindowBuilder::new(
         app,
-        "captcha",
-        tauri::WebviewUrl::App("captcha.html".into()),
+        label,
+        tauri::WebviewUrl::App(format!("captcha.html?claimId={claim_id}").into()),
     )
     .title(i18n::tr("title.captcha"))
     .theme(Some(tauri::Theme::Dark))
@@ -956,10 +1150,17 @@ async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
     }
     i18n::set(l);
     rebuild_tray(&app);
-    for (label, key) in [("settings", "title.settings"), ("captcha", "title.captcha"), ("login", "title.login")] {
-        if let Some(w) = app.get_webview_window(label) {
-            let _ = w.set_title(&i18n::tr(key));
-        }
+    for (label, window) in app.webview_windows() {
+        let key = if label == "settings" {
+            "title.settings"
+        } else if label == "login" {
+            "title.login"
+        } else if label.starts_with("captcha-") {
+            "title.captcha"
+        } else {
+            continue;
+        };
+        let _ = window.set_title(&i18n::tr(key));
     }
     let _ = app.emit("state-changed", ());
     Ok(())
@@ -1226,6 +1427,9 @@ pub fn run() {
             claim_captcha_config,
             claim_captcha_submit,
             claim_cancel,
+            claim_status,
+            claim_sessions,
+            claim_acknowledge_unknown,
             oauth_providers,
             oauth_begin,
             set_auth_proxy,
@@ -1256,8 +1460,20 @@ pub fn run() {
                         let _ = window.hide();
                     }
                 }
-                if window.label() == "captcha" {
-                    *pending_guard() = None;
+                if let Some(claim_id) = window.label().strip_prefix("captcha-") {
+                    let claim_id = claim_id.to_string();
+                    let cancelled = {
+                        let mut registry = claim_registry_guard();
+                        registry
+                            .as_mut()
+                            .map(|registry| registry.cancel(&claim_id).cancelled)
+                            .unwrap_or(false)
+                    };
+                    if cancelled {
+                        let _ = window
+                            .app_handle()
+                            .emit("claim://cancelled", json!({ "claimId": claim_id }));
+                    }
                 }
             }
         })

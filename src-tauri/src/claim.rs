@@ -40,22 +40,14 @@ pub struct CaptchaConfig {
     pub scene_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClaimOutcome {
-    pub account_id: String,
-    pub account_name: String,
-    pub plan_name: String,
-    pub starts_at: Option<i64>,
-    pub ends_at: Option<i64>,
-    pub server_time: Option<i64>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ClaimError {
     pub code: i64,
     pub message: String,
     pub next_at: Option<i64>,
+    /// True when the request may have reached the server but no definitive
+    /// business outcome was observed.
+    pub unknown: bool,
 }
 
 impl From<String> for ClaimError {
@@ -64,6 +56,7 @@ impl From<String> for ClaimError {
             code: -1,
             message,
             next_at: None,
+            unknown: false,
         }
     }
 }
@@ -80,6 +73,16 @@ fn claim_error(code: i64, body: &Value) -> ClaimError {
         code,
         message: failure_message(code, body),
         next_at,
+        unknown: false,
+    }
+}
+
+fn unknown_claim_error(message: String) -> ClaimError {
+    ClaimError {
+        code: -1,
+        message,
+        next_at: None,
+        unknown: true,
     }
 }
 
@@ -295,20 +298,35 @@ pub fn submit_claim(
     if let Some(r) = captcha_region.filter(|r| !r.trim().is_empty()) {
         req = req.set("X-Aliyun-Captcha-Verify-Region", r.trim());
     }
-    let resp = req
-        .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: http_err(&crate::i18n::tr("err.claim.claim_req"), e),
-            next_at: None,
-        })?
-        .into_string()
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: crate::i18n::trf("err.http.read", &[("e", &e.to_string())]),
-            next_at: None,
-        })?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let sent = req.send_json(serde_json::json!({ "plan_id": plan_id }));
+    let response = match sent {
+        Ok(response) => response,
+        // A definitive client rejection is a failed claim; anything else means the
+        // POST may have reached the server and the result is unknown.
+        Err(ureq::Error::Status(code, response)) => {
+            let message = http_err(
+                &crate::i18n::tr("err.claim.claim_req"),
+                ureq::Error::Status(code, response),
+            );
+            if (400..500).contains(&code) {
+                return Err(ClaimError { code: -1, message, next_at: None, unknown: false });
+            }
+            return Err(unknown_claim_error(message));
+        }
+        Err(error) => {
+            return Err(unknown_claim_error(http_err(
+                &crate::i18n::tr("err.claim.claim_req"),
+                error,
+            )))
+        }
+    };
+    let resp = response.into_string().map_err(|error| {
+        unknown_claim_error(crate::i18n::trf("err.http.read", &[("e", &error.to_string())]))
+    })?;
+    let v: Value = match serde_json::from_str(&resp) {
+        Ok(value) => value,
+        Err(_) => return Err(unknown_claim_error(crate::i18n::tr("err.claim.claim_req"))),
+    };
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(claim_error(code, &v));
