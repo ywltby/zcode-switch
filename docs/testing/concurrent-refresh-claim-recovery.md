@@ -62,25 +62,48 @@
 
 ## 4. Windows 原生 WebView 验收
 
-**未完成。** 本次执行环境没有可交互的桌面会话，未运行 `zcode-switch.exe` 做下列人工路径：
+**未完成（待执行）。** 本次执行环境没有可交互的桌面会话，未运行 `zcode-switch.exe` 做下列人工路径。Node 测试不能替代。
 
-- 关闭/重开验证码窗口。
-- SDK 失败后点击“重试验证准备”。
-- 关闭主窗口（最小化到托盘）后重新打开并恢复待确认状态。
-- 旧验证码窗口关闭不影响新会话窗口；窗口标签为 `captcha-<claimId>`，能力文件匹配 `captcha-*`。
-- 提交中关闭验证码窗口后仍能收到 `claim://result`。
+准备独立环境（不触碰现有安装与 live 凭证）：
 
-Node 测试不能替代这些路径；它们仍待在有桌面会话的 Windows 机器上验收。
+```powershell
+$home = Join-Path $env:TEMP "zswitch-native-check"
+New-Item -ItemType Directory -Force $home | Out-Null
+Copy-Item "$env:USERPROFILE\.zcode-switch\accounts" "$home\.zcode-switch\accounts" -Recurse
+Copy-Item "$env:USERPROFILE\.zcode-switch\settings.json" "$home\.zcode-switch\settings.json"
+$env:ZCODE_SWITCH_HOME = $home
+$env:ZCODE_DATA_BASE_DIR = "<ZCode 数据目录>"
+.\src-tauri\target\debug\zcode-switch.exe
+```
+
+确认 `settings.json` 中 `auto_claim` 为 `false`。检查项：
+
+- 验证码窗口标签为 `captcha-<claimId>`；关闭后重开不会复用旧会话。
+- SDK 失败时显示“重试验证准备”，点击只重试准备，不提交。
+- 关闭主窗口到托盘再打开，待确认行仍存在（`claim_sessions` 恢复）。
+- 旧验证码窗口关闭不影响新会话窗口；`capabilities/captcha.json` 匹配 `captcha-*`。
+- 提交中关闭验证码窗口：主窗口收到结果或显示“已提交，正在确认结果”，后端互斥保持。
+- 手动等待超时后按 `claim_status` 分流：已完成消费结果、未提交取消、提交中确认中、未知待确认。
+- `claim-attempts.json` 不含 JWT、验证码参数或完整响应。
+
+产物：原生窗口截图、时间线、脱敏后的 `claim-attempts.json`、执行人/日期。
 
 ## 5. 线上副作用验收
 
-**未执行。** 真实激活上报、验证码与领取都会产生副作用，需要用户明确指定测试账号。默认设置未改动（自动领取仍默认关闭），测试使用独立临时 home，未触碰用户账号、ZCode live 文件或现有安装。
+**未执行（待授权）。** 真实激活上报、验证码与领取都会产生副作用，需要用户明确指定测试账号并授权。默认设置未改动（自动领取仍默认关闭），测试使用独立临时 home，未触碰用户账号、ZCode live 文件或现有安装。
 
-上线前仍需在用户指定的测试账号上确认：
+执行前需要确认：账号 ID、当前可领套餐、是否允许激活上报、是否允许一次真实领取。只做单账号手动领取，不做批量、不开自动领取。
 
-- 首次领取触发设备 ID 初始化时返回 `scope_changed` 并在刷新 state 后自动重试一次。
-- 提交成功后额度与可领套餐在同一行更新。
-- 提交结果不明时进入“待确认”，重启程序后仍拦截同身份同套餐的自动领取，显式重试只允许一次。
+步骤：
+
+1. 只读确认：`zcode-switch.exe --cli claim-preview --id <账号id>`，该命令不触发激活上报。
+2. GUI 单账号领取，记录 claimId、开始/结束时间、最终状态。
+3. 成功：额度与可领套餐在同一行刷新，`claim_sessions` 无 unknown。
+4. 失败或 Unknown：界面区分明确失败与待确认；重启后同身份同套餐的自动领取仍被拦截；“检查领取结果”只调用额度与预览。
+5. 显式重试：确认后只允许一次；重试失败（含验证码 3007）仍保留旧待确认记录。
+6. 首次领取触发设备 ID 初始化时返回 `scope_changed`，刷新 state 后自动重试一次。
+
+一次线上结果不能外推为所有账号通过；发布验收仍需单独记录。
 
 ## 6. 已知边界
 
