@@ -16,20 +16,20 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `npm test` | 73 通过，0 失败（`node --test tests/*.test.mjs`） |
-| `npm run check:i18n` | 通过（zh/en 各 238 个键） |
+| `npm test` | 77 通过，0 失败（`node --test tests/*.test.mjs`） |
+| `npm run check:i18n` | 通过（zh/en 各 241 个键） |
 | `npm run build` | 通过（Vite 生产构建） |
-| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 69 通过，0 失败 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 72 通过，0 失败 |
 | `npm run tauri build -- --debug --no-bundle` | 成功，产物 `src-tauri/target/debug/zcode-switch.exe` |
 | `git diff --check` | 无输出（退出码 0） |
 
 新增或扩充的测试：
 
 - `tests/request-queue.test.mjs`：峰值并发、失败/同步抛错释放槽位、重复 key 共享 promise、手动提升、同级 FIFO、取消排队任务。
-- `tests/refresh.test.mjs`：20 个到期账号三路排空、手动去重与提升、旧版本成功/失败丢弃、排队期间删除、删除重加同版本、重命名不失效、失败释放槽位、旧任务不推迟新版本扫描、资格刷新与预览复用/先后顺序、`scope_changed` 只重试一次、领取完成后使提交前的预览失效。
-- `tests/claim-state.test.mjs` / `tests/claim-attempts.test.mjs` / `tests/claim-run.test.mjs`：资格 ticket 校验、迟到结果、waiter 与结果解耦、结果早于 `claim_start` 返回、提交中暂停下一次领取、事件与状态查询去重。
+- `tests/refresh.test.mjs`：20 个到期账号三路排空、手动去重与提升、旧版本成功/失败丢弃、排队期间删除、删除重加同版本、重命名不失效、失败释放槽位、旧任务不推迟新版本扫描、资格刷新与预览复用/先后顺序、`scope_changed` 只重试一次、领取完成后使提交前的预览失效、额度与领取共享同一队列（混合峰值不超过 3）、批量资格刷新三路并发、连续两次 `scope_changed` 后不残留 busy。
+- `tests/claim-state.test.mjs` / `tests/claim-attempts.test.mjs` / `tests/claim-run.test.mjs`：资格 ticket 校验、迟到结果、waiter 与结果解耦、结果早于 `claim_start` 返回、提交中暂停下一次领取、事件与状态查询去重、后端取消事件结束对应 waiter。
 - `tests/captcha.test.mjs`：配置先于 SDK、SDK/初始化超时、晚回调不提交、重复 success 只提交一次、重载发现 Submitting 不再初始化、setup 与 interactive 分流。
-- Rust：`claim_session`（唯一活动会话、单次提交许可、准备期取消、提交后不解锁、重启 Submitting → Unknown、坏记录不静默清空、记录不含凭证）、`store` 领取快照版本校验与设备 ID 只初始化一次、`claim` 验证码配置缓存（TTL、按 endpoint、暂态重试一次、401/429/业务拒绝不重试、不可用配置不缓存）。
+- Rust：`claim_session`（唯一活动会话、单次提交许可、准备期取消、提交后不解锁、重启 Submitting → Unknown、坏记录不静默清空、记录不含凭证、待确认只放行一次已确认的手动重试、确认不会解除自动/批量拦截、明确结果替换旧记录、数值与字符串型 JWT 主体不误合并）、`store` 领取快照版本校验与设备 ID 只初始化一次、`claim` 验证码配置缓存（TTL、按 endpoint、暂态重试一次、401/429/业务拒绝不重试、不可用配置不缓存）。
 
 ## 2. 离线并发统计
 
@@ -41,7 +41,7 @@
 | 20 | 3 | 3 | 20 | 430 ms |
 | 11 | 1 | 1 | 11 | 677 ms |
 
-轮次内完成顺序与入队顺序一致（`a0, a1, a2, a3, a4 …`）；总耗时只说明调度开销，不代表真实网络收益。资格刷新已移除逐账号 5 秒等待，浏览器验收中 11 个账号在 5 秒内完成（含每个账号 60ms 的模拟延迟）。
+轮次内完成顺序与入队顺序一致（`a0, a1, a2, a3, a4 …`）；总耗时只说明调度开销，不代表真实网络收益。资格刷新与额度共享同一队列，批量资格刷新并发发起、每批最多 3 个；浏览器验收中 11 个账号在约 1.2 秒内完成（每个账号 300ms 模拟延迟，3 路并发）。
 
 ## 3. 浏览器离线验收
 
@@ -50,7 +50,7 @@
 - `python tests/quota-ui.py`：PASS。保留原有 A/B/C 额度断言：部分失败、失败保留旧值与时间戳、凭证更新丢弃旧响应、5 秒状态轮询、迟到成功/失败、删除、切换、520px 窄布局。
 - `python tests/claim-ui.py`：PASS。11 个合成账号：
   - 启动恢复：未知结果（含 claimId `old-2`）与提交中会话分别显示“领取结果待确认”“已提交，正在确认结果”；提交中会话完成后自动解除。
-  - 批量资格刷新：逐项进度 `刷新资格 n/11`；单账号失败显示错误与“重试本账号”；11 次调用在 5 秒内完成；未触发 `claim_captcha_submit`。
+  - 批量资格刷新：逐项进度 `刷新资格 n/11`（并发完成后计数）；单账号失败显示错误与“重试本账号”；11 次调用在 5 秒内完成；未触发 `claim_captcha_submit`。
   - 单账号重试：只新增一次该账号调用，整批冷却按钮保持禁用。
   - 待确认：显示“检查领取结果”，只调用额度与预览，不提交。
   - 显式重试：二次确认后调用 `claim_acknowledge_unknown`，使用新 claimId 重新领取。
@@ -88,3 +88,16 @@ Node 测试不能替代这些路径；它们仍待在有桌面会话的 Windows 
 - `claimId` 只用于本地会话关联，不假设服务端提供幂等语义；断电或服务端 exactly-once 无法承诺。
 - 提交记录只保存脱敏字段；不保存 JWT、OAuth Token、验证码参数或完整服务端响应。
 - `claim-attempts.json` 损坏时自动领取暂停并提示，不把坏记录当作空记录；退回不认识该记录的旧版本前应先关闭自动领取。
+
+## 7. 复核修复记录
+
+复核发现并修复了以下问题，均新增回归测试：
+
+| 问题 | 修复 | 回归 |
+| --- | --- | --- |
+| 额度调度器忽略传入队列，内部另建一个，混合请求峰值 6 | `createQuotaScheduler` 接受并复用外部队列 | `quota and claim eligibility share the same three slots` |
+| 批量资格刷新逐个 `await`，峰值只有 1 | `refreshMany` 并发发起，进度按完成计数 | `batch eligibility refresh runs three accounts at a time` |
+| 待确认账号可被“一键领取”直接开新会话；确认会永久解除自动拦截 | 批量与自动始终被拦截；确认只发放一次性手动许可，明确结果替换旧记录 | `only_an_acknowledged_manual_claim_passes_the_unconfirmed_gate`、`a_definite_outcome_clears_the_unknown_it_replaced`；`tests/claim-ui.py` 断言待确认账号不进入批量 |
+| 连续两次 `scope_changed` 后行内 busy 永久残留 | 任何未落结果的收尾都释放 ticket | `two consecutive scope_changed results never leave the row busy` |
+| 后端 `claim://cancelled` 前端未监听，关窗后仍等待超时 | 新增监听并结束对应 waiter | `a backend cancellation ends its own attempt without a claim outcome`；`tests/claim-ui.py` 断言关窗后领取按钮立即恢复 |
+| JWT 数值型主体被当作 `unknown`，同渠道不同账号共享拦截范围 | 身份摘要复用 `normalized_id`，数值与字符串主体等价 | `identity_scope_accepts_numeric_and_string_subjects_without_merging_accounts` |
