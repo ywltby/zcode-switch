@@ -64,19 +64,52 @@
 
 **未完成（待执行）。** 本次执行环境没有可交互的桌面会话，未运行 `zcode-switch.exe` 做下列人工路径。Node 测试不能替代。
 
-准备独立环境（不触碰现有安装与 live 凭证）：
+先从当前 HEAD 重新构建调试版（不生成安装包），并记录产物时间与提交号：
 
 ```powershell
-$home = Join-Path $env:TEMP "zswitch-native-check"
-New-Item -ItemType Directory -Force $home | Out-Null
-Copy-Item "$env:USERPROFILE\.zcode-switch\accounts" "$home\.zcode-switch\accounts" -Recurse
-Copy-Item "$env:USERPROFILE\.zcode-switch\settings.json" "$home\.zcode-switch\settings.json"
-$env:ZCODE_SWITCH_HOME = $home
-$env:ZCODE_DATA_BASE_DIR = "<ZCode 数据目录>"
-.\src-tauri\target\debug\zcode-switch.exe
+npm run tauri build -- --debug --no-bundle
+Get-Item .\src-tauri\target\debug\zcode-switch.exe | Select-Object FullName, LastWriteTime
+git rev-parse --short HEAD
 ```
 
-确认 `settings.json` 中 `auto_claim` 为 `false`。检查项：
+产物 `LastWriteTime` 必须晚于当前提交时间；若早于最新修复，重新构建后再验收。
+
+准备独立 home、独立 ZCode 数据根与强制关闭自动领取（`$nativeCheckHome` 避免与只读变量 `$HOME` 冲突）：
+
+```powershell
+$nativeCheckHome = Join-Path $env:TEMP "zswitch-native-check"
+$nativeDataRoot = Join-Path $nativeCheckHome "zcode-data"
+$accountsDir = Join-Path $nativeCheckHome ".zcode-switch\accounts"
+New-Item -ItemType Directory -Force $nativeCheckHome | Out-Null
+New-Item -ItemType Directory -Force $accountsDir | Out-Null
+New-Item -ItemType Directory -Force $nativeDataRoot | Out-Null
+if (Test-Path "$env:USERPROFILE\.zcode-switch\accounts") {
+  Copy-Item "$env:USERPROFILE\.zcode-switch\accounts\*" $accountsDir -Recurse -Force
+}
+
+$settingsPath = Join-Path $nativeCheckHome ".zcode-switch\settings.json"
+if (Test-Path "$env:USERPROFILE\.zcode-switch\settings.json") {
+  Copy-Item "$env:USERPROFILE\.zcode-switch\settings.json" $settingsPath -Force
+}
+if (Test-Path $settingsPath) {
+  $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
+} else {
+  $settings = [pscustomobject]@{}
+}
+$settings | Add-Member -NotePropertyName auto_claim -NotePropertyValue $false -Force
+$settings | ConvertTo-Json -Depth 8 | Set-Content $settingsPath -Encoding UTF8
+if ((Get-Content $settingsPath -Raw | ConvertFrom-Json).auto_claim -ne $false) {
+  throw "auto_claim must be false before native verification"
+}
+
+$env:ZCODE_SWITCH_HOME = $nativeCheckHome
+$env:ZCODE_SWITCH_DATA_ROOT = $nativeDataRoot
+& .\src-tauri\target\debug\zcode-switch.exe
+```
+
+`ZCODE_SWITCH_HOME` 承载账号库、设置与 `claim-attempts.json`；`ZCODE_SWITCH_DATA_ROOT` 承载 ZCode live 配置与凭证。两者都指向临时目录，验收期间不会读写真实安装或真实 ZCode 数据目录。临时数据根为空时，切换账号会在其中生成 live 配置；不要在真实 home 上执行。
+
+检查项：
 
 - 验证码窗口标签为 `captcha-<claimId>`；关闭后重开不会复用旧会话。
 - SDK 失败时显示“重试验证准备”，点击只重试准备，不提交。
@@ -86,17 +119,17 @@ $env:ZCODE_DATA_BASE_DIR = "<ZCode 数据目录>"
 - 手动等待超时后按 `claim_status` 分流：已完成消费结果、未提交取消、提交中确认中、未知待确认。
 - `claim-attempts.json` 不含 JWT、验证码参数或完整响应。
 
-产物：原生窗口截图、时间线、脱敏后的 `claim-attempts.json`、执行人/日期。
+产物：原生窗口截图、时间线、脱敏后的 `claim-attempts.json`、执行人/日期、EXE 构建时间与提交号。
 
 ## 5. 线上副作用验收
 
-**未执行（待授权）。** 真实激活上报、验证码与领取都会产生副作用，需要用户明确指定测试账号并授权。默认设置未改动（自动领取仍默认关闭），测试使用独立临时 home，未触碰用户账号、ZCode live 文件或现有安装。
+**未执行（待授权）。** 真实激活上报、验证码与领取都会产生副作用，需要用户明确指定测试账号并授权。验收使用第 4 节的临时 home 与临时数据根，强制 `auto_claim=false`；现有安装与用户账号不被触碰。
 
 执行前需要确认：账号 ID、当前可领套餐、是否允许激活上报、是否允许一次真实领取。只做单账号手动领取，不做批量、不开自动领取。
 
 步骤：
 
-1. 只读确认：`zcode-switch.exe --cli claim-preview --id <账号id>`，该命令不触发激活上报。
+1. 预览确认（不触发激活上报）：在临时 home 下运行 `zcode-switch.exe --cli claim-preview --id <账号id>`。该命令会确保账号拥有设备 ID，可能初始化 `virtual_device_mid` 并写回**临时副本**的账号文件，因此不是无副作用的只读命令；不得对真实账号库执行。
 2. GUI 单账号领取，记录 claimId、开始/结束时间、最终状态。
 3. 成功：额度与可领套餐在同一行刷新，`claim_sessions` 无 unknown。
 4. 失败或 Unknown：界面区分明确失败与待确认；重启后同身份同套餐的自动领取仍被拦截；“检查领取结果”只调用额度与预览。
