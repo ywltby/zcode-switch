@@ -21,6 +21,12 @@ export function beginQuotaRequest(model, id) {
   };
 }
 
+export function releaseQuotaRequest(model, ticket) {
+  const entry = ticket && model.entries[ticket.id];
+  if (!entry?.busy || entry.revision !== ticket.revision || entry.sequence !== ticket.sequence) return model;
+  return { ...model, entries: { ...model.entries, [ticket.id]: { ...entry, busy: false } } };
+}
+
 export function settleQuotaRequest(model, ticket, { data, error } = {}) {
   const entry = ticket && model.entries[ticket.id];
   if (!entry?.busy || entry.revision !== ticket.revision || entry.sequence !== ticket.sequence) return model;

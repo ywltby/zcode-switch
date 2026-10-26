@@ -3,15 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
-import { createQuotaState, syncQuotaAccounts, beginQuotaRequest, settleQuotaRequest } from "./quota-state.js";
+import { createQuotaScheduler } from "./refresh-scheduler.js";
 
 const $app = document.getElementById("app");
 let state = null;
 let renaming = null;
 let busy = false;
 let appVer = "";
-let quotaState = createQuotaState();
-let acctQuota = quotaState.entries;
+let acctQuota = {};
 let stateSequence = 0;
 let claimable = {};
 let claimAllRunning = false;
@@ -70,26 +69,17 @@ async function refresh() {
   if (sequence === stateSequence) applyState(next);
 }
 
-function setQuotaState(next) {
-  quotaState = next;
-  acctQuota = next.entries;
-}
-
 function applyState(next) {
-  for (const account of next?.accounts || []) {
-    if (acctQuota[account.id]?.revision !== account.quota_revision) pokeAccount(account.id);
-  }
   state = next;
   if (state?.language) init(state.language);
-  setQuotaState(syncQuotaAccounts(quotaState, state?.accounts || []));
-  enrollAccounts();
+  quotaScheduler.applyAccounts(state?.accounts || []);
+  acctQuota = quotaScheduler.entries();
 }
 
 function invalidateQuotaFor(id) {
   ++stateSequence;
-  const entries = { ...quotaState.entries };
-  delete entries[id];
-  setQuotaState({ ...quotaState, entries });
+  quotaScheduler.invalidate(id);
+  acctQuota = quotaScheduler.entries();
 }
 
 function quotaErrorMessage(code) {
@@ -118,21 +108,19 @@ async function guard(fn) {
 }
 
 async function loadAcctQuota(id) {
-  const pending = beginQuotaRequest(quotaState, id);
-  if (!pending.ticket) return;
-  const ticket = pending.ticket;
-  setQuotaState(pending.model);
-  if (!uiLocked()) render();
-  try {
-    const data = await invoke("get_account_quota", { id, revision: ticket.revision });
-    if (data.account_id !== id || data.revision !== ticket.revision) throw new Error("scope_changed");
-    const error = data.completion === "unavailable" ? quotaErrors(data) || t("q.refreshFailed") : null;
-    setQuotaState(settleQuotaRequest(quotaState, ticket, { data, error }));
-  } catch (e) {
-    setQuotaState(settleQuotaRequest(quotaState, ticket, { error: quotaErrorMessage(String(e)) }));
-  }
-  if (!uiLocked()) render();
+  return quotaScheduler.request(id, { priority: "manual" });
 }
+
+const quotaScheduler = createQuotaScheduler({
+  invoke,
+  limit: 3,
+  classifyData: (data) => (data?.completion === "unavailable" ? quotaErrors(data) || t("q.refreshFailed") : null),
+  errorText: (error) => quotaErrorMessage(String(error)),
+  onChange: () => {
+    acctQuota = quotaScheduler.entries();
+    if (!uiLocked()) render();
+  },
+});
 
 async function loadClaimPreview(id) {
   const cur = claimable[id] || {};
@@ -334,10 +322,7 @@ const actions = {
     catch (e) { toast(stripErr(e), "err"); }
   },
   acctQuota(id) {
-    const dueAt = quotaDue[id];
-    loadAcctQuota(id).then(() => {
-      if (quotaDue[id] === dueAt) scheduleNext(id);
-    });
+    loadAcctQuota(id);
   },
 
   async addAccount() {
@@ -974,40 +959,14 @@ listen("state-changed", () => {
   refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
 });
 
-const SWEEP_PERIOD = 5 * 60 * 1000;
-const SWEEP_JITTER = 0.2;
-const TICK_MS = 8000;
-let quotaDue = {};
-let ticking = false;
+const SWEEP_TICK_MS = 8000;
 
-function scheduleNext(id, base = Date.now()) {
-  const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
-  quotaDue[id] = base + Math.round(SWEEP_PERIOD * jitter);
-}
-function enrollAccounts() {
-  const live = new Set((state?.accounts || []).map((a) => a.id));
-  for (const id of live) if (!(id in quotaDue)) quotaDue[id] = Date.now();
-  for (const id of Object.keys(quotaDue)) if (!live.has(id)) delete quotaDue[id];
-}
-function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
+function scheduleNext(id) { quotaScheduler.scheduleNext(id); }
+function enrollAccounts() { quotaScheduler.applyAccounts(state?.accounts || []); }
+function pokeAccount(id) { if (id) quotaScheduler.poke(id); }
 
-async function sweepTick() {
-  if (ticking) return;
-  enrollAccounts();
-  const now = Date.now();
-  const due = (state?.accounts || []).find(
-    (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
-  );
-  if (!due) return;
-  ticking = true;
-  const dueAt = quotaDue[due.id];
-  try {
-    await loadAcctQuota(due.id);
-    if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
-    if (!uiLocked()) render();
-  } finally {
-    ticking = false;
-  }
+function sweepTick() {
+  quotaScheduler.sweep({ isBlocked: (id) => Boolean(claimable[id]?.busy) });
 }
 
 (async () => {
@@ -1022,7 +981,7 @@ async function sweepTick() {
     setInterval(() => {
       refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
-    setInterval(sweepTick, TICK_MS);
+    setInterval(sweepTick, SWEEP_TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
     setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
   } catch (e) {

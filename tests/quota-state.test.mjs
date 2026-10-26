@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createQuotaState, syncQuotaAccounts, beginQuotaRequest, settleQuotaRequest } from "../src/quota-state.js";
+import { createQuotaState, syncQuotaAccounts, beginQuotaRequest, releaseQuotaRequest, settleQuotaRequest } from "../src/quota-state.js";
 
 const accounts = (revision = "r1") => [{ id: "a", quota_revision: revision }, { id: "b", quota_revision: "b1" }];
 const data = (revision = "r1") => ({ account_id: "a", revision, completion: "complete", refreshed_at: 100, plans: [{ name: "Synthetic plan" }] });
@@ -58,4 +58,22 @@ test("rename preserves cached quota; a settled request cannot finish twice", () 
   const renamed = syncQuotaAccounts(loaded, accounts().map(a => ({ ...a, name: "Renamed" })));
   assert.deepEqual(renamed.entries.a.data, data());
   assert.strictEqual(settleQuotaRequest(renamed, first.ticket, { error: "duplicate" }), renamed);
+});
+
+test("cancelling a queued request releases its busy marker exactly once", () => {
+  const first = beginQuotaRequest(initial(), "a");
+  const released = releaseQuotaRequest(first.model, first.ticket);
+  assert.equal(released.entries.a.busy, false);
+  assert.deepEqual(released.entries.b, initial().entries.b);
+  const again = beginQuotaRequest(released, "a");
+  assert.notEqual(again.ticket.sequence, first.ticket.sequence);
+  assert.strictEqual(releaseQuotaRequest(again.model, first.ticket), again.model);
+});
+
+test("releasing a stale ticket never frees a newer request", () => {
+  const first = beginQuotaRequest(initial(), "a");
+  const released = releaseQuotaRequest(first.model, first.ticket);
+  const next = beginQuotaRequest(released, "a");
+  const updated = syncQuotaAccounts(next.model, accounts("r2"));
+  assert.strictEqual(releaseQuotaRequest(updated, first.ticket), updated);
 });
