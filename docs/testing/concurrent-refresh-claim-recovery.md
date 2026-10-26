@@ -19,7 +19,7 @@
 | `npm test` | 77 通过，0 失败（`node --test tests/*.test.mjs`） |
 | `npm run check:i18n` | 通过（zh/en 各 241 个键） |
 | `npm run build` | 通过（Vite 生产构建） |
-| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 72 通过，0 失败 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | 75 通过，0 失败 |
 | `npm run tauri build -- --debug --no-bundle` | 成功，产物 `src-tauri/target/debug/zcode-switch.exe` |
 | `git diff --check` | 无输出（退出码 0） |
 
@@ -29,7 +29,7 @@
 - `tests/refresh.test.mjs`：20 个到期账号三路排空、手动去重与提升、旧版本成功/失败丢弃、排队期间删除、删除重加同版本、重命名不失效、失败释放槽位、旧任务不推迟新版本扫描、资格刷新与预览复用/先后顺序、`scope_changed` 只重试一次、领取完成后使提交前的预览失效、额度与领取共享同一队列（混合峰值不超过 3）、批量资格刷新三路并发、连续两次 `scope_changed` 后不残留 busy。
 - `tests/claim-state.test.mjs` / `tests/claim-attempts.test.mjs` / `tests/claim-run.test.mjs`：资格 ticket 校验、迟到结果、waiter 与结果解耦、结果早于 `claim_start` 返回、提交中暂停下一次领取、事件与状态查询去重、后端取消事件结束对应 waiter。
 - `tests/captcha.test.mjs`：配置先于 SDK、SDK/初始化超时、晚回调不提交、重复 success 只提交一次、重载发现 Submitting 不再初始化、setup 与 interactive 分流。
-- Rust：`claim_session`（唯一活动会话、单次提交许可、准备期取消、提交后不解锁、重启 Submitting → Unknown、坏记录不静默清空、记录不含凭证、待确认只放行一次已确认的手动重试、确认不会解除自动/批量拦截、明确结果替换旧记录、数值与字符串型 JWT 主体不误合并）、`store` 领取快照版本校验与设备 ID 只初始化一次、`claim` 验证码配置缓存（TTL、按 endpoint、暂态重试一次、401/429/业务拒绝不重试、不可用配置不缓存）。
+- Rust：`claim_session`（唯一活动会话、单次提交许可、准备期取消、提交后不解锁、准备失败保留旧 Unknown、重启 Submitting → Unknown、坏记录不静默清空、记录不含凭证、待确认只放行一次已确认的手动重试、确认不会解除自动/批量拦截、明确结果替换旧记录、渠道由唯一凭证推导时摘要稳定、数值与字符串型 JWT 主体不误合并）、`store` 领取快照版本校验与设备 ID 只初始化一次、`claim` 验证码配置缓存（TTL、按 endpoint、暂态重试一次、401/429/业务拒绝不重试、不可用配置不缓存）。
 
 ## 2. 离线并发统计
 
@@ -101,3 +101,6 @@ Node 测试不能替代这些路径；它们仍待在有桌面会话的 Windows 
 | 连续两次 `scope_changed` 后行内 busy 永久残留 | 任何未落结果的收尾都释放 ticket | `two consecutive scope_changed results never leave the row busy` |
 | 后端 `claim://cancelled` 前端未监听，关窗后仍等待超时 | 新增监听并结束对应 waiter | `a backend cancellation ends its own attempt without a claim outcome`；`tests/claim-ui.py` 断言关窗后领取按钮立即恢复 |
 | JWT 数值型主体被当作 `unknown`，同渠道不同账号共享拦截范围 | 身份摘要复用 `normalized_id`，数值与字符串主体等价 | `identity_scope_accepts_numeric_and_string_subjects_without_merging_accounts` |
+| 手动重试在预览阶段失败，却删除了旧 Unknown，自动领取被误解锁 | 只有 `succeeded` 或**已发送 POST 后**的明确失败才替换旧记录；准备失败保留旧记录 | `a_pre_submit_failure_keeps_the_unknown_it_replaced`、`a_post_submit_rejection_does_supersede_the_replaced_unknown` |
+| 缺少 `oauth:active_provider` 时身份摘要使用 `unknown`，补齐字段后同一账号摘要变化 | 身份摘要改用 `resolve_account_context` 中已验证的渠道与主体 | `identity_scope_matches_a_uniquely_inferred_provider` |
+| 准备期间取消后仍打开验证码窗口 | `mark_verifying` 失败即放弃开窗并返回“领取已取消” | `cancel_while_preparing_blocks_late_verification`；命令路径增加显式判断 |
