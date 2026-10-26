@@ -1055,7 +1055,7 @@ function render() {
        </div>`
     : rows;
 
-  const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const claimableCount = s.accounts.filter((a) => !unknownClaimFor(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
 
   $app.innerHTML = `
     <header class="topbar">
