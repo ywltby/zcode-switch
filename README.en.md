@@ -12,6 +12,8 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Add accounts**: OAuth login for new accounts inside the tool (BigModel / z.ai entries), never touching the current login
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping
 - **Claim promotions**: one-click claim for eligible promotions; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
+- **Concurrent refresh**: quota and claim eligibility share at most three application-level task slots; one request per account and revision; batch eligibility refresh no longer waits five seconds per account
+- **Claim recovery**: manual, batch, and automatic claims share one backend session; in-flight submission, unconfirmed results, and definite failures are shown separately, late results still land, and a restart never replays an unconfirmed submission
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
 - **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
 - **Tray / autostart / CLI automation**
@@ -34,6 +36,8 @@ Quota queries implement the ZCode 3.16.x login and project-token protocol. Exist
 Queries bind to one account, login revision, and project, using that account's existing device ID. Coding Plan reuses an existing API Key ID and **POSTs to issue a short-lived project token**, held only in memory. Queries do not create organizations, projects, or long-lived API keys, claim plans, or write account, live credential, configuration, or device files. Team projects remain separate; partial failures retain confirmed plans. Responses from changed or deleted logins are discarded.
 
 See the [quota isolation verification record](docs/testing/quota-account-isolation.md) for local and live verification status. Offline tests alone do not establish successful verification of all real accounts.
+
+The [concurrent refresh and claim recovery record](docs/testing/concurrent-refresh-claim-recovery.md) separates offline, browser, native Windows, and live side-effect verification. Native and live checks still require a machine with test accounts.
 
 ```
 zcode-switch.exe --cli state|list
