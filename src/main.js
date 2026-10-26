@@ -4,8 +4,18 @@ import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDe
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 import { createQuotaScheduler } from "./refresh-scheduler.js";
-import { createClaimFlow } from "./claim-flow.js";
+import { createClaimFlow, parseScopeError } from "./claim-flow.js";
 import { createRequestQueue } from "./request-queue.js";
+import {
+  closeWaiter,
+  createClaimAttempts,
+  finishWaiter,
+  registerAttempt,
+  settleAttempt,
+  syncClaimAccounts,
+  waitForAttempt,
+} from "./claim-attempts.js";
+import { claimOutcomeOf, resolveClaimTimeout } from "./claim-run.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -16,6 +26,9 @@ let acctQuota = {};
 let stateSequence = 0;
 let claimable = {};
 let claimAllRunning = false;
+let claimAttempts = createClaimAttempts();
+let claimUnknown = new Map();
+let claimRecovery = { ok: true };
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let refreshTicker = null;
@@ -78,6 +91,7 @@ function applyState(next) {
   acctQuota = quotaScheduler.entries();
   claimFlow.applyAccounts(state?.accounts || []);
   claimable = claimFlow.entries();
+  claimAttempts = syncClaimAccounts(claimAttempts, state?.accounts || []);
 }
 
 function invalidateQuotaFor(id) {
@@ -145,14 +159,132 @@ function loadClaimPreview(id) {
   return claimFlow.preview(id);
 }
 
-let claimWaiter = null;
-function waitForClaimResult(accountId, timeoutMs = 90000) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => { if (!done) { done = true; claimWaiter = null; clearTimeout(t); resolve(v); } };
-    const t = setTimeout(() => finish(null), timeoutMs);
-    claimWaiter = { accountId, finish };
+function newClaimId() {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi?.randomUUID) return cryptoApi.randomUUID();
+  return `claim-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function claimResultToast(payload, attempt) {
+  const name = payload.accountName || accountName(attempt.accountId);
+  if (payload.cancelled) return;
+  if (payload.unknown) {
+    claimUnknown.set(payload.claimId, { ...payload });
+    toast(t("m.claimUnconfirmed", { name }), "warn", t("m.claimUnconfirmedDetail"));
+    return;
+  }
+  if (payload.ok === false) {
+    let msg = payload.message || t("m.unknownErr");
+    if (payload.code === 1005 && payload.nextAt) {
+      msg += t("m.claimNextAt", { time: new Date(payload.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+    }
+    toast(t("m.claimFailed", { name, msg }), "err");
+    return;
+  }
+  const bits = [];
+  const now = payload.serverTime || Date.now();
+  if (payload.startsAt && payload.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(payload.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
+  if (payload.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(payload.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
+  toast(t("m.claimOk", { name, plan: payload.planName }), "ok", bits.join(t("common.listSep")));
+}
+
+function handleClaimResult(payload) {
+  const claimId = payload?.claimId;
+  if (!claimId) return false;
+  const settled = settleAttempt(claimAttempts, claimId, payload);
+  if (settled.status !== "accepted") return false;
+  const attempt = settled.attempt;
+  claimResultToast(payload, attempt);
+  if (settled.refresh) {
+    const id = attempt.accountId;
+    loadAcctQuota(id);
+    claimFlow.afterClaim(id);
+    scheduleNext(id);
+  }
+  finishWaiter(claimAttempts, claimId, payload);
+  if (!uiLocked()) render();
+  return true;
+}
+
+async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, retried = false } = {}) {
+  const account = (state?.accounts || []).find((a) => a.id === id);
+  if (!account || !plan) return { status: "skipped" };
+  const claimId = newClaimId();
+  registerAttempt(claimAttempts, {
+    claimId,
+    accountId: id,
+    revision: account.quota_revision,
+    planId: plan.plan_id,
+    mode,
   });
+  if (!uiLocked()) render();
+  try {
+    await invoke("claim_start", {
+      id,
+      revision: account.quota_revision,
+      planId: plan.plan_id,
+      claimId,
+      auto: mode === "auto",
+    });
+  } catch (e) {
+    const scope = parseScopeError(e);
+    claimAttempts.attempts.delete(claimId);
+    claimAttempts.order = claimAttempts.order.filter((value) => value !== claimId);
+    if (scope?.notStarted && !retried) {
+      await refresh();
+      return performClaim(id, plan, { mode, timeoutMs, retried: true });
+    }
+    const error = stripErr(e);
+    toast(t("m.claimAccountErr", { name: account.name, err: error }), "err");
+    return { status: "failed", error };
+  }
+  const payload = await waitForAttempt(claimAttempts, claimId, { timeoutMs });
+  if (payload) return claimOutcomeOf(payload);
+  return resolveClaimTimeout({
+    invoke,
+    claimId,
+    mode,
+    attempt: claimAttempts.attempts.get(claimId),
+    handleResult: handleClaimResult,
+    onConfirming: () => toast(t("m.claimConfirming"), "warn", t("m.claimConfirmingDetail")),
+    onTimeout: () => toast(t("m.claimTimeout"), "warn"),
+    isAborted: () => autoAbortRequested,
+    autoWaitMs: AUTO_CLAIM_WAIT_MS,
+  });
+}
+
+async function recoverClaimSessions() {
+  try {
+    const result = await invoke("claim_sessions");
+    claimRecovery = result?.recovery || { ok: true };
+    if (claimRecovery.ok === false) {
+      toast(t("m.claimRecoveryPaused"), "err", t("m.claimRecoveryPausedDetail"));
+    }
+    for (const session of result?.sessions || []) {
+      if (session?.status === "unknown") claimUnknown.set(session.claimId, session);
+    }
+  } catch {
+    claimRecovery = { ok: true };
+  }
+}
+
+function claimPending() {
+  for (const attempt of claimAttempts.attempts.values()) {
+    if (!attempt.handled) return true;
+  }
+  return false;
+}
+
+async function checkUnknownResult(id) {
+  quotaScheduler.poke(id);
+  await Promise.all([loadAcctQuota(id), loadClaimPreview(id)]);
+  if (!uiLocked()) render();
+}
+
+async function acknowledgeUnknown(claimId) {
+  await invoke("claim_acknowledge_unknown", { claimId }).catch(() => {});
+  claimUnknown.delete(claimId);
+  if (!uiLocked()) render();
 }
 
 async function awaitClaimPreviewFresh(id) {
@@ -348,18 +480,17 @@ const actions = {
   },
 
   async claim(id) {
-    if (claimActive || claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
+    if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) {
+      toast(t("m.claimBusy"), "warn");
+      return;
+    }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
     if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
     claimActive = true;
     try {
-      await invoke("claim_start", { id, planId: plan.plan_id });
       toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
-      const r = await waitForClaimResult(id);
-      if (!r) toast(t("m.claimTimeout"), "warn");
-    } catch (e) {
-      toast(stripErr(e), "err");
+      await performClaim(id, plan, { mode: "manual", timeoutMs: 90_000 });
     } finally {
       claimActive = false;
     }
@@ -370,25 +501,15 @@ const actions = {
       .map((a) => a.id)
       .filter((id) => (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    if (claimActive || claimAllRunning || refreshClaim.running) return;
+    if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) return;
     claimAllRunning = true;
     claimActive = true;
     try {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
-        const plan = claimable[id].plans[0];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
-        try {
-          await invoke("claim_start", { id, planId: plan.plan_id });
-        } catch (e) {
-          toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
-          continue;
-        }
-        const r = await waitForClaimResult(id, 120000);
-        if (!r) {
-          toast(t("m.claimAcctTimeout", { name }), "warn");
-          await invoke("claim_cancel").catch(() => {});
-        }
+        const plan = claimable[id]?.plans?.[0];
+        if (!plan) continue;
+        await performClaim(id, plan, { mode: "all", timeoutMs: 120_000 });
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
       }
     } finally {
@@ -501,7 +622,8 @@ function autoClaimCooldownFor(r) {
 
 async function autoClaimTick() {
   if (!state?.auto_claim || autoClaimRunning) return;
-  if (claimActive || claimAllRunning || refreshClaim.running) return;
+  if (claimRecovery.ok === false) return;
+  if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) return;
   const ids = (state.accounts || [])
     .map((a) => a.id)
     .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now());
@@ -534,28 +656,20 @@ async function autoClaimTick() {
         progressed = false;
         const plan = claimable[id]?.plans?.[0];
         if (!plan) break;
-        try {
-          await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
-        } catch (e) {
-          await invoke("claim_cancel").catch(() => {});
-          autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
-          break;
+        const outcome = await performClaim(id, plan, { mode: "auto", timeoutMs: AUTO_CLAIM_WAIT_MS });
+        if (outcome.status === "ok") {
+          gotAny = true; roundClaimed++;
+          await awaitClaimPreviewFresh(id);
+          if (!uiLocked()) render();
+          progressed = true;
+          await new Promise((res) => setTimeout(res, 1200));
+          continue;
         }
-        const r = await waitForClaimResult(id, AUTO_CLAIM_WAIT_MS);
-        if (!r) {
-          await invoke("claim_cancel").catch(() => {});
-          autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
-          break;
-        }
-        if (r.ok === false) {
-          autoClaimCooldown[id] = autoClaimCooldownFor(r);
-          break;
-        }
-        gotAny = true; roundClaimed++;
-        await awaitClaimPreviewFresh(id);
-        if (!uiLocked()) render();
-        progressed = true;
-        await new Promise((res) => setTimeout(res, 1200));
+        const payload = outcome.payload || { status: outcome.status };
+        autoClaimCooldown[id] = payload.unknown || outcome.status === "unknown"
+          ? Date.now() + 60 * 60 * 1000
+          : autoClaimCooldownFor(payload);
+        break;
       }
       if (!gotAny && (claimable[id]?.plans || []).length) roundSkipped++;
       await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS));
@@ -907,37 +1021,18 @@ listen("tray-action", (ev) => {
 });
 
 listen("claim://result", (ev) => {
-  const p = ev.payload || {};
-  if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
-  if (p.ok === false) {
-    let msg = p.message || t("m.unknownErr");
-    if (p.code === 1005 && p.nextAt) {
-      msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
-    }
-    toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
-  } else {
-    const bits = [];
-    const now = p.serverTime || Date.now();
-    if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
-    if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
-    toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
-  }
-  if (p.accountId) {
-    loadAcctQuota(p.accountId);
-    if (!autoClaimRunning) {
-      loadClaimPreview(p.accountId).then(() => { if (!uiLocked()) render(); });
-    }
-    scheduleNext(p.accountId);
-  }
+  handleClaimResult(ev.payload || {});
 });
 
-listen("captcha://interactive", () => {
-  if (!autoClaimRunning || !claimWaiter) return;
-  const id = claimWaiter.accountId;
-  invoke("claim_cancel").catch(() => {});
-  autoClaimCooldown[id] = Date.now() + 60 * 60 * 1000;
-  toast(t("m.autoClaimInteractive", { name: accountName(id) }), "warn", t("m.autoClaimInteractiveDetail"));
-  claimWaiter.finish({ ok: false, code: "interactive" });
+listen("captcha://interactive", (ev) => {
+  const claimId = ev.payload?.claimId;
+  if (!claimId) return;
+  const attempt = claimAttempts.attempts.get(claimId);
+  if (!attempt || attempt.mode !== "auto") return;
+  invoke("claim_cancel", { claimId }).catch(() => {});
+  autoClaimCooldown[attempt.accountId] = Date.now() + 60 * 60 * 1000;
+  toast(t("m.autoClaimInteractive", { name: accountName(attempt.accountId) }), "warn", t("m.autoClaimInteractiveDetail"));
+  closeWaiter(claimAttempts, claimId);
 });
 
 listen("oauth://done", (ev) => {
@@ -981,6 +1076,7 @@ function sweepTick() {
     setTimeout(dismissSplash, 350);
     enrollAccounts();
     sweepTick();
+    recoverClaimSessions().then(() => { if (!uiLocked()) render(); });
     setInterval(() => {
       refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);

@@ -13,7 +13,7 @@ import {
 
 const claimKey = (ticket) => JSON.stringify(["claim", ticket.kind, ticket.id, ticket.revision, ticket.sequence]);
 
-function parseScopeError(error) {
+export function parseScopeError(error) {
   const text = typeof error === "string" ? error : String(error);
   const start = text.indexOf("{");
   if (start < 0) return null;
