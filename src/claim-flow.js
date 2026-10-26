@@ -71,12 +71,10 @@ export function createClaimFlow({
     }
     liveSignature = signature;
     live = next;
-    const seen = new Set(live.map((a) => a.id));
     for (const [id, pending] of [...inFlight]) {
       const account = live.find((a) => a.id === id);
       if (!account || account.quota_revision !== pending.ticket.revision) cancel(id);
     }
-    void seen;
     setModel(syncClaimAccounts(model, live));
   }
 
