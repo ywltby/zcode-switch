@@ -335,16 +335,94 @@ pub fn submit_claim(
 }
 
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
-    let mut req = agent().get(CLIENT_CONFIGS_URL);
-    for (k, v) in quota::zai_billing_headers("") {
-        req = req.set(&k, &v);
+    static CACHE: std::sync::OnceLock<CaptchaCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(CaptchaCache::new);
+    let now = chrono::Utc::now().timestamp_millis();
+    cache.fetch(CLIENT_CONFIGS_URL, &fetch_config_http, now)
+}
+
+pub(crate) const CAPTCHA_CONFIG_TTL_MS: i64 = 300_000;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum CaptchaFetchError {
+    Transient,
+    Rejected,
+}
+
+type CaptchaHttp<'a> = dyn Fn(&str) -> Result<(u16, Value), CaptchaFetchError> + 'a;
+
+pub(crate) struct CaptchaCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, (i64, CaptchaConfig)>>,
+    fetch_lock: std::sync::Mutex<()>,
+}
+
+impl CaptchaCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fetch_lock: std::sync::Mutex::new(()),
+        }
     }
-    let resp = req
-        .call()
-        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+
+    /// Shared, endpoint-scoped cache. Only a usable config is cached; failures,
+    /// disabled configs, and missing scene ids are fetched again next time.
+    pub(crate) fn fetch(
+        &self,
+        endpoint: &str,
+        http: &CaptchaHttp,
+        now: i64,
+    ) -> Result<CaptchaConfig, String> {
+        if let Some(config) = self.cached(endpoint, now) {
+            return Ok(config);
+        }
+        let _fetch = self.fetch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(config) = self.cached(endpoint, now) {
+            return Ok(config);
+        }
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match http(endpoint) {
+                Ok((status, body)) => {
+                    if status == 401 || status == 429 {
+                        return Err(crate::i18n::tr("err.claim.config_unavailable"));
+                    }
+                    if status >= 400 {
+                        if status >= 500 && attempt == 1 {
+                            std::thread::sleep(Duration::from_millis(300));
+                            continue;
+                        }
+                        return Err(crate::i18n::trf("err.claim.config_req", &[("e", &format!("HTTP {status}"))]));
+                    }
+                    let config = parse_captcha_config(&body)?;
+                    if config.enabled && !config.scene_id.trim().is_empty() {
+                        self.entries
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(endpoint.to_string(), (now, config.clone()));
+                    }
+                    return Ok(config);
+                }
+                Err(CaptchaFetchError::Transient) if attempt == 1 => {
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                Err(error) => {
+                    let detail = if error == CaptchaFetchError::Transient { "transient" } else { "rejected" };
+                    return Err(crate::i18n::trf("err.claim.config_req", &[("e", detail)]));
+                }
+            }
+        }
+    }
+
+    fn cached(&self, endpoint: &str, now: i64) -> Option<CaptchaConfig> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, config) = entries.get(endpoint)?;
+        (now.saturating_sub(*at) < CAPTCHA_CONFIG_TTL_MS).then(|| config.clone())
+    }
+}
+
+fn parse_captcha_config(v: &Value) -> Result<CaptchaConfig, String> {
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
         return Err(crate::i18n::tr("err.claim.config_unavailable"));
     }
@@ -356,6 +434,29 @@ pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
         prefix: s("prefix"),
         scene_id: s("sceneId"),
     })
+}
+
+fn fetch_config_http(url: &str) -> Result<(u16, Value), CaptchaFetchError> {
+    let mut req = agent().get(url);
+    for (k, v) in quota::zai_billing_headers("") {
+        req = req.set(&k, &v);
+    }
+    match req.call() {
+        Ok(response) => {
+            let status = response.status();
+            let text = response
+                .into_string()
+                .map_err(|_| CaptchaFetchError::Transient)?;
+            let value = serde_json::from_str(&text).map_err(|_| CaptchaFetchError::Rejected)?;
+            Ok((status, value))
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            let value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            Ok((status, value))
+        }
+        Err(_) => Err(CaptchaFetchError::Transient),
+    }
 }
 
 fn str_field<'a>(e: &'a Value, snake: &str, camel: &str) -> Option<&'a str> {
