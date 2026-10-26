@@ -4,6 +4,8 @@ import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDe
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 import { createQuotaScheduler } from "./refresh-scheduler.js";
+import { createClaimFlow } from "./claim-flow.js";
+import { createRequestQueue } from "./request-queue.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -74,12 +76,16 @@ function applyState(next) {
   if (state?.language) init(state.language);
   quotaScheduler.applyAccounts(state?.accounts || []);
   acctQuota = quotaScheduler.entries();
+  claimFlow.applyAccounts(state?.accounts || []);
+  claimable = claimFlow.entries();
 }
 
 function invalidateQuotaFor(id) {
   ++stateSequence;
   quotaScheduler.invalidate(id);
+  claimFlow.invalidate(id);
   acctQuota = quotaScheduler.entries();
+  claimable = claimFlow.entries();
 }
 
 function quotaErrorMessage(code) {
@@ -111,9 +117,11 @@ async function loadAcctQuota(id) {
   return quotaScheduler.request(id, { priority: "manual" });
 }
 
+const requestQueue = createRequestQueue(3);
+
 const quotaScheduler = createQuotaScheduler({
   invoke,
-  limit: 3,
+  queue: requestQueue,
   classifyData: (data) => (data?.completion === "unavailable" ? quotaErrors(data) || t("q.refreshFailed") : null),
   errorText: (error) => quotaErrorMessage(String(error)),
   onChange: () => {
@@ -122,16 +130,19 @@ const quotaScheduler = createQuotaScheduler({
   },
 });
 
-async function loadClaimPreview(id) {
-  const cur = claimable[id] || {};
-  if (cur.busy) return;
-  claimable[id] = { plans: cur.plans || [], busy: true };
-  try {
-    const plans = await invoke("claim_preview", { id });
-    claimable[id] = { plans: plans || [], err: null, busy: false };
-  } catch (e) {
-    claimable[id] = { plans: cur.plans || [], err: String(e), busy: false };
-  }
+const claimFlow = createClaimFlow({
+  invoke,
+  queue: requestQueue,
+  errorText: (error) => stripErr(error),
+  refreshState: () => refresh(),
+  onChange: () => {
+    claimable = claimFlow.entries();
+    if (!uiLocked()) render();
+  },
+});
+
+function loadClaimPreview(id) {
+  return claimFlow.preview(id);
 }
 
 let claimWaiter = null;
@@ -145,13 +156,7 @@ function waitForClaimResult(accountId, timeoutMs = 90000) {
 }
 
 async function awaitClaimPreviewFresh(id) {
-  claimable[id] = { ...(claimable[id] || {}), busy: true };
-  try {
-    const plans = await invoke("claim_preview", { id });
-    claimable[id] = { plans: plans || [], err: null, busy: false };
-  } catch (e) {
-    claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-  }
+  await claimFlow.afterClaim(id);
 }
 
 const accountName = (id) => (state?.accounts || []).find((a) => a.id === id)?.name || id;
@@ -418,32 +423,34 @@ const actions = {
       }
     }
     let okCount = 0;
+    let failedCount = 0;
+    let skippedCount = 0;
     try {
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
-        refreshClaim.done = i + 1;
-        claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
-        if (!uiLocked()) render();
-        try {
-          const r = await invoke("claim_refresh", { id });
-          claimable[id] = { plans: r.plans || [], err: null, busy: false };
-          if ((r.plans || []).length) okCount++;
-          if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
-        } catch (e) {
-          claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-          toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
-        }
-        scheduleNext(id);
-        if (!uiLocked()) render();
-        if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 5000));
-      }
+      await claimFlow.refreshMany(ids, {
+        onItem: ({ id, done, outcome }) => {
+          refreshClaim.done = done;
+          const name = state?.accounts?.find((a) => a.id === id)?.name || id;
+          if (outcome.status === "ok") {
+            okCount++;
+            if (outcome.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(outcome.activationError) }), "warn");
+          } else if (outcome.status === "skipped") {
+            skippedCount++;
+          } else {
+            failedCount++;
+            toast(t("m.refreshClaimAcctErr", { name, err: stripErr(outcome.error || "") }), "err");
+          }
+          quotaScheduler.poke(id);
+          if (!uiLocked()) render();
+        },
+      });
     } finally {
       refreshClaim.running = false;
       refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
       if (!uiLocked()) render();
       setTimeout(stopRefreshTickerIfIdle, 1100);
     }
+    void failedCount;
+    void skippedCount;
     toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
   },
 
@@ -512,12 +519,8 @@ async function autoClaimTick() {
       if (!state?.auto_claim || autoAbortRequested) break;
       if (!(state.accounts || []).some((a) => a.id === id)) continue;
       let gotAny = false;
-      claimable[id] = { ...(claimable[id] || {}), busy: true };
-      try {
-        const r = await invoke("claim_refresh", { id });
-        claimable[id] = { plans: r.plans || [], err: null, busy: false };
-      } catch (e) {
-        claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+      const refreshed = await claimFlow.refresh(id);
+      if (refreshed.status !== "ok") {
         autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
         roundSkipped++;
         continue;

@@ -100,6 +100,18 @@ pub fn failure_payload(
     })
 }
 
+/// Structured scope failure. `notStarted` is true only when no activation report,
+/// preview, or claim request was sent for this attempt.
+pub fn scope_payload(account_id: &str, revision: &str, not_started: bool) -> String {
+    serde_json::json!({
+        "code": "scope_changed",
+        "accountId": account_id,
+        "revision": revision,
+        "notStarted": not_started,
+    })
+    .to_string()
+}
+
 fn claim_token(creds: &Value, _config: Option<&Value>, secret: &str) -> Result<String, String> {
     crate::quota_auth::strict_zcode_jwt(creds, secret).map_err(|_| crate::i18n::tr("err.claim.no_jwt"))
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PERIOD, account, createHarness, tick } from "./ui-harness.mjs";
+import { PERIOD, account, createClaimHarness, createHarness, tick } from "./ui-harness.mjs";
 
 const ids = (n) => Array.from({ length: n }, (_, i) => account(`a${i}`));
 
@@ -150,4 +150,102 @@ test("sweep skips blocked accounts without losing their due time", async () => {
   assert.equal(h.callsTo("a0").length, 1);
   await h.drain();
   assert.equal(h.scheduler.dueAt("a1"), 0, "a blocked account stays due for the next tick");
+});
+
+// ---- Claim eligibility refresh (Task 3) ----
+
+const claimIds = (n) => Array.from({ length: n }, (_, i) => account(`c${i}`));
+
+test("a preview in flight makes an explicit refresh wait its turn", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.hold.add("c0");
+  const preview = h.flow.preview("c0");
+  const refresh = h.flow.refresh("c0");
+  assert.deepEqual(h.callsTo("c0").map((c) => c.command), ["claim_preview"]);
+  h.release("c0");
+  await tick();
+  assert.deepEqual(h.callsTo("c0").map((c) => c.command), ["claim_preview", "claim_refresh"]);
+  h.release("c0");
+  const result = await refresh;
+  assert.equal(result.status, "ok");
+  assert.equal((await preview).status, "ok");
+});
+
+test("a refresh in flight lets a manual preview reuse its result", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.hold.add("c0");
+  const refresh = h.flow.refresh("c0");
+  const preview = h.flow.preview("c0");
+  assert.equal(preview, refresh, "the preview must share the in-flight refresh promise");
+  h.release("c0");
+  assert.equal((await preview).status, "ok");
+  assert.equal(h.callsTo("c0").length, 1);
+});
+
+test("activation failure does not discard a successful preview", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.responses.c0 = { plans: [{ plan_id: "p1", name: "Grant" }], activationError: "denied" };
+  const result = await h.flow.refresh("c0");
+  assert.equal(result.status, "ok");
+  assert.equal(result.activationError, "denied");
+  assert.deepEqual(h.state("c0").plans, [{ plan_id: "p1", name: "Grant" }]);
+  assert.equal(h.state("c0").activationError, "denied");
+});
+
+test("a failing account does not stop the batch and progress counts each item once", async () => {
+  const h = createClaimHarness({ accounts: claimIds(3) });
+  h.control.failures.set("c1", [new Error("network_error")]);
+  const progress = [];
+  const done = await h.flow.refreshMany(["c0", "c1", "c2"], {
+    onItem: ({ id, done, total, outcome }) => progress.push({ id, done, total, status: outcome.status }),
+  });
+  assert.equal(done, 3);
+  assert.deepEqual(progress.map((p) => p.done), [1, 2, 3]);
+  assert.deepEqual(progress.map((p) => p.status), ["ok", "failed", "ok"]);
+  assert.equal(h.state("c1").err, "Error: network_error");
+  assert.ok(h.state("c2").plans.length, "the batch continues after a failure");
+});
+
+test("a late refresh result for a changed revision is discarded", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.hold.add("c0");
+  const pending = h.flow.refresh("c0");
+  h.bumpRevision("c0", "r2");
+  h.release("c0");
+  const outcome = await pending;
+  assert.equal(outcome.status, "skipped");
+  assert.deepEqual(h.state("c0").plans, []);
+});
+
+test("scope_changed before any network work retries once after refreshing state", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.failures.set("c0", [h.scopeError()]);
+  const outcome = await h.flow.refresh("c0");
+  assert.equal(outcome.status, "ok");
+  assert.equal(h.control.refreshStateCalls, 1);
+  assert.equal(h.callsTo("c0").length, 2);
+});
+
+test("a second scope_changed is reported instead of retrying forever", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.failures.set("c0", [h.scopeError(), h.scopeError()]);
+  const outcome = await h.flow.refresh("c0");
+  assert.equal(outcome.status, "scope_changed");
+  assert.equal(h.control.refreshStateCalls, 1);
+  assert.equal(h.callsTo("c0").length, 2);
+});
+
+test("a claim completion invalidates a preview started before submission", async () => {
+  const h = createClaimHarness({ accounts: [account("c0")] });
+  h.control.hold.add("c0");
+  const beforeSubmit = h.flow.preview("c0");
+  const after = h.flow.afterClaim("c0");
+  assert.notEqual(after, beforeSubmit, "the post-claim preview must be a new request");
+  assert.equal(h.callsTo("c0").length, 2);
+  h.release("c0");
+  assert.equal((await beforeSubmit).status, "skipped");
+  h.release("c0");
+  const outcome = await after;
+  assert.equal(outcome.status, "ok");
+  assert.ok(h.state("c0").plans.length);
 });

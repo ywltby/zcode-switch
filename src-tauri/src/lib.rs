@@ -227,37 +227,99 @@ async fn get_account_quota(id: String, revision: Option<String>) -> Result<quota
     }).await.map_err(|_| "quota_worker_failed".to_string())?
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimPreviewResult {
+    account_id: String,
+    revision: String,
+    plans: Vec<claim::ClaimPlan>,
+}
+
 #[tauri::command]
-async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
-    let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+async fn claim_preview(id: String, revision: Option<String>) -> Result<ClaimPreviewResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = Paths::detect();
+        let snapshot = {
+            let _guard = store_guard();
+            store::claim_snapshot_locked(&paths, &id, revision.as_deref())?
+        };
+        if snapshot.device_initialized && revision.is_some() {
+            // The device id changed the account revision before any HTTP request.
+            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        }
+        let plans = claim::preview_plans(
+            &paths.home,
+            &snapshot.account.credentials,
+            snapshot.account.config.as_ref(),
+            snapshot.account.virtual_device_mid.clone(),
+        )?;
+        let unchanged = {
+            let _guard = store_guard();
+            store::claim_revision_matches(&paths, &id, &snapshot.revision)
+        };
+        if !unchanged {
+            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        }
+        Ok(ClaimPreviewResult { account_id: id, revision: snapshot.revision, plans })
+    })
+    .await
+    .map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaimRefreshResult {
+    account_id: String,
+    revision: String,
     plans: Vec<claim::ClaimPlan>,
     activated: bool,
     activation_error: Option<String>,
 }
 
 #[tauri::command]
-async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
-    let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    let (activated, activation_error) =
-        match claim::telemetry_user_id(&paths.home, &acc.credentials) {
-            Some(uid) => match claim::report_activation_events(&uid, &mid) {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e)),
-            },
-            None => (false, None),
+async fn claim_refresh(id: String, revision: Option<String>) -> Result<ClaimRefreshResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = Paths::detect();
+        let snapshot = {
+            let _guard = store_guard();
+            store::claim_snapshot_locked(&paths, &id, revision.as_deref())?
         };
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
-    Ok(ClaimRefreshResult { plans, activated, activation_error })
+        if snapshot.device_initialized && revision.is_some() {
+            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        }
+        let mid = snapshot.account.virtual_device_mid.clone().unwrap_or_default();
+        let (activated, activation_error) =
+            match claim::telemetry_user_id(&paths.home, &snapshot.account.credentials) {
+                Some(uid) => match claim::report_activation_events(&uid, &mid) {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                },
+                None => (false, None),
+            };
+        let plans = claim::preview_plans(
+            &paths.home,
+            &snapshot.account.credentials,
+            snapshot.account.config.as_ref(),
+            snapshot.account.virtual_device_mid.clone(),
+        )?;
+        let unchanged = {
+            let _guard = store_guard();
+            store::claim_revision_matches(&paths, &id, &snapshot.revision)
+        };
+        if !unchanged {
+            // The activation report was already sent, so this must not auto-retry.
+            return Err(claim::scope_payload(&id, &snapshot.revision, false));
+        }
+        Ok(ClaimRefreshResult {
+            account_id: id,
+            revision: snapshot.revision,
+            plans,
+            activated,
+            activation_error,
+        })
+    })
+    .await
+    .map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[tauri::command]

@@ -45,6 +45,55 @@ fn contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     result
 }
 
+fn expect_scope_changed(result: Result<ClaimSnapshot, String>) {
+    match result {
+        Err(error) => assert_eq!(error, "scope_changed"),
+        Ok(_) => panic!("expected a scope change"),
+    }
+}
+
+#[test]
+fn claim_snapshot_initializes_the_device_once_and_rejects_the_old_revision() {
+    let fixture = Fixture::new();
+    let paths = &fixture.paths;
+    let mut fresh = account("c", "zai");
+    fresh.virtual_device_mid = None;
+    save_account(paths, &fresh).unwrap();
+    let secret = zcrypto::default_secret(&paths.home);
+    let before = crate::quota_auth::quota_revision(&fresh, &secret);
+
+    let first = claim_snapshot_locked(paths, "account-c", Some(&before)).unwrap();
+    assert!(first.device_initialized);
+    assert_ne!(first.revision, before, "the device id changes the revision");
+    let mid = first.account.virtual_device_mid.clone().unwrap();
+    assert!(!mid.trim().is_empty());
+
+    // The same revision is now stale: no activation, preview, or claim may start.
+    expect_scope_changed(claim_snapshot_locked(paths, "account-c", Some(&before)));
+
+    let second = claim_snapshot_locked(paths, "account-c", Some(&first.revision)).unwrap();
+    assert!(!second.device_initialized, "the device id is initialized once");
+    assert_eq!(second.account.virtual_device_mid.as_deref(), Some(mid.as_str()));
+    assert_eq!(second.revision, first.revision);
+}
+
+#[test]
+fn claim_revision_check_detects_updates_and_deletion() {
+    let fixture = Fixture::new();
+    let paths = &fixture.paths;
+    let snapshot = claim_snapshot_locked(paths, "account-a", None).unwrap();
+    assert!(claim_revision_matches(paths, "account-a", &snapshot.revision));
+
+    let mut updated = load_account(paths, "account-a").unwrap();
+    updated.credentials["zcodejwttoken"] = serde_json::json!(crate::test_support::jwt(serde_json::json!({"id": "replacement"})));
+    save_account(paths, &updated).unwrap();
+    assert!(!claim_revision_matches(paths, "account-a", &snapshot.revision));
+
+    delete_account(paths, "account-a").unwrap();
+    assert!(!claim_revision_matches(paths, "account-a", &snapshot.revision));
+    expect_scope_changed(claim_snapshot_locked(paths, "account-a", Some(&snapshot.revision)));
+}
+
 #[test]
 fn account_query_is_read_only_and_independent_of_live_account() {
     let fixture = Fixture::new();

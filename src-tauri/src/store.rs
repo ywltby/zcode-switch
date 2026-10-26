@@ -1221,6 +1221,46 @@ pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Stri
     ensure_virtual_device_mid_locked(paths, id)
 }
 
+pub(crate) struct ClaimSnapshot {
+    pub account: Account,
+    pub revision: String,
+    pub device_initialized: bool,
+}
+
+// Short-lock claim preparation: validate the caller's revision, then make sure the
+// account owns a virtual device id. Never performs network I/O or repairs hashes.
+pub(crate) fn claim_snapshot_locked(
+    paths: &Paths,
+    id: &str,
+    expected: Option<&str>,
+) -> Result<ClaimSnapshot, String> {
+    let mut account = read_quota_account(paths, id)?;
+    let secret = zcrypto::default_secret(&paths.home);
+    let current = crate::quota_auth::quota_revision(&account, &secret);
+    if expected.is_some_and(|value| value != current) {
+        return Err("scope_changed".into());
+    }
+    let device_initialized = account
+        .virtual_device_mid
+        .as_deref()
+        .map_or(true, |m| m.trim().is_empty());
+    if device_initialized {
+        let mid = ensure_virtual_device_mid_locked(paths, id)?;
+        account.virtual_device_mid = Some(mid);
+    }
+    let revision = crate::quota_auth::quota_revision(&account, &secret);
+    Ok(ClaimSnapshot { account, revision, device_initialized })
+}
+
+pub(crate) fn claim_revision_matches(paths: &Paths, id: &str, revision: &str) -> bool {
+    read_quota_account(paths, id)
+        .map(|account| {
+            crate::quota_auth::quota_revision(&account, &zcrypto::default_secret(&paths.home))
+                == revision
+        })
+        .unwrap_or(false)
+}
+
 pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
     let mut v: Value = fs::read_to_string(paths.live_telemetry())
         .ok()
