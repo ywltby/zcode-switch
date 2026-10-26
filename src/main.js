@@ -772,8 +772,7 @@ function quotaBarHtml(pct) {
   const remaining = used == null ? null : 100 - used;
   const danger = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
   const txt = remaining == null ? "--" : remaining.toFixed(0) + "%";
-  const txtCls = (remaining ?? 100) >= 58 ? " in-fill" : "";
-  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct${txtCls}">${txt}</span></div>`;
+  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct">${txt}</span></div>`;
 }
 
 function itemKind(it) {

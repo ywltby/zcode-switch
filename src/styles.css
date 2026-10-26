@@ -633,8 +633,24 @@ input:focus-visible,
   display: inline-block;
 }
 .qbar { height: 19px; border-radius: 4px; background: #2b2e36; overflow: hidden; margin-top: 4px; position: relative; }
-.qbar-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 11.5px; color: #97a1b4; letter-spacing: .02em; }
-.qbar-pct.in-fill { color: #0e1116; font-weight: 600; }
+.qbar-pct {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #151a20;
+  color: #f7f9fc;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 15px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  pointer-events: none;
+}
 .qbar-fill { height: 100%; background: var(--mint); border-radius: 3px; transition: width .3s ease; }
 .qbar.warn .qbar-fill { background: var(--amber); }
 .qbar.danger .qbar-fill { background: var(--red); }
@@ -690,7 +706,6 @@ input:focus-visible,
 .q-win.mini .q-win-pct { font-size: 12.5px; }
 .q-win.mini .q-win-reset { font-size: 11.5px; }
 .q-win.mini .qbar { height: 17px; }
-.q-win.mini .qbar-pct { font-size: 11px; }
 .aq-loading { color: var(--ink-mute); font-size: 13px; }
 .aq-err { color: #c98f8f; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row.force { border-color: #4a3d22; background: #241f16; }
