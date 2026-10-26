@@ -379,7 +379,6 @@ async fn claim_start(
         created_at: now,
         updated_at: now,
         phase: claim_session::ClaimPhase::Preparing,
-        submitted: false,
         replaces: None,
         material: claim_session::ClaimMaterial {
             credentials: snapshot.account.credentials.clone(),

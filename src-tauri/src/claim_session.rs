@@ -75,8 +75,6 @@ pub struct ClaimSession {
     pub created_at: i64,
     pub updated_at: i64,
     pub phase: ClaimPhase,
-    /// True once the submission marker was persisted and the POST may have run.
-    pub submitted: bool,
     /// Unknown claim this session explicitly replaces after a manual acknowledgement.
     pub replaces: Option<String>,
     pub material: ClaimMaterial,
@@ -335,13 +333,11 @@ impl ClaimRegistry {
         };
         if let Some(session) = self.active.as_mut() {
             session.phase = ClaimPhase::Submitting;
-            session.submitted = true;
             session.updated_at = now_ms();
         }
         if self.persist().is_err() {
             if let Some(session) = self.active.as_mut() {
                 session.phase = ClaimPhase::Verifying;
-                session.submitted = false;
             }
             return Err(SubmitError::PersistFailed);
         }
@@ -357,10 +353,9 @@ impl ClaimRegistry {
             return false;
         }
         let replaced = active.replaces.clone();
-        // Only a definite result of an attempt that actually sent the POST may
-        // supersede the unresolved record it replaced.
-        let supersedes = phase == ClaimPhase::Succeeded
-            || (phase == ClaimPhase::Failed && active.submitted);
+        // Only a successful replacement proves the plan is now claimed. Any failure
+        // — including a rejection of the new POST — says nothing about the old one.
+        let supersedes = phase == ClaimPhase::Succeeded;
         let mut summary = active.summary();
         summary.status = phase.as_str().to_string();
         summary.result = result;

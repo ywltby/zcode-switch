@@ -22,7 +22,6 @@ fn session(claim_id: &str, scope: &str, plan_id: &str) -> ClaimSession {
         created_at: now_ms(),
         updated_at: now_ms(),
         phase: ClaimPhase::Preparing,
-        submitted: false,
         replaces: None,
         material: ClaimMaterial {
             credentials: json!({"zcodejwttoken": "synthetic-secret-token"}),
@@ -249,25 +248,69 @@ fn a_pre_submit_failure_keeps_the_unknown_it_replaced() {
     assert_eq!(registry.status("old").unwrap().status, "unknown");
 }
 
-#[test]
-fn a_post_submit_rejection_does_supersede_the_replaced_unknown() {
+fn retry_registry() -> (ClaimRegistry, String) {
     let mut registry = ClaimRegistry::load(temp_file());
     verifying(&mut registry, "old", "zai:one", "p1");
     registry.begin_submit("old").unwrap();
     registry.finish("old", ClaimPhase::Unknown, None);
     assert!(registry.allow_manual_retry("old"));
     let replaced = match registry.gate("manual", "zai:one", "p1") {
-        StartGate::Allowed(replaced) => replaced,
+        StartGate::Allowed(Some(replaced)) => replaced,
         _ => panic!("explicit retry should be permitted"),
     };
+    (registry, replaced)
+}
+
+#[test]
+fn a_local_auth_failure_after_the_marker_keeps_the_old_unknown() {
+    let (mut registry, replaced) = retry_registry();
     let mut retry = session("retry", "zai:one", "p1");
-    retry.replaces = replaced;
+    retry.replaces = Some(replaced);
     registry.try_start(retry).unwrap();
     assert!(registry.mark_verifying("retry"));
     registry.begin_submit("retry").unwrap();
-    registry.finish("retry", ClaimPhase::Failed, Some(json!({"code": 1005})));
-    assert!(!registry.blocks("zai:one", "p1"));
-    assert!(registry.status("old").is_none(), "the rejected retry is the new outcome");
+
+    // Captured credentials can expire while the user solves the captcha. The
+    // submission marker is not proof that the replacement POST was sent.
+    let mut account = crate::test_support::account("review", "zai");
+    account.credentials["zcodejwttoken"] = json!(crate::test_support::jwt(
+        json!({"id": "zcode-review", "exp": 1})
+    ));
+    let error = crate::claim::submit_claim(
+        &std::env::temp_dir(),
+        &account.credentials,
+        None,
+        "p1",
+        "synthetic-captcha",
+        None,
+        Some("synthetic-mid".into()),
+    )
+    .unwrap_err();
+    assert!(!error.unknown, "the expired JWT fails before any POST");
+    registry.finish("retry", ClaimPhase::Failed, Some(json!({"code": error.code})));
+    assert!(
+        registry.blocks("zai:one", "p1"),
+        "a persisted marker is not proof that the replacement POST was sent"
+    );
+    assert_eq!(registry.gate("auto", "zai:one", "p1"), StartGate::Unconfirmed);
+}
+
+#[test]
+fn a_captcha_rejection_of_the_retry_keeps_the_old_unknown() {
+    let (mut registry, replaced) = retry_registry();
+    let mut retry = session("retry", "zai:one", "p1");
+    retry.replaces = Some(replaced);
+    registry.try_start(retry).unwrap();
+    assert!(registry.mark_verifying("retry"));
+    registry.begin_submit("retry").unwrap();
+    // 3007 rejects the NEW request; it says nothing about the OLD POST.
+    registry.finish("retry", ClaimPhase::Failed, Some(json!({"code": 3007})));
+    assert!(
+        registry.blocks("zai:one", "p1"),
+        "a new request's captcha rejection cannot resolve an old unknown result"
+    );
+    assert_eq!(registry.gate("auto", "zai:one", "p1"), StartGate::Unconfirmed);
+    assert_eq!(registry.status("old").unwrap().status, "unknown");
 }
 
 #[test]
