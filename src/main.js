@@ -15,7 +15,7 @@ import {
   syncClaimAccounts,
   waitForAttempt,
 } from "./claim-attempts.js";
-import { claimOutcomeOf, resolveClaimTimeout } from "./claim-run.js";
+import { claimOutcomeOf, resolveClaimTimeout, waitForBackendResult } from "./claim-run.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -246,7 +246,12 @@ async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, ret
     mode,
     attempt: claimAttempts.attempts.get(claimId),
     handleResult: handleClaimResult,
-    onConfirming: () => toast(t("m.claimConfirming"), "warn", t("m.claimConfirmingDetail")),
+    onConfirming: () => {
+      const attempt = claimAttempts.attempts.get(claimId);
+      if (attempt) attempt.confirming = true;
+      if (!uiLocked()) render();
+      toast(t("m.claimConfirming"), "warn", t("m.claimConfirmingDetail"));
+    },
     onTimeout: () => toast(t("m.claimTimeout"), "warn"),
     isAborted: () => autoAbortRequested,
     autoWaitMs: AUTO_CLAIM_WAIT_MS,
@@ -261,7 +266,25 @@ async function recoverClaimSessions() {
       toast(t("m.claimRecoveryPaused"), "err", t("m.claimRecoveryPausedDetail"));
     }
     for (const session of result?.sessions || []) {
-      if (session?.status === "unknown") claimUnknown.set(session.claimId, session);
+      if (session?.status === "unknown") {
+        claimUnknown.set(session.claimId, session);
+        continue;
+      }
+      if (session?.status === "submitting") {
+        const account = (state?.accounts || []).find((a) => a.id === session.accountId);
+        if (!account) continue;
+        const attempt = registerAttempt(claimAttempts, {
+          claimId: session.claimId,
+          accountId: session.accountId,
+          revision: session.revision || account.quota_revision,
+          planId: session.planId,
+          mode: "manual",
+        });
+        attempt.confirming = true;
+        // Keep polling: the backend still owns the submission mutex.
+        waitForBackendResult({ invoke, claimId: session.claimId, mode: "all", handleResult: handleClaimResult })
+          .then(() => { if (!uiLocked()) render(); });
+      }
     }
   } catch {
     claimRecovery = { ok: true };
@@ -460,6 +483,44 @@ const actions = {
   },
   acctQuota(id) {
     loadAcctQuota(id);
+  },
+
+  async refreshClaimOne(id) {
+    if (refreshClaim.running || claimAllRunning || autoClaimRunning || claimPending()) return;
+    if (!(state?.accounts || []).some((a) => a.id === id)) return;
+    const outcome = await claimFlow.refresh(id).catch((e) => ({ status: "failed", error: stripErr(e) }));
+    if (outcome.status === "ok" && outcome.activationError) {
+      toast(t("m.refreshClaimAcctErr", { name: accountName(id), err: stripErr(outcome.activationError) }), "warn");
+    } else if (outcome.status === "failed") {
+      toast(t("m.refreshClaimAcctErr", { name: accountName(id), err: stripErr(outcome.error || "") }), "err");
+    }
+    quotaScheduler.poke(id);
+    if (!uiLocked()) render();
+  },
+
+  async checkUnknown(id) {
+    await checkUnknownResult(id);
+    toast(t("m.claimChecked"), "ok", t("m.claimCheckedDetail"));
+  },
+
+  askRetryUnknown(claimId, id) {
+    if (!(state?.accounts || []).some((a) => a.id === id)) return;
+    openConfirmModal({
+      kind: "warn",
+      icon: "alert",
+      title: t("m.claimRetry"),
+      desc: t("m.claimRetryDetail"),
+      yesLabel: t("m.claimRetryYes"),
+      onYes: () => actions.doRetryUnknown(claimId, id),
+    });
+  },
+
+  async doRetryUnknown(claimId, id) {
+    await acknowledgeUnknown(claimId);
+    await refresh();
+    const plan = claimable[id]?.plans?.[0];
+    if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
+    await actions.claim(id);
   },
 
   async addAccount() {
@@ -779,19 +840,54 @@ function grantLabel(plan) {
   }
   return (plan.grants || [])[0] || "";
 }
+function claimAttemptFor(id) {
+  for (const attempt of claimAttempts.attempts.values()) {
+    if (attempt.accountId === id && !attempt.handled) return attempt;
+  }
+  return null;
+}
+
+function unknownClaimFor(id) {
+  for (const claim of claimUnknown.values()) {
+    if (claim.accountId === id) return claim;
+  }
+  return null;
+}
+
 function claimStripHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
-  if (!plan) return "";
+  const attempt = claimAttemptFor(id);
+  const unknown = unknownClaimFor(id);
+  const rows = [];
+  if (attempt?.confirming) {
+    rows.push(`<div class="claim-unknown"><span class="aq-status">${esc(t("m.claimConfirming"))}</span></div>`);
+  }
+  if (unknown) {
+    rows.push(`<div class="claim-unknown">
+      <span class="aq-err">${esc(t("m.claimUnconfirmed", { name: accountName(id) }))}</span>
+      <button class="btn-ghost" click="actions.checkUnknown('${id}')">${esc(t("m.claimCheck"))}</button>
+      <button class="btn-ghost" click="actions.askRetryUnknown('${unknown.claimId}','${id}')">${esc(t("m.claimRetry"))}</button>
+    </div>`);
+  }
+  if (c?.err) {
+    rows.push(`<div class="claim-unknown">
+      <span class="aq-err" title="${esc(c.err)}">${esc(c.err)}</span>
+      <button class="btn-ghost" click="actions.refreshClaimOne('${id}')"
+        ${refreshClaim.running || claimAllRunning || autoClaimRunning || claimPending() ? "disabled" : ""}>${esc(t("m.refreshClaimRetry"))}</button>
+    </div>`);
+  }
+  if (!plan) return rows.join("");
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
-  return `
+  rows.unshift(`
   <div class="claim-strip" title="${esc(plan.description || label)}">
     ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
-  </div>`;
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning || claimPending() || unknown ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+  </div>`);
+  return rows.join("");
 }
 
 function slotRowsHtml(items) {
@@ -967,7 +1063,7 @@ function render() {
         ${ic("capture", 16)} ${t("btn.saveLogin")}
       </button>
       ${claimableCount > 0
-        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning || claimPending() ? "disabled" : ""}
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
       ${(s.accounts.length > 0)
@@ -1022,6 +1118,17 @@ listen("tray-action", (ev) => {
 
 listen("claim://result", (ev) => {
   handleClaimResult(ev.payload || {});
+});
+
+listen("captcha://setup-failed", (ev) => {
+  const claimId = ev.payload?.claimId;
+  if (!claimId) return;
+  const attempt = claimAttempts.attempts.get(claimId);
+  if (!attempt || attempt.mode === "manual") return;
+  invoke("claim_cancel", { claimId }).catch(() => {});
+  autoClaimCooldown[attempt.accountId] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+  closeWaiter(claimAttempts, claimId);
+  toast(t("m.claimSetupFailed", { name: accountName(attempt.accountId) }), "warn", t("m.claimSetupFailedDetail"));
 });
 
 listen("captcha://interactive", (ev) => {

@@ -53,7 +53,8 @@ MOCK = r"""
         fixture.accounts.forEach(a => a.is_active = a.id === args.id);
         return { switched: true, name: args.id, probe: null };
       }
-      if (command === 'claim_preview') return [];
+      if (command === 'claim_preview') return { accountId: args.id, revision: args.revision, plans: [] };
+      if (command === 'claim_sessions') return { sessions: [], recovery: { ok: true } };
       if (command.startsWith('plugin:event|')) return 1;
       if (['reveal_main','dismiss_splash'].includes(command)) return;
       throw new Error(`Unexpected synthetic command: ${command}`);
@@ -133,7 +134,7 @@ def main():
         page.set_viewport_size({"width": 520, "height": 760})
         page.screenshot(path=str(output / "final.png"), full_page=True)
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "horizontal overflow"
-        assert not any("claim" in command and command != "claim_preview" for command in page.evaluate("quotaFixture.trace"))
+        assert not any("claim" in command and command not in ("claim_preview", "claim_sessions") for command in page.evaluate("quotaFixture.trace"))
         assert not errors, errors
         browser.close()
     print("PASS: synthetic A/B/C refresh, partial status, stale timestamp, credential update, state polling, late success/error, deletion, switching, and narrow layout. No real API requests.")

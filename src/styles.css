@@ -950,6 +950,20 @@ input:focus-visible,
 .btn-claim:hover { background: #f0b055; }
 .btn-claim:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 
+.claim-unknown {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 4px;
+  padding: 4px 8px;
+  border: 1px solid rgba(201, 143, 143, .35);
+  border-radius: 6px;
+  background: rgba(201, 143, 143, .06);
+}
+.claim-unknown .aq-err { flex: 1 1 160px; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.claim-unknown .btn-ghost { flex: none; font-size: 12px; padding: 2px 8px; }
+
 .toolbar .claim-all {
   border-color: var(--amber-deep);
   color: var(--amber);
