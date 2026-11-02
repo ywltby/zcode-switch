@@ -1241,6 +1241,22 @@ pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Stri
     ensure_virtual_device_mid_locked(paths, id)
 }
 
+/// Campaign eligibility is keyed to the device id: once the server has delivered to it,
+/// that id never sees the campaign again. Replacing it is the same move as deleting
+/// ZCode's `telemetry-state.json`, without touching the client's own identity.
+pub fn reset_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, String> {
+    let _guard = crate::store_guard();
+    let mut acc = load_account(paths, id)?;
+    if id == LIVE_ID {
+        return Err("identity_conflict".into());
+    }
+    let mid = Uuid::new_v4().to_string();
+    acc.virtual_device_mid = Some(mid.clone());
+    acc.updated_at = now_ts();
+    save_account(paths, &acc)?;
+    Ok(mid)
+}
+
 pub(crate) struct ClaimSnapshot {
     pub account: Account,
     pub revision: String,

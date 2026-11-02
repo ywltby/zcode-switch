@@ -233,6 +233,15 @@ pub fn run(args: &[String]) -> (String, i32) {
             }
             ok(json!({ "anyClaimable": any, "accounts": items }))
         }
+        "reset-device" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err(&crate::i18n::tr("cli.usage.reset_device")), 2);
+            };
+            match reset_virtual_device_mid(&paths, &id) {
+                Ok(mid) => ok(json!({ "id": id, "device_mid": mid })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         "behavior" => {
             let las = flag(rest, "--launch-after-switch");
             let ctt = flag(rest, "--close-to-tray");

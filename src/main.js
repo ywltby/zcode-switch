@@ -591,6 +591,17 @@ const actions = {
     if (!uiLocked()) render();
   },
 
+  async resetDevice(id) {
+    await guard(async () => {
+      await invoke("reset_device", { id });
+      invalidateQuotaFor(id);
+      claimFlow.invalidate(id);
+      await refresh();
+      render();
+      toast(t("m.resetDeviceOk", { name: claimDisplayName(id) }), "ok", t("m.resetDeviceOkDetail"));
+    });
+  },
+
   async checkUnknown(id) {
     await checkUnknownResult(id);
     toast(t("m.claimChecked"), "ok", t("m.claimCheckedDetail"));
@@ -1171,7 +1182,7 @@ function render() {
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
           <div class="row-name"><span class="row-name-ident"><span class="row-name-text" title="${esc(a.name)}">${esc(a.name)}</span>${channelBadge(a.identity?.provider)}</span>${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
-          <div class="row-meta">${meta ? `<span class="row-meta-text">${meta}</span>` : ""}</div>
+          <div class="row-meta">${meta ? `<span class="row-meta-text">${meta}</span>` : ""}<button class="row-meta-action" title="${esc(t("btn.resetDeviceTitle"))}" click="actions.resetDevice('${a.id}')">${esc(t("btn.resetDevice"))}</button></div>
         </div>
         <div class="row-actions">
           <button class="icon-btn${claimQueryBusy ? " is-checking" : ""}" title="${esc(t(claimQueryBusy ? "btn.checkEligibilityBusy" : "btn.checkEligibilityTitle"))}" aria-label="${esc(t("btn.checkEligibility"))}" aria-busy="${claimQueryBusy}" click="actions.refreshClaimOne('${a.id}')" ${claimQueryBusy ? "disabled" : ""}>${ic(claimQueryBusy ? "refresh" : "giftSearch", 16)}</button>

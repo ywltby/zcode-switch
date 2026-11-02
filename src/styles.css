@@ -299,6 +299,22 @@ input:focus-visible,
   letter-spacing: .03em;
 }
 .row-meta-text { min-width: 0; overflow-wrap: anywhere; }
+/* Secondary action: keeps the row's icon group at five buttons so nothing is pushed out. */
+.row-meta-action {
+  flex: none;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink-mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .03em;
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.row-meta-action:hover { color: var(--ink); border-color: var(--ink-mute); }
 .channel-badge {
   flex: none;
   display: inline-flex;

@@ -272,6 +272,20 @@ async fn get_account_quota(id: String, revision: Option<String>) -> Result<quota
     }).await.map_err(|_| "quota_worker_failed".to_string())?
 }
 
+/// Campaign eligibility is keyed to the device id: an id the server already delivered to
+/// never sees the same campaign again. Swapping it is the in-app equivalent of deleting
+/// ZCode's own `telemetry-state.json`, without touching the client's identity.
+#[tauri::command]
+async fn reset_device(id: String) -> Result<serde_json::Value, String> {
+    let account_id = id.clone();
+    let mid = tauri::async_runtime::spawn_blocking(move || {
+        store::reset_virtual_device_mid(&Paths::detect(), &account_id)
+    })
+    .await
+    .map_err(|_| "quota_worker_failed".to_string())??;
+    Ok(json!({ "id": id, "deviceMid": mid }))
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaimPreviewResult {
@@ -1476,6 +1490,7 @@ pub fn run() {
             switch_to,
             get_live_quota,
             get_account_quota,
+            reset_device,
             claim_preview,
             claim_refresh,
             claim_start,
