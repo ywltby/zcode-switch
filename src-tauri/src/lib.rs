@@ -1,21 +1,20 @@
 pub mod cipher;
 pub mod cli;
 pub mod i18n;
-mod claim;
-mod claim_session;
+pub mod changelog;
+pub mod claim;
 mod flowlog;
 mod oauth;
 mod probe;
 mod quota;
-mod quota_auth;
-mod quota_http;
-mod project_token;
+mod risk;
 mod store;
 mod zcrypto;
 #[cfg(test)]
 mod test_support;
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use store::*;
 use tauri::menu::{MenuBuilder, MenuItem};
@@ -28,7 +27,29 @@ const TRAY_ID: &str = "main";
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
-static CLAIM_REGISTRY: Mutex<Option<claim_session::ClaimRegistry>> = Mutex::new(None);
+/// 托盘 tooltip 上附加的「新活动」提示（None = 无提示）。
+/// Windows 便携版拿不到 Toast，悬停托盘图标看提示是最可靠的可见通道。
+static ACTIVITY_TIP: Mutex<Option<String>> = Mutex::new(None);
+/// 托盘闪烁开关：true 时后台线程持续交替图标，直到用户点开活动详情。
+static TRAY_FLASH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn activity_tip_guard() -> std::sync::MutexGuard<'static, Option<String>> {
+    match ACTIVITY_TIP.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[derive(Clone)]
+struct PendingClaim {
+    account_id: String,
+    account_name: String,
+    plan_id: String,
+    plan_name: String,
+    credentials: Value,
+    config: Option<Value>,
+    device_mid: String,
+}
 
 fn claim_registry_guard() -> std::sync::MutexGuard<'static, Option<claim_session::ClaimRegistry>> {
     let mut guard = match CLAIM_REGISTRY.lock() {
@@ -98,6 +119,22 @@ fn store_guard() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
+/// 在阻塞线程池里跑必须同步等待的工作（ureq 网络请求、进程操作等）。
+///
+/// 纪律：`async` 命令里**禁止**直接执行阻塞 I/O。Tauri 的 async 命令跑在异步运行时的
+/// worker 线程上，一次 `claim_refresh` 最长阻塞 2×10s（激活事件）+ 25s（preview）+
+/// 25s（marketing）；并发点几个账号就会把所有 worker 占满，`get_state` / `set_behavior`
+/// 等命令全部排队 → 界面整体卡死、额度区永远「查询中…」。
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| i18n::trf("err.internal", &[("e", &e.to_string())]))?
+}
+
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
@@ -120,7 +157,15 @@ fn tray_menu_inner(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
         }
     };
 
-    let b = MenuBuilder::new(app)
+    let mut b = MenuBuilder::new(app);
+    // 有新活动时，托盘菜单顶部给出醒目入口（tooltip 小字太弱，菜单更不易被忽略）
+    if let Some(extra) = activity_tip_guard().clone().filter(|t| !t.trim().is_empty()) {
+        let label = format!("【新活动】{extra}");
+        b = b
+            .item(&MenuItem::with_id(app, "activity", &label, true, None::<&str>)?)
+            .separator();
+    }
+    let b = b
         .item(&MenuItem::with_id(app, "show", &i18n::tr("tray.show"), true, None::<&str>)?)
         .item(&MenuItem::with_id(app, "capture", &i18n::tr("tray.capture"), state.live_logged_in, None::<&str>)?)
         .separator()
@@ -149,7 +194,20 @@ pub fn rebuild_tray(app: &AppHandle) {
                 }
                 Err(_) => "Z·SWITCH".into(),
             };
+            let extra = activity_tip_guard().clone().filter(|t| !t.trim().is_empty());
+            let has_extra = extra.is_some();
+            let tip = match &extra {
+                // 把「新活动」放最前面：tooltip 前面部分更容易被看见
+                Some(e) => format!("【新活动】{e} · {tip}"),
+                None => tip,
+            };
             let _ = tray.set_tooltip(Some(&tip));
+            // Windows：仅 NIM_MODIFY 更新 szTip 有时不刷新，重设一次当前图标可强制 shell 读新提示
+            if has_extra {
+                if let Some(ic) = app2.default_window_icon().cloned() {
+                    let _ = tray.set_icon(Some(ic));
+                }
+            }
             if let Ok(menu) = tray_menu_inner(&app2) {
                 let _ = tray.set_menu(Some(menu));
             }
@@ -261,68 +319,76 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
 
 #[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
-    tauri::async_runtime::spawn_blocking(|| store::live_quota(&Paths::detect()))
-        .await.map_err(|_| "quota_worker_failed".to_string())?
+    run_blocking(|| store::live_quota(&Paths::detect())).await
 }
 
 #[tauri::command]
-async fn get_account_quota(id: String, revision: Option<String>) -> Result<quota::QuotaOverview, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        store::account_quota_revision(&Paths::detect(), &id, revision.as_deref())
-    }).await.map_err(|_| "quota_worker_failed".to_string())?
-}
-
-/// Campaign eligibility is keyed to the device id: an id the server already delivered to
-/// never sees the same campaign again. Swapping it is the in-app equivalent of deleting
-/// ZCode's own `telemetry-state.json`, without touching the client's identity.
-#[tauri::command]
-async fn reset_device(id: String) -> Result<serde_json::Value, String> {
-    let account_id = id.clone();
-    let mid = tauri::async_runtime::spawn_blocking(move || {
-        store::reset_virtual_device_mid(&Paths::detect(), &account_id)
+async fn get_account_quota(id: String, force: Option<bool>) -> Result<quota::QuotaOverview, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
+            let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+            return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+        }
+        let r = store::account_quota(&paths, &id);
+        if let Err(e) = &r {
+            risk::observe_upstream_failure(&paths, &id, e);
+        }
+        r
     })
     .await
-    .map_err(|_| "quota_worker_failed".to_string())??;
-    Ok(json!({ "id": id, "deviceMid": mid }))
+}
+
+#[tauri::command]
+async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        // 冷却期零上游流量：preview 也是 billing 请求，必须一起挡住
+        if risk::is_cooling(&paths, &id) {
+            let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+            return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+        }
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+            .map_err(|e| {
+                risk::observe_upstream_failure(&paths, &id, &e);
+                e
+            })
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClaimPreviewResult {
-    account_id: String,
-    revision: String,
-    plans: Vec<claim::ClaimPlan>,
+struct ClaimCurrentResult {
+    plans: Vec<claim::ActivePlan>,
+    history: Vec<Value>,
 }
 
 #[tauri::command]
-async fn claim_preview(id: String, revision: Option<String>) -> Result<ClaimPreviewResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
+    run_blocking(move || {
         let paths = Paths::detect();
-        let snapshot = {
-            let _guard = store_guard();
-        claim_snapshot(&paths, &id, revision.as_deref())?
-        };
-        if snapshot.device_initialized && revision.is_some() {
-            // The device id changed the account revision before any HTTP request.
-            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        // 冷却期零上游流量：current 只回本地历史，不发上游请求（避免冷却被反复刷新击穿）
+        if risk::is_cooling(&paths, &id) {
+            return Ok(ClaimCurrentResult {
+                plans: Vec::new(),
+                history: store::claim_history_for(&paths, &id),
+            });
         }
-        let plans = claim::claim_plans(
-            &paths.home,
-            &snapshot.account.credentials,
-            snapshot.account.config.as_ref(),
-            snapshot.account.virtual_device_mid.clone(),
-        )?;
-        let unchanged = {
-            let _guard = store_guard();
-            claim_revision_ok(&paths, &id, &snapshot.revision)
-        };
-        if !unchanged {
-            return Err(claim::scope_payload(&id, &snapshot.revision, true));
-        }
-        Ok(ClaimPreviewResult { account_id: id, revision: snapshot.revision, plans })
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        let plans =
+            claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+                .map_err(|e| {
+                    risk::observe_upstream_failure(&paths, &id, &e);
+                    e
+                })?;
+        let history = store::claim_history_for(&paths, &id);
+        Ok(ClaimCurrentResult { plans, history })
     })
     .await
-    .map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[derive(serde::Serialize)]
@@ -336,49 +402,32 @@ struct ClaimRefreshResult {
 }
 
 #[tauri::command]
-async fn claim_refresh(id: String, revision: Option<String>) -> Result<ClaimRefreshResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
+    run_blocking(move || {
         let paths = Paths::detect();
-        let snapshot = {
-            let _guard = store_guard();
-        claim_snapshot(&paths, &id, revision.as_deref())?
-        };
-        if snapshot.device_initialized && revision.is_some() {
-            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
+            let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+            return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
         }
-        let mid = snapshot.account.virtual_device_mid.clone().unwrap_or_default();
         let (activated, activation_error) =
-            match claim::telemetry_user_id(&paths.home, &snapshot.account.credentials) {
+            match claim::telemetry_user_id(&paths.home, &acc.credentials) {
                 Some(uid) => match claim::report_activation_events(&uid, &mid) {
                     Ok(()) => (true, None),
                     Err(e) => (false, Some(e)),
                 },
                 None => (false, None),
             };
-        let plans = claim::claim_plans(
-            &paths.home,
-            &snapshot.account.credentials,
-            snapshot.account.config.as_ref(),
-            snapshot.account.virtual_device_mid.clone(),
-        )?;
-        let unchanged = {
-            let _guard = store_guard();
-            claim_revision_ok(&paths, &id, &snapshot.revision)
-        };
-        if !unchanged {
-            // The activation report was already sent, so this must not auto-retry.
-            return Err(claim::scope_payload(&id, &snapshot.revision, false));
-        }
-        Ok(ClaimRefreshResult {
-            account_id: id,
-            revision: snapshot.revision,
-            plans,
-            activated,
-            activation_error,
-        })
+        let plans =
+            claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+                .map_err(|e| {
+                    risk::observe_upstream_failure(&paths, &id, &e);
+                    e
+                })?;
+        Ok(ClaimRefreshResult { plans, activated, activation_error })
     })
     .await
-    .map_err(|_| "quota_worker_failed".to_string())?
 }
 
 #[tauri::command]
@@ -390,125 +439,49 @@ async fn claim_start(
     claim_id: Option<String>,
     mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let claim_id = claim_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let mode = match mode.as_deref() {
-        Some("auto") => "auto",
-        Some("all") => "all",
-        _ => "manual",
-    };
-    let is_auto = mode == "auto";
-    let paths = Paths::detect();
-    let snapshot = {
-        let _guard = store_guard();
-        claim_snapshot(&paths, &id, revision.as_deref())?
-    };
-    if snapshot.device_initialized && revision.is_some() {
-        return Err(claim::scope_payload(&id, &snapshot.revision, true));
-    }
-    // Campaign eligibility follows the activation events the client reports on launch.
-    if let Some(mid) = snapshot.account.virtual_device_mid.as_deref() {
-        activate_once(&paths.home, &snapshot.account.credentials, mid);
-    }
-    let secret = zcrypto::default_secret(&paths.home);
-    let scope = claim_session::identity_scope(&snapshot.account.credentials, &secret);
-    let now = claim_now_ms();
-    let mut session = claim_session::ClaimSession {
-        claim_id: claim_id.clone(),
-        account_id: id.clone(),
-        account_name: snapshot.account.name.clone(),
-        revision: snapshot.revision.clone(),
-        identity_scope: scope.clone(),
-        plan_id: plan_id.clone(),
-        plan_name: String::new(),
-        auto: is_auto,
-        created_at: now,
-        updated_at: now,
-        phase: claim_session::ClaimPhase::Preparing,
-        replaces: None,
-        material: claim_session::ClaimMaterial {
-            credentials: snapshot.account.credentials.clone(),
-            config: snapshot.account.config.clone(),
-            device_mid: snapshot.account.virtual_device_mid.clone().unwrap_or_default(),
-        },
-    };
-    {
-        let mut registry = claim_registry_guard();
-        let Some(registry) = registry.as_mut() else {
-            return Err(i18n::tr("err.claim.none_pending"));
-        };
-        if registry.blocks(&scope, &plan_id) {
-            // An unresolved submission only permits one acknowledged manual retry.
-            match registry.gate(mode, &scope, &plan_id) {
-                claim_session::StartGate::Allowed(replaced) => session.replaces = replaced,
-                claim_session::StartGate::Unconfirmed => return Err(i18n::tr("err.claim.unconfirmed")),
-            }
+    let app2 = app.clone();
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
+        if auto.unwrap_or(false) && risk::is_cooling(&paths, &id) {
+            return Err(i18n::tr("err.risk.cooling_auto"));
         }
-        match registry.try_start(session) {
-            Ok(_) => {}
-            Err(claim_session::StartError::Busy) => return Err(i18n::tr("err.claim.busy")),
-        }
-    }
+        let plans = claim::collect_claimable_plans(
+            &paths.home,
+            &acc.credentials,
+            acc.config.as_ref(),
+            mid.clone(),
+        )
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
+        let plan = plans
+            .iter()
+            .find(|p| p.plan_id == plan_id)
+            .ok_or_else(|| i18n::tr("err.claim.gone"))?;
+        let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
 
-    let home = paths.home.clone();
-    let credentials = snapshot.account.credentials.clone();
-    let config = snapshot.account.config.clone();
-    let mid = snapshot.account.virtual_device_mid.clone();
-    let wanted = plan_id.clone();
-    let prepared = tauri::async_runtime::spawn_blocking(move || {
-        claim::claim_plans(&home, &credentials, config.as_ref(), mid)
+        *pending_guard() = Some(PendingClaim {
+            account_id: acc.id.clone(),
+            account_name: acc.name.clone(),
+            plan_id: plan.plan_id.clone(),
+            plan_name: display.clone(),
+            credentials: acc.credentials,
+            config: acc.config,
+            device_mid: mid,
+        });
+        open_captcha_window(&app2, auto.unwrap_or(false))?;
+        Ok(json!({ "account": acc.name, "plan": display }))
     })
-    .await;
-    // A campaign read only supplies the display name: the server decides whether this
-    // identity may claim the plan right now, so an empty or failed read must not block
-    // a claim the user already clicked. The session stays owned by this claim either way.
-    let display = claim::claim_display_name(prepared.unwrap_or_else(|_| Err(String::new())), &wanted);
-    let verifying = {
-        let mut registry = claim_registry_guard();
-        match registry.as_mut() {
-            Some(registry) => {
-                registry.update_plan_name(&claim_id, &display);
-                registry.mark_verifying(&claim_id)
-            }
-            None => false,
-        }
-    };
-    if !verifying {
-        // The session was cancelled while preparing: never open a window for it.
-        return Err(i18n::tr("err.claim.cancelled"));
-    }
-    if let Err(error) = open_captcha_window(&app, &claim_id, is_auto) {
-        finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
-        return Err(error);
-    }
-    claim_summary_json(&claim_id).ok_or_else(|| i18n::tr("err.claim.none_pending"))
-}
-
-/// The client reports activation events on every launch, which is what makes an
-/// account eligible for campaigns. Mirror that once per login and device.
-fn activate_once(home: &std::path::Path, credentials: &Value, device_mid: &str) {
-    static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let Some(user_id) = claim::telemetry_user_id(home, credentials) else {
-        return;
-    };
-    let key = format!("{user_id}:{device_mid}");
-    {
-        let mut done = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
-        if done.iter().any(|k| k == &key) {
-            return;
-        }
-        done.push(key);
-    }
-    let _ = claim::report_activation_events(&user_id, device_mid);
+    .await
 }
 
 #[tauri::command]
 async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
-    tauri::async_runtime::spawn_blocking(claim::fetch_captcha_config)
-        .await
-        .map_err(|_| "quota_worker_failed".to_string())?
+    run_blocking(claim::fetch_captcha_config).await
 }
 
 #[tauri::command]
@@ -518,114 +491,87 @@ async fn claim_captcha_submit(
     param: String,
     region: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let summary = {
-        let registry = claim_registry_guard();
-        registry.as_ref().and_then(|r| r.status(&claim_id))
-    }
-    .ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
-    let material = {
-        let mut registry = claim_registry_guard();
-        let Some(registry) = registry.as_mut() else {
-            return Err(i18n::tr("err.claim.none_pending"));
-        };
-        match registry.begin_submit(&claim_id) {
-            Ok(material) => material,
-            Err(claim_session::SubmitError::PersistFailed) => {
-                registry.finish(&claim_id, claim_session::ClaimPhase::Failed, None);
-                return Err(i18n::tr("err.claim.marker_failed"));
-            }
-            Err(claim_session::SubmitError::NotReady) => {
-                return Err(i18n::tr("err.claim.already_submitted"))
-            }
-            Err(_) => return Err(i18n::tr("err.claim.none_pending")),
-        }
-    };
-
-    let paths = Paths::detect();
-    let home = paths.home.clone();
-    let plan_id = summary.plan_id.clone();
-    let submitted = tauri::async_runtime::spawn_blocking(move || {
-        claim::submit_claim(
-            &home,
-            &material.credentials,
-            material.config.as_ref(),
-            &plan_id,
+    let app2 = app.clone();
+    run_blocking(move || {
+        let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
+        let paths = Paths::detect();
+        let res = claim::submit_claim(
+            &paths.home,
+            &pending.credentials,
+            pending.config.as_ref(),
+            &pending.plan_id,
             &param,
             region.as_deref(),
-            Some(material.device_mid),
-        )
-    })
-    .await;
-
-    let payload = match submitted {
-        Ok(Ok(value)) => {
-            let ms = |k: &str| -> Option<i64> {
-                value
-                    .pointer(&format!("/data/plan/{k}"))
-                    .and_then(quota::timestamp_millis)
-            };
-            let server_time = value
-                .pointer("/data/server_time")
-                .and_then(quota::timestamp_millis);
-            let entitlement_starts = value.pointer("/data/plan")
-                .map(quota::entitlement_start_times).unwrap_or_default();
-            let payload = json!({
-                "ok": true,
-                "claimId": claim_id,
-                "accountId": summary.account_id,
-                "accountName": summary.account_name,
-                "revision": summary.revision,
-                "planId": summary.plan_id,
-                "planName": summary.plan_name,
-                "startsAt": ms("starts_at"),
-                "entitlementStarts": entitlement_starts,
-                "endsAt": ms("ends_at"),
-                "serverTime": server_time,
-            });
-            finish_claim(&claim_id, claim_session::ClaimPhase::Succeeded, Some(payload.clone()));
-            payload
-        }
-        Ok(Err(error)) => {
-            let mut payload = claim::failure_payload(
-                &summary.account_id,
-                &summary.account_name,
-                &summary.plan_name,
-                &error,
-            );
-            if let Some(object) = payload.as_object_mut() {
-                object.insert("claimId".into(), json!(claim_id));
-                object.insert("planId".into(), json!(summary.plan_id));
-                object.insert("revision".into(), json!(summary.revision));
-                object.insert("unknown".into(), json!(error.unknown));
+            Some(pending.device_mid.clone()),
+        );
+        // 3007（验证码被拒/参数过期）：**不再换码自动重试**。
+        // 参考实测结论（zcode2api 2.6.5 整改）：拒码本身就是上游风险信号，换码连打只会加剧，
+        // 且会白耗一次唯一重试额度。这里直接走终态失败，让用户重新发起领取（重新取验证码）。
+        if let Err(e) = &res {
+            if e.is_captcha_rejected() {
+                flowlog::log(
+                    "claim",
+                    "captcha-rejected-3007",
+                    &format!("code={} 不自动重试", e.code),
+                );
             }
-            let phase = if error.unknown {
-                claim_session::ClaimPhase::Unknown
-            } else {
-                claim_session::ClaimPhase::Failed
-            };
-            finish_claim(&claim_id, phase, Some(payload.clone()));
-            payload
         }
-        Err(_) => {
-            let payload = json!({
-                "ok": false,
-                "claimId": claim_id,
-                "accountId": summary.account_id,
-                "accountName": summary.account_name,
-                "revision": summary.revision,
-                "planId": summary.plan_id,
-                "planName": summary.plan_name,
-                "code": -1,
-                "message": i18n::tr("err.claim.unknown"),
-                "unknown": true,
-            });
-            finish_claim(&claim_id, claim_session::ClaimPhase::Unknown, Some(payload.clone()));
-            payload
-        }
-    };
-    close_captcha_window(&app, &claim_id);
-    let _ = app.emit("claim://result", &payload);
-    Ok(payload)
+        close_captcha_window(&app2);
+        let payload = match res {
+            Ok(v) => {
+                let ms = |k: &str| -> Option<i64> {
+                    v.pointer(&format!("/data/plan/{k}"))
+                        .and_then(|x| x.as_i64())
+                        .map(|s| s * 1000)
+                };
+                let server_time = v
+                    .pointer("/data/server_time")
+                    .and_then(|x| x.as_i64())
+                    .map(|s| s * 1000);
+                // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），starts_at 只是活动开始
+                let effective_at = v
+                    .pointer("/data/plan/entitlements")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .filter_map(|it| it.get("effective_at").and_then(|x| x.as_i64()))
+                            .min()
+                    })
+                    .map(|s| s * 1000);
+                let outcome = claim::ClaimOutcome {
+                    account_id: pending.account_id.clone(),
+                    account_name: pending.account_name.clone(),
+                    plan_name: pending.plan_name.clone(),
+                    starts_at: ms("starts_at"),
+                    ends_at: ms("ends_at"),
+                    effective_at,
+                    server_time,
+                };
+                let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+                // 领取成功落历史（best-effort），供「已领取生效中」展示
+                store::record_claim_history(
+                    &paths,
+                    &pending.account_id,
+                    &pending.plan_id,
+                    &pending.plan_name,
+                );
+                let _ = app2.emit("claim://result", &p);
+                p
+            }
+            Err(e) => {
+                let p = claim::failure_payload(
+                    &pending.account_id,
+                    &pending.account_name,
+                    &pending.plan_name,
+                    &e,
+                );
+                let _ = app2.emit("claim://result", &p);
+                return Ok(p);
+            }
+        };
+        Ok(payload)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -648,37 +594,233 @@ async fn claim_cancel(app: AppHandle, claim_id: String) -> Result<serde_json::Va
     Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
 }
 
-#[tauri::command]
-async fn claim_status(claim_id: String) -> Result<serde_json::Value, String> {
-    Ok(claim_summary_json(&claim_id).unwrap_or(Value::Null))
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityProbeItem {
+    account_id: String,
+    name: String,
+    plans: Vec<claim::ClaimPlan>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityProbeResult {
+    items: Vec<ActivityProbeItem>,
+    /// 因风控冷却 / 账号读取失败被跳过的账号（前端用来显示「已跳过」而不是「无活动」）
+    skipped: Vec<String>,
+}
+
+/// 只读活动探测：只请求 marketing/touch，不领取、不写 claim-history、不发 activation 事件。
+/// 冷却中的账号直接跳过（零上游流量）；账号选择与节奏由前端调度器负责。
 #[tauri::command]
-async fn claim_sessions() -> Result<serde_json::Value, String> {
-    let registry = claim_registry_guard();
-    let Some(registry) = registry.as_ref() else {
-        return Ok(json!({ "sessions": [], "recovery": { "ok": true } }));
-    };
-    Ok(json!({
-        "sessions": registry.sessions(),
-        "recovery": {
-            "ok": registry.recovery_error().is_none(),
-            "error": registry.recovery_error(),
+async fn activity_probe(ids: Vec<String>) -> Result<ActivityProbeResult, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        for id in ids {
+            if risk::is_cooling(&paths, &id) {
+                skipped.push(id);
+                continue;
+            }
+            let Ok(mid) = store::ensure_virtual_device_mid(&paths, &id) else {
+                skipped.push(id);
+                continue;
+            };
+            let Ok(acc) = load_account(&paths, &id) else {
+                skipped.push(id);
+                continue;
+            };
+            let plans = claim::probe_marketing_only(
+                &paths.home,
+                &acc.credentials,
+                acc.config.as_ref(),
+                Some(mid),
+            );
+            items.push(ActivityProbeItem { account_id: id, name: acc.name, plans });
         }
-    }))
+        Ok(ActivityProbeResult { items, skipped })
+    })
+    .await
 }
 
-#[tauri::command]
-async fn claim_acknowledge_unknown(claim_id: String) -> Result<bool, String> {
-    let mut registry = claim_registry_guard();
-    match registry.as_mut() {
-        Some(registry) => Ok(registry.allow_manual_retry(&claim_id)),
-        None => Ok(false),
+fn append_rolling_log(name: &str, cap: usize, message: &str) -> Result<(), String> {
+    let dir = Paths::detect().store_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join(name);
+    let mut lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    lines.push(format!("[{ts}] {}", message.replace('\n', " ⏎ ")));
+    if lines.len() > cap {
+        let excess = lines.len() - cap;
+        lines.drain(0..excess);
     }
+    std::fs::write(&file, lines.join("\n") + "\n").map_err(|e| e.to_string())
 }
 
-fn close_captcha_window(app: &AppHandle, claim_id: &str) {
-    if let Some(w) = app.get_webview_window(&captcha_label(claim_id)) {
+/// 当前待领取的那一笔（用于「只取消自己发起的领取」）。
+#[tauri::command]
+fn claim_pending() -> Option<serde_json::Value> {
+    pending_guard()
+        .as_ref()
+        .map(|p| json!({ "accountId": p.account_id, "planId": p.plan_id }))
+}
+
+/// 设置「新活动」提示：托盘 tooltip 附加文案（None 清除）。
+/// 便携版拿不到 Windows Toast 时，悬停托盘图标是可见性兜底。
+#[tauri::command]
+async fn set_activity_tip(app: AppHandle, tip: Option<String>) -> Result<(), String> {
+    let cleaned = tip.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    {
+        let mut g = activity_tip_guard();
+        *g = cleaned.clone();
+    }
+    rebuild_tray(&app);
+    let _ = append_rolling_log(
+        "probe.log",
+        500,
+        &format!("tray tip -> {:?}", cleaned),
+    );
+    if app.tray_by_id(TRAY_ID).is_none() {
+        return Err("tray not found".into());
+    }
+    Ok(())
+}
+
+/// 原图标 + 右下角红点徽标（钉钉式）：红点出现/消失交替，比整图标染色自然。
+fn badged_icon(base: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+    let (w, h) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    let cx = w as f32 * 0.74;
+    let cy = h as f32 * 0.74;
+    let r = (h as f32 * 0.22).max(3.0);
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= r {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i] = 235;
+                rgba[i + 1] = 64;
+                rgba[i + 2] = 56;
+                rgba[i + 3] = 255;
+            } else if d <= r + 1.5 {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i] = 255;
+                rgba[i + 1] = 255;
+                rgba[i + 2] = 255;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, w, h)
+}
+
+/// 托盘图标交替闪烁（Windows 托盘没有闪烁 API，用图标交替模拟）。
+/// 提醒态 = 原图标 + 右下角红点徽标，与常态来回切换 `times` 轮后恢复（0 = 直到点开活动）。
+#[tauri::command]
+async fn tray_flash(app: AppHandle, times: Option<u32>) -> Result<(), String> {
+    use tauri::image::Image;
+    let base = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| "no window icon".to_string())?;
+    let (w, h) = (base.width(), base.height());
+    let base: Image<'static> = Image::new_owned(base.rgba().to_vec(), w, h);
+    let attention: Image<'static> = badged_icon(&base);
+    // times: None/0 = 持续闪烁直到用户点开活动（tray_flash_stop），
+    // Some(n) = 闪 n 轮后自动停止（仅测试用）。
+    let rounds = times.unwrap_or(0);
+    TRAY_FLASH_ACTIVE.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let mut count = 0u32;
+        while TRAY_FLASH_ACTIVE.load(Ordering::SeqCst) {
+            count += 1;
+            if rounds > 0 && count > rounds * 2 {
+                TRAY_FLASH_ACTIVE.store(false, Ordering::SeqCst);
+                break;
+            }
+            let holder = app.clone();
+            let inner = app.clone();
+            let ic = attention.clone();
+            let _ = holder.run_on_main_thread(move || {
+                if let Some(t) = inner.tray_by_id(TRAY_ID) {
+                    let _ = t.set_icon(Some(ic));
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(420));
+            let holder = app.clone();
+            let inner = app.clone();
+            let ic = base.clone();
+            let _ = holder.run_on_main_thread(move || {
+                if let Some(t) = inner.tray_by_id(TRAY_ID) {
+                    let _ = t.set_icon(Some(ic));
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(420));
+        }
+        let _ = append_rolling_log("probe.log", 500, "tray flash done");
+    });
+    Ok(())
+}
+
+/// 停止托盘闪烁（用户已点开活动详情），并恢复常态图标。
+#[tauri::command]
+async fn tray_flash_stop(app: AppHandle) -> Result<(), String> {
+    TRAY_FLASH_ACTIVE.store(false, Ordering::SeqCst);
+    let owned = app.default_window_icon().map(|ic| {
+        let (w, h) = (ic.width(), ic.height());
+        tauri::image::Image::new_owned(ic.rgba().to_vec(), w, h)
+    });
+    if let Some(ic) = owned {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(t) = app2.tray_by_id(TRAY_ID) {
+                let _ = t.set_icon(Some(ic));
+            }
+        });
+    }
+    Ok(())
+}
+
+/// 探测留痕：`{home}/.zcode-switch/probe.log`（500 行滚动）。
+/// 用于回答「开关开了但没探到」这类问题：能查到每轮选了谁、返回几条、是否被跳过。
+#[tauri::command]
+async fn log_probe(message: String) -> Result<(), String> {
+    run_blocking(move || append_rolling_log("probe.log", 500, &message)).await
+}
+
+/// 前端异常落盘：`{home}/.zcode-switch/client-error.log`，最多保留 200 行。
+/// 目的是让「界面冻结/报错」这类只能靠 DevTools 看到的问题可回传、可定位。
+#[tauri::command]
+async fn log_client_error(message: String) -> Result<(), String> {
+    run_blocking(move || {
+        let dir = Paths::detect().store_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = dir.join("client-error.log");
+        let mut lines: Vec<String> = std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        lines.push(format!("[{ts}] {}", message.replace('\n', " ⏎ ")));
+        if lines.len() > 200 {
+            let excess = lines.len() - 200;
+            lines.drain(0..excess);
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").map_err(|e| e.to_string())
+    })
+    .await
+}
+
+fn close_captcha_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("captcha") {
         let _ = w.close();
     }
 }
@@ -752,13 +894,21 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             .unwrap_or(0);
         let srv_flow = init.poll_url.rsplit('/').next().unwrap_or("");
         let expires_in = init.expires_at_ms.saturating_sub(now) / 1000;
+        let authorize = init.authorize_url.split('?').next().unwrap_or("");
+        let mode = if provider == "zai" { "official-login+relay" } else { "direct" };
         flowlog::log(
             &flow,
             "init-ok",
-            &format!("server_flow={srv_flow} expires_in={expires_in}s interval={}ms", init.poll_interval_ms),
+            &format!("mode={mode} authorize={authorize} server_flow={srv_flow} expires_in={expires_in}s interval={}ms", init.poll_interval_ms),
         );
     }
+    // zai 第二段接力用规范化入口（chat.z.ai/auth?...）：直接打原始 /api/oauth/authorize
+    // 会因缺少 chat.z.ai 会话被弹回登录页；走 /auth 可完成登录/SSO。
+    // 非 zai 或未规范化时 authorize_url 就是服务端原始地址。
     let url = init.authorize_url.clone();
+    // zai：默认直接打开本次 flow 的 CLI 授权入口（chat.z.ai/auth?client_id=<CLI>&...）。
+    // 在该页用手机号 / 邮箱登录会直接建立 chat.z.ai 会话并续到授权/回调，不依赖官网跨站会话。
+    let entry_url = url.clone();
     let poll_cfg = PollCfg {
         url: init.poll_url.clone(),
         token: init.poll_token.clone(),
@@ -782,10 +932,19 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     let app2 = app.clone();
     let (provider2, state2, flow2, mid2) = (provider.clone(), init.state.clone(), flow.clone(), mid.clone());
     let flow_close = flow.clone();
+    let relay_to = url.clone();
+    let relay_to2 = url.clone();
+    let relay_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(provider == "zai"));
+    let relay_armed2 = relay_armed.clone();
+    let relay_armed3 = relay_armed.clone();
+    let flow_relay = flow.clone();
+    let flow_relay2 = flow.clone();
+    let flow_nav = flow.clone();
+    let log_nav = provider == "zai";
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "login",
-        tauri::WebviewUrl::External(url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
+        tauri::WebviewUrl::External(entry_url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
     )
     .title(i18n::tr("title.login"))
     .theme(Some(tauri::Theme::Dark))
@@ -797,17 +956,92 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     if let Some(u) = proxy_url {
         builder = builder.proxy_url(u);
     }
+    // z.ai：邮箱 / 手机号两个表单在同一个登录页上（手机号默认隐藏），页内切换优先，
+    // 页面每次加载后注入按钮条，用户随时可切回邮箱登录 / 邮箱注册
+    if provider == "zai" {
+        let assist = oauth::zai_email_assist_script(&init.authorize_url);
+        let assist_load = assist.clone();
+        let flow_load = flow.clone();
+        builder = builder.on_page_load(move |wv, payload| {
+            if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+                flowlog::log(&flow_load, "assist", "inject on-page-load");
+                let _ = wv.eval(&assist_load);
+            }
+        });
+        // 首次导航可能早于 on_page_load 注册生效，窗口起来后再补几次注入（脚本幂等，重复执行无副作用）
+        let app_assist = app.clone();
+        let flow_assist = flow.clone();
+        std::thread::spawn(move || {
+            let mut logged = false;
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let ours = pending_oauth_guard().as_ref().map(|p| p.flow == flow_assist).unwrap_or(false);
+                if !ours {
+                    return;
+                }
+                let Some(w) = app_assist.get_webview_window("login") else { return };
+                if w.eval(&assist).is_ok() && !logged {
+                    flowlog::log(&flow_assist, "assist", "inject boost");
+                    logged = true;
+                }
+            }
+        });
+    }
     builder
     .on_navigation(move |url| {
-        if url.scheme() != "zcode" {
-            return true;
+        if url.scheme() == "zcode" {
+            let full = url.to_string();
+            let (app3, p3, s3, f3, m3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone());
+            tauri::async_runtime::spawn(async move {
+                finish_oauth(&app3, p3, s3, f3, m3, &full).await;
+            });
+            return false;
         }
-        let full = url.to_string();
-        let (app3, p3, s3, f3, m3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone());
-        tauri::async_runtime::spawn(async move {
-            finish_oauth(&app3, p3, s3, f3, m3, &full).await;
-        });
-        false
+        if log_nav && url.host_str().map_or(false, |h| h.ends_with("z.ai")) {
+            // 只标记是否带 error 参数，不落 query（可能含 code / state 等敏感值）
+            let mark = if url.query().map_or(false, |q| q.contains("error")) { " (error)" } else { "" };
+            flowlog::log(&flow_nav, "nav", &format!("{}{}{}", url.host_str().unwrap_or(""), url.path(), mark));
+        }
+        let nav_host = url.host_str().unwrap_or("");
+        let nav_path = url.path();
+        // 接力状态跟随登录态：授权链路中收枪（避免打断正在进行的授权），
+        // 回到登录页（含第三方登录入口）重新武装，保证再次登录完成后仍能取码
+        if nav_host == "z.ai" || nav_host == "chat.z.ai" {
+            if is_authorize_page(nav_path) {
+                if relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    flowlog::log(&flow_relay, "relay-disarm", &format!("{nav_host}{nav_path}"));
+                }
+            } else if is_login_page(nav_path) {
+                if !relay_armed2.load(std::sync::atomic::Ordering::SeqCst) {
+                    flowlog::log(&flow_relay, "relay-rearm", &format!("{nav_host}{nav_path}"));
+                    relay_armed2.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        // zai 第一段（登录页）完成 → 接力到本次 flow 的授权入口取码（此时已登录，不再要求手机号）
+        if (nav_host == "z.ai" || nav_host == "chat.z.ai")
+            && !is_login_page(nav_path)
+            && !is_authorize_page(nav_path)
+            && relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            flowlog::log(
+                &flow_relay,
+                "zai-relay",
+                &format!("nav {}{} -> authorize", url.host_str().unwrap_or(""), url.path()),
+            );
+            let target = relay_to.clone();
+            let app4 = app2.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if let Some(w) = app4.get_webview_window("login") {
+                    if let Ok(t) = target.parse::<tauri::Url>() {
+                        let _ = w.navigate(t);
+                    }
+                }
+            });
+            log_after_relay(app2.clone(), flow_relay.clone(), 5000);
+        }
+        true
     })
     .build()
     .map_err(|e| {
@@ -830,8 +1064,78 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             }
         });
     }
+    // 官网登录成功后走的是 SPA 内部路由（history.replaceState），on_navigation 收不到事件，
+    // 所以再加一路轮询窗口 URL 兜底：一旦离开登录页、落到 z.ai 站点即接力取码
+    if provider == "zai" {
+        let app_relay = app.clone();
+        let armed = relay_armed3;
+        let target = relay_to2;
+        let fl = flow_relay2;
+        let guard_flow = flow.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let ours = pending_oauth_guard().as_ref().map(|p| p.flow == guard_flow).unwrap_or(false);
+                if !ours {
+                    return;
+                }
+                let Some(w) = app_relay.get_webview_window("login") else { return };
+                let Ok(u) = w.url() else { continue };
+                let host = u.host_str().unwrap_or("");
+                let path = u.path();
+                if !(host == "z.ai" || host == "chat.z.ai") {
+                    continue;
+                }
+                if is_authorize_page(path) {
+                    armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                if is_login_page(path) {
+                    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                if !armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    continue; // 已被 on_navigation 那路接力
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1200)); // 留点时间让官网把回调收尾
+                flowlog::log(&fl, "zai-relay", &format!("poll {host}{} -> authorize", u.path()));
+                if let Ok(t) = target.parse::<tauri::Url>() {
+                    let _ = w.navigate(t);
+                }
+                log_after_relay(app_relay.clone(), fl.clone(), 5000);
+                return;
+            }
+        });
+    }
     spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
     Ok(json!({ "opened": true, "provider": provider }))
+}
+
+/// 接力后留痕：几秒后把窗口实际落点写进日志，便于判断授权是否成功
+fn log_after_relay(app: AppHandle, flow: String, delay_ms: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if let Some(w) = app.get_webview_window("login") {
+            if let Ok(u) = w.url() {
+                flowlog::log(&flow, "zai-after", &format!("{}{}", u.host_str().unwrap_or(""), u.path()));
+            }
+        }
+    });
+}
+
+/// 登录 / 注册相关路径（含第三方入口与登录回调）：说明登录链路还没收尾，
+/// zai 接力不能在这些页面触发，否则会打断官网自己的回调跳转。
+fn is_login_page(path: &str) -> bool {
+    ["/auth", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/reset", "/forgot", "/oauth"]
+        .iter()
+        .any(|p| path.starts_with(p))
+}
+
+/// 已在授权链路中（授权入口 / 授权确认页）：让页面自行走完，不能再接力，
+/// 否则会把正在进行的授权打断，被服务端弹回登录页。
+fn is_authorize_page(path: &str) -> bool {
+    path.ends_with("/oauth/authorize")
 }
 
 fn sweep_login_profiles(root: &std::path::Path) {
@@ -1185,6 +1489,8 @@ async fn set_behavior(
     close_to_tray: Option<bool>,
     hot_switch: Option<bool>,
     auto_claim: Option<bool>,
+    activity_probe: Option<bool>,
+    claim_at_effective: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -1200,6 +1506,12 @@ async fn set_behavior(
     }
     if let Some(v) = auto_claim {
         s.auto_claim = Some(v);
+    }
+    if let Some(v) = activity_probe {
+        s.activity_probe = Some(v);
+    }
+    if let Some(v) = claim_at_effective {
+        s.claim_at_effective = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
@@ -1477,6 +1789,7 @@ pub fn run() {
             show_main(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1494,13 +1807,18 @@ pub fn run() {
             reset_device,
             claim_preview,
             claim_refresh,
+            claim_current,
             claim_start,
             claim_captcha_config,
             claim_captcha_submit,
             claim_cancel,
-            claim_status,
-            claim_sessions,
-            claim_acknowledge_unknown,
+            claim_pending,
+            activity_probe,
+            set_activity_tip,
+            tray_flash,
+            tray_flash_stop,
+            log_probe,
+            log_client_error,
             oauth_providers,
             oauth_begin,
             set_auth_proxy,
@@ -1555,6 +1873,10 @@ pub fn run() {
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
             }
+            {
+                let home = Paths::detect().home;
+                std::thread::spawn(move || changelog::refresh_cache(&home));
+            }
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())
                 .tooltip("Z·SWITCH")
@@ -1564,6 +1886,10 @@ pub fn run() {
                     let id = event.id().as_ref().to_string();
                     match id.as_str() {
                         "show" => show_main(app),
+                        "activity" => {
+                            TRAY_FLASH_ACTIVE.store(false, Ordering::SeqCst);
+                            let _ = app.emit("tray-activity", ());
+                        }
                         "quit" => app.exit(0),
                         other => run_tray_action(app.clone(), other.to_string()),
                     }
