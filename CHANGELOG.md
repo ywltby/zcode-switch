@@ -1,5 +1,21 @@
 # 更新日志
 
+## v1.7.0-beta.13（2026-11-03）
+
+### 领取链路移植（wjsqqj fork 实现，冲突以其为准）
+
+- **marketing/touch 深度递归解析**：修复新版活动查不到；同时识别 claim_zcode_plan / claim_plan 按钮。
+- **billing/current + 本地领取历史**：区分「无活动 / 已领取生效中 / 已领过」。
+- **领取错误分级**：challenge / terminal / captcha_rejected；3007 拒码不自动重试。
+- **活动中心**：活动探测、托盘红点、详情弹框、到点自动领取（独立开关）。
+- **风控门禁**：上游失败账号级冷却；marketing-fail / captcha-rejected-3007 等 claim 日志落盘。
+
+### 主线保留
+
+- 代理覆盖全部业务请求（领取 / 活动查询 / 激活上报 / 额度），换出口即换资格环境。
+- 账号行「重置设备标识」与 CLI eset-device --id <账号>。
+
+---
 ## v1.7.3-Z.EMAIL（2026-10-27）
 
 ### 修复：z.ai 登录窗口的登录方式切换（手机号 / 邮箱 / Google / GitHub）
