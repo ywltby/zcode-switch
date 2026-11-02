@@ -55,6 +55,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         out
     };
     let paths = Paths::detect();
+    crate::quota_http::set_proxy(load_settings(&paths).auth_proxy().map(str::to_string));
 
     if let Some(l) = lang_override {
         crate::i18n::set(l);

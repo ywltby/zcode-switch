@@ -131,10 +131,12 @@ fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
-        .build()
+    crate::quota_http::apply_proxy(
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS)),
+    )
+    .build()
 }
 
 pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
@@ -195,10 +197,12 @@ fn device_os_category() -> &'static str {
 }
 
 pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
-        .build();
+    let agent = crate::quota_http::apply_proxy(
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS)),
+    )
+    .build();
     for element in ACTIVATION_EVENTS {
         let body = activation_event_body(
             element,

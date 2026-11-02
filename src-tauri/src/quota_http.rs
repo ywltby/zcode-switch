@@ -26,6 +26,33 @@ fn cooldowns() -> &'static Mutex<HashMap<String, i64>> {
     COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Campaign eligibility follows the exit address, so the configured proxy has to cover
+// claim traffic too, not just the OAuth window. One process-wide slot keeps every
+// ureq agent (claim, quota, activation reporting) on the same exit.
+static TRAFFIC_PROXY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn proxy_slot() -> &'static Mutex<Option<String>> {
+    TRAFFIC_PROXY.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_proxy(url: Option<String>) {
+    let normalized = url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
+    *proxy_slot().lock().unwrap_or_else(|e| e.into_inner()) = normalized;
+}
+
+pub(crate) fn proxy() -> Option<String> {
+    proxy_slot().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// An unusable proxy address must not silently disable claiming: fall back to direct.
+pub(crate) fn apply_proxy(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
+    let Some(url) = proxy() else { return builder };
+    match ureq::Proxy::new(&url) {
+        Ok(proxy) => builder.proxy(proxy),
+        Err(_) => builder,
+    }
+}
+
 fn credential_scope(request: &Request) -> String {
     let origin = request.url.split("/api/").next().unwrap_or(&request.url);
     let fields: Vec<_> = request
@@ -87,11 +114,13 @@ impl Transport for HttpTransport {
             }
         }
         // Do not forward credentials across redirects or propagate response bodies.
-        let agent = ureq::AgentBuilder::new()
-            .redirects(0)
-            .timeout_connect(std::time::Duration::from_secs(8))
-            .timeout(std::time::Duration::from_secs(20))
-            .build();
+        let agent = apply_proxy(
+            ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout_connect(std::time::Duration::from_secs(8))
+                .timeout(std::time::Duration::from_secs(20)),
+        )
+        .build();
         let mut req = agent.request(request.method, &request.url);
         for (key, value) in request.headers {
             req = req.set(&key, &value);

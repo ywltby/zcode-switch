@@ -862,6 +862,7 @@ async fn set_auth_proxy(app: AppHandle, on: bool, url: Option<String>) -> Result
         s.auth_proxy_on = Some(on);
         s.auth_proxy_url = normalized;
         save_settings(&paths, &s)?;
+        crate::quota_http::set_proxy(s.auth_proxy().map(str::to_string));
     }
     let _ = app.emit("state-changed", ());
     Ok(())
@@ -1548,7 +1549,9 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            i18n::init_from_settings(&store::load_settings(&Paths::detect()));
+            let settings = store::load_settings(&Paths::detect());
+            i18n::init_from_settings(&settings);
+            crate::quota_http::set_proxy(settings.auth_proxy().map(str::to_string));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
             }
