@@ -44,6 +44,36 @@ fn claim_registry_guard() -> std::sync::MutexGuard<'static, Option<claim_session
     guard
 }
 
+/// Claim snapshots cover two identities: a stored account (which owns a virtual
+/// device id) and the login ZCode runs right now (`live`, real device id, nothing
+/// written to disk).
+fn claim_snapshot(paths: &Paths, id: &str, expected: Option<&str>) -> Result<ClaimSnapshot, String> {
+    if id != store::LIVE_ID {
+        return store::claim_snapshot_locked(paths, id, expected);
+    }
+    let mut account = store::live_claim_snapshot(paths)?;
+    account.name = zcrypto::account_identity(&account.credentials, &paths.home)
+        .label()
+        .unwrap_or_else(|| i18n::tr("claim.live_name"));
+    let revision = crate::quota_auth::quota_revision(&account, &zcrypto::default_secret(&paths.home));
+    if expected.is_some_and(|value| value != revision) {
+        return Err("scope_changed".into());
+    }
+    Ok(ClaimSnapshot { account, revision, device_initialized: false })
+}
+
+/// Re-reading must not revive a claim prepared for a different login.
+fn claim_revision_ok(paths: &Paths, id: &str, revision: &str) -> bool {
+    if id != store::LIVE_ID {
+        return store::claim_revision_matches(paths, id, revision);
+    }
+    store::live_claim_snapshot(paths)
+        .map(|account| {
+            crate::quota_auth::quota_revision(&account, &zcrypto::default_secret(&paths.home)) == revision
+        })
+        .unwrap_or(false)
+}
+
 fn claim_now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -256,13 +286,13 @@ async fn claim_preview(id: String, revision: Option<String>) -> Result<ClaimPrev
         let paths = Paths::detect();
         let snapshot = {
             let _guard = store_guard();
-            store::claim_snapshot_locked(&paths, &id, revision.as_deref())?
+        claim_snapshot(&paths, &id, revision.as_deref())?
         };
         if snapshot.device_initialized && revision.is_some() {
             // The device id changed the account revision before any HTTP request.
             return Err(claim::scope_payload(&id, &snapshot.revision, true));
         }
-        let plans = claim::preview_plans(
+        let plans = claim::claim_plans(
             &paths.home,
             &snapshot.account.credentials,
             snapshot.account.config.as_ref(),
@@ -270,7 +300,7 @@ async fn claim_preview(id: String, revision: Option<String>) -> Result<ClaimPrev
         )?;
         let unchanged = {
             let _guard = store_guard();
-            store::claim_revision_matches(&paths, &id, &snapshot.revision)
+            claim_revision_ok(&paths, &id, &snapshot.revision)
         };
         if !unchanged {
             return Err(claim::scope_payload(&id, &snapshot.revision, true));
@@ -297,7 +327,7 @@ async fn claim_refresh(id: String, revision: Option<String>) -> Result<ClaimRefr
         let paths = Paths::detect();
         let snapshot = {
             let _guard = store_guard();
-            store::claim_snapshot_locked(&paths, &id, revision.as_deref())?
+        claim_snapshot(&paths, &id, revision.as_deref())?
         };
         if snapshot.device_initialized && revision.is_some() {
             return Err(claim::scope_payload(&id, &snapshot.revision, true));
@@ -311,7 +341,7 @@ async fn claim_refresh(id: String, revision: Option<String>) -> Result<ClaimRefr
                 },
                 None => (false, None),
             };
-        let plans = claim::preview_plans(
+        let plans = claim::claim_plans(
             &paths.home,
             &snapshot.account.credentials,
             snapshot.account.config.as_ref(),
@@ -319,7 +349,7 @@ async fn claim_refresh(id: String, revision: Option<String>) -> Result<ClaimRefr
         )?;
         let unchanged = {
             let _guard = store_guard();
-            store::claim_revision_matches(&paths, &id, &snapshot.revision)
+            claim_revision_ok(&paths, &id, &snapshot.revision)
         };
         if !unchanged {
             // The activation report was already sent, so this must not auto-retry.
@@ -359,10 +389,14 @@ async fn claim_start(
     let paths = Paths::detect();
     let snapshot = {
         let _guard = store_guard();
-        store::claim_snapshot_locked(&paths, &id, revision.as_deref())?
+        claim_snapshot(&paths, &id, revision.as_deref())?
     };
     if snapshot.device_initialized && revision.is_some() {
         return Err(claim::scope_payload(&id, &snapshot.revision, true));
+    }
+    // Campaign eligibility follows the activation events the client reports on launch.
+    if let Some(mid) = snapshot.account.virtual_device_mid.as_deref() {
+        activate_once(&paths.home, &snapshot.account.credentials, mid);
     }
     let secret = zcrypto::default_secret(&paths.home);
     let scope = claim_session::identity_scope(&snapshot.account.credentials, &secret);
@@ -410,7 +444,7 @@ async fn claim_start(
     let mid = snapshot.account.virtual_device_mid.clone();
     let wanted = plan_id.clone();
     let prepared = tauri::async_runtime::spawn_blocking(move || {
-        claim::preview_plans(&home, &credentials, config.as_ref(), mid)
+        claim::claim_plans(&home, &credentials, config.as_ref(), mid)
     })
     .await;
     let plans = match prepared {
@@ -451,6 +485,24 @@ async fn claim_start(
         return Err(error);
     }
     claim_summary_json(&claim_id).ok_or_else(|| i18n::tr("err.claim.none_pending"))
+}
+
+/// The client reports activation events on every launch, which is what makes an
+/// account eligible for campaigns. Mirror that once per login and device.
+fn activate_once(home: &std::path::Path, credentials: &Value, device_mid: &str) {
+    static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let Some(user_id) = claim::telemetry_user_id(home, credentials) else {
+        return;
+    };
+    let key = format!("{user_id}:{device_mid}");
+    {
+        let mut done = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        if done.iter().any(|k| k == &key) {
+            return;
+        }
+        done.push(key);
+    }
+    let _ = claim::report_activation_events(&user_id, device_mid);
 }
 
 #[tauri::command]

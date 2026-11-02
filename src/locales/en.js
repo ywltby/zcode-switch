@@ -67,6 +67,7 @@ export const en = {
   "m.loginWindowDetail": "The account is saved automatically once you sign in",
   "m.claimBusy": "Batch claim in progress — wait for it to finish",
   "m.noClaimable": "No claimable plan for this account",
+  "m.claimLiveBadge": "Current login",
   "m.claimVerify": "Completing security verification for \"{name}\"…",
   "m.claimVerifyDetail": "Traceless verification usually takes 2–3 seconds",
   "m.claimTimeout": "Verification timed out or was canceled",

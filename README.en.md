@@ -11,7 +11,7 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Save / switch accounts**: one-click login switching; the current login is auto-preserved before any switch — accounts are never lost
 - **Add accounts**: OAuth login for new accounts inside the tool (BigModel / z.ai entries), never touching the current login
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping
-- **Claim promotions**: one-click claim for eligible promotions; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
+- **Claim promotions**: one-click claim for eligible promotions, sourced from both the billing preview and the marketing campaigns the official client renders — the unsaved "current login" can be checked and claimed too; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
 - **Concurrent refresh**: quota and claim eligibility share at most three application-level task slots; one request per account and revision; batch eligibility refresh no longer waits five seconds per account
 - **Claim recovery**: manual, batch, and automatic claims share one backend session; in-flight submission, unconfirmed results, and definite failures are shown separately, late results still land, and a restart never replays an unconfirmed submission
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
@@ -42,7 +42,7 @@ The [concurrent refresh and claim recovery record](docs/testing/concurrent-refre
 ```
 zcode-switch.exe --cli state|list
 zcode-switch.exe --cli quota [--id <account-id>]
-zcode-switch.exe --cli claim-preview [--id <account-id>]
+zcode-switch.exe --cli claim-preview [--id <account-id>|live]
 zcode-switch.exe --cli capture [--name <name>]
 zcode-switch.exe --cli switch --id <id> [--force] [--restart|--no-restart] [--hot <bool>|--no-hot]
 zcode-switch.exe --cli kill

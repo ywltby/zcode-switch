@@ -932,6 +932,20 @@ input:focus-visible,
   min-width: 0;
 }
 .claim-strip .ic { flex: none; }
+.claim-strip.live {
+  margin: 0 0 10px;
+  padding: 7px 10px;
+}
+.claim-badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(232, 163, 61, .45);
+  background: rgba(232, 163, 61, .14);
+  font-size: 11px;
+  letter-spacing: .02em;
+  color: var(--amber);
+}
 .claim-name {
   font-weight: 600;
   white-space: nowrap;

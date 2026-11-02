@@ -1120,7 +1120,22 @@ fn read_live_quota_snapshot(paths: &Paths) -> Result<Account, String> {
     let mid = fs::read_to_string(paths.live_telemetry()).ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from));
-    Ok(crate::quota_auth::login_snapshot("live", creds, mid))
+    Ok(crate::quota_auth::login_snapshot(LIVE_ID, creds, mid))
+}
+
+/// Pseudo account id for the login ZCode is running right now. Nothing is written
+/// to disk: claim and quota reads only borrow the live credentials and device id.
+pub const LIVE_ID: &str = "live";
+
+pub(crate) fn live_claim_snapshot(paths: &Paths) -> Result<Account, String> {
+    let creds = read_live(paths)?
+        .filter(is_logged_in)
+        .ok_or_else(|| tr("err.live.not_logged_in"))?;
+    let mid = fs::read_to_string(paths.live_telemetry()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from))
+        .filter(|m: &String| !m.trim().is_empty());
+    Ok(crate::quota_auth::login_snapshot(LIVE_ID, creds, mid))
 }
 
 fn query_snapshot_via(

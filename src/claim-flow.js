@@ -13,6 +13,10 @@ import {
 
 const claimKey = (ticket) => JSON.stringify(["claim", ticket.kind, ticket.id, ticket.revision, ticket.sequence]);
 
+// The live row is not a stored account: the backend derives its own revision, so the
+// frontend only needs a non-empty placeholder to own the request.
+const LIVE_REVISION = "live";
+
 export function parseScopeError(error) {
   const text = typeof error === "string" ? error : String(error);
   const start = text.indexOf("{");
@@ -32,6 +36,7 @@ export function createClaimFlow({
   errorText = (error) => String(error),
   onChange = () => {},
   refreshState = async () => {},
+  isLive = () => false,
 }) {
   let model = createClaimState();
   let live = [];
@@ -62,8 +67,8 @@ export function createClaimFlow({
     setModel(releaseClaimRequest(model, pending.ticket));
   }
 
-  function applyAccounts(accounts) {
-    const next = accounts || [];
+  function applyAccounts(accounts, extraIds = []) {
+    const next = [...(accounts || []), ...(extraIds || []).map((id) => ({ id, quota_revision: LIVE_REVISION }))];
     const signature = next.map((a) => `${a.id}\u0000${a.quota_revision}`).join("\u0001");
     if (signature === liveSignature) {
       live = next;
@@ -82,9 +87,13 @@ export function createClaimFlow({
     if (!current(ticket)) return { status: "skipped" };
     const command = ticket.kind === "refresh" ? "claim_refresh" : "claim_preview";
     try {
-      const response = await invoke(command, { id: ticket.id, revision: ticket.revision });
+      const liveRow = isLive(ticket.id);
+      const response = await invoke(command, liveRow
+        ? { id: ticket.id }
+        : { id: ticket.id, revision: ticket.revision });
       if (response?.accountId !== ticket.id) return { status: "skipped" };
-      if (response.revision && response.revision !== ticket.revision) return { status: "skipped" };
+      // The live row's revision is a placeholder; the backend owns the real one.
+      if (!liveRow && response.revision && response.revision !== ticket.revision) return { status: "skipped" };
       const settled = settleClaimRequest(model, ticket, {
         plans: response.plans,
         activationError: response.activationError,

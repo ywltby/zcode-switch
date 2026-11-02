@@ -67,6 +67,7 @@ export const zh = {
   "m.loginWindowDetail": "登录完成后账号会自动入库",
   "m.claimBusy": "批量领取进行中，请等待完成",
   "m.noClaimable": "该账号暂无可领取的套餐",
+  "m.claimLiveBadge": "当前登录",
   "m.claimVerify": "正在为「{name}」完成安全验证…",
   "m.claimVerifyDetail": "无感验证通常 2-3 秒",
   "m.claimTimeout": "验证超时或已取消",
