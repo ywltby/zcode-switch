@@ -2,12 +2,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { init, t, lang, stripErr } from "./i18n.js";
-import { createCaptchaFlow } from "./captcha-flow.js";
 
 const SDK_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
-const query = new URLSearchParams(location.search);
-const claimId = query.get("claimId") || "";
-const auto = query.get("auto") === "1";
+const TRACELESS_TIMEOUT = 8000;
 
 const $text = document.getElementById("cap-text");
 const $detail = document.getElementById("cap-detail");
@@ -23,22 +20,20 @@ function detail(text) {
   $detail.textContent = text || "";
 }
 
-function notify(event, payload) {
-  emit(event, payload).catch(() => {});
-}
-
 document.addEventListener("securitypolicyviolation", (e) => {
   detail(t("c.cspBlocked", { directive: e.violatedDirective, uri: String(e.blockedURI).slice(0, 70) }));
 });
 
+const notifyStuck = () => { emit("captcha://interactive").catch(() => {}); };
+
 function loadSdk() {
   return new Promise((resolve, reject) => {
     if (typeof window.initAliyunCaptcha === "function") return resolve();
-    const script = document.createElement("script");
-    script.src = SDK_URL;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error(t("c.sdkFail")));
-    document.head.appendChild(script);
+    const s = document.createElement("script");
+    s.src = SDK_URL;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(t("c.sdkFail")));
+    document.head.appendChild(s);
   });
 }
 
@@ -47,18 +42,15 @@ let region = null;
 let tracelessTimer = 0;
 let captchaInstance = null;
 
-const labels = {
-  preparing: () => t("c.preparing"),
-  verifying: () => t("c.traceless"),
-  interactive: () => t("c.interactive"),
-  submitted: () => t("c.passed"),
-  succeeded: () => t("c.succeeded"),
-  failed: () => t("c.failed"),
-  unknown: () => t("c.unknown"),
-  already: () => t("c.already"),
-  setup_failed: () => t("c.setupFailed"),
-  submit_failed: () => t("c.submitFailed"),
-};
+async function run() {
+  try {
+    const st = await invoke("get_state");
+    if (st?.language) init(st.language);
+  } catch { }
+  document.title = t("c.title");
+  $btn.textContent = t("c.btn");
+  document.querySelector(".cap-foot").textContent = t("c.foot");
+  status(t("c.preparing"));
 
   let cfg;
   try {
@@ -115,17 +107,9 @@ const labels = {
     clearTimeout(tracelessTimer);
     status(t("c.interactive"));
     $btn.hidden = false;
-    $btn.textContent = t("c.retry");
     $btn.focus();
-    notify("captcha://setup-failed", { claimId });
-  } else if (phase === "interactive") {
-    $btn.hidden = false;
-    $btn.textContent = t("c.btn");
-    $btn.focus();
-  } else {
-    $btn.hidden = true;
-  }
-}
+    if (why) detail(typeof why === "string" ? why.slice(0, 120) : JSON.stringify(why).slice(0, 120));
+  };
 
   function startCaptcha() {
     try {
@@ -168,26 +152,4 @@ $btn.addEventListener("click", () => {
   if (!$btn.hidden) status(t("c.inPopup"));
 });
 
-$btn.addEventListener("click", () => {
-  if (flow.canRetry()) {
-    flow.retry();
-    return;
-  }
-  if (!flow.canRetry() && !$btn.hidden) status(t("c.inPopup"));
-});
-
-(async () => {
-  try {
-    const st = await invoke("get_state");
-    if (st?.language) init(st.language);
-  } catch { }
-  document.title = t("c.title");
-  $btn.textContent = t("c.retry");
-  document.querySelector(".cap-foot").textContent = t("c.foot");
-  if (!claimId) {
-    status(t("c.cfgUnavailable"), "err");
-    detail(t("c.cfgUnavailableDetail"));
-    return;
-  }
-  flow.start();
-})();
+run();

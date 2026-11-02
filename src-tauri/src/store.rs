@@ -12,12 +12,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-#[cfg(test)]
-mod tests;
-
-// Protect only snapshot capture / save and cache registration, never network I/O.
-static QUOTA_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(windows)]
 fn no_window(prog: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
@@ -175,7 +169,6 @@ impl Settings {
 #[derive(Serialize, Clone, Debug)]
 pub struct AccountSummary {
     pub id: String,
-    pub quota_revision: String,
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
@@ -678,14 +671,10 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
 }
 
 pub fn save_account(paths: &Paths, acc: &Account) -> Result<(), String> {
-    let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     paths.ensure_dirs()?;
     let path = paths.accounts_dir().join(format!("{}.json", acc.id));
     let body = serde_json::to_string_pretty(acc).unwrap_or_default() + "\n";
-    atomic_write(&path, &body)?;
-    crate::project_token::service().retain_revision(&acc.id,
-        &crate::quota_auth::quota_revision(acc, &zcrypto::default_secret(&paths.home)));
-    Ok(())
+    atomic_write(&path, &body)
 }
 
 pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -754,6 +743,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         virtual_arms_uid: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
+    adopt_virtual_arms_uid(paths, &mut acc)?;
     Ok(acc)
 }
 
@@ -796,6 +786,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         virtual_arms_uid: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
+    adopt_virtual_arms_uid(paths, &mut acc)?;
     Ok(Some(name))
 }
 
@@ -946,26 +937,27 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     }
 }
 
-pub(crate) fn run_switch_probe(paths: &Paths, id: &str) -> Option<crate::probe::ProbeOutcome> {
-    let target = read_quota_account(paths, id).ok()?;
+fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Option<crate::probe::ProbeOutcome> {
     if in_sandbox() || !is_logged_in(&target.credentials) {
         return None;
     }
-    crate::probe::switch_probe(paths, id)
+    let cfg = probe_config_base(paths, target);
+    crate::probe::switch_probe(
+        &target.credentials,
+        cfg.as_ref(),
+        &zcrypto::default_secret(&paths.home),
+        mid,
+        new_gen_provider_config(&paths.data_root),
+    )
+}
+
+fn probe_config_base(paths: &Paths, target: &Account) -> Option<Value> {
+    if target.config.is_none() { return None; }
+    if new_gen_provider_config(&paths.data_root) { target.config.clone() }
+    else { read_live_config(paths).or_else(|| target.config.clone()) }
 }
 
 pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
-    switch_to_with_process_check(paths, id, force, restart, hot, zcode_running)
-}
-
-fn switch_to_with_process_check(
-    paths: &Paths,
-    id: &str,
-    force: bool,
-    restart: bool,
-    hot: bool,
-    is_running: impl FnOnce() -> bool,
-) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
     let live = read_live(paths)?;
@@ -987,7 +979,12 @@ fn switch_to_with_process_check(
                 eprintln!("sync-back 失败(不阻断 already 返回): {e}");
             }
         }
-        ensure_virtual_device_mid_locked(paths, &target.id)?;
+        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
+        write_live_device_mid(paths, &mid)?;
+        let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
+        if !zcode_running() {
+            let _ = write_live_arms_uid(paths, &uid);
+        }
         return Ok(SwitchResult {
             switched: false,
             already_active: true,
@@ -1001,13 +998,7 @@ fn switch_to_with_process_check(
         });
     }
 
-    // The active account can refresh independently; do not restore an expired
-    // non-active snapshot or stop ZCode before telling the user to sign in.
-    if account_jwt_expired(&target.credentials, &paths.home) {
-        return Err(tr("err.switch.jwt_expired"));
-    }
-
-    let running = is_running();
+    let running = zcode_running();
     if hot && running {
         if let Err(e) = sync_live_back_to_source(paths, &accounts) {
             eprintln!("sync-back 失败(不阻断切换): {e}");
@@ -1018,8 +1009,10 @@ fn switch_to_with_process_check(
         hot_swap_verified(paths, &target, &creds)?;
         backfill_relay_pass_hash(paths, &target.id, &creds);
         reset_live_plan_cache(paths);
-        ensure_virtual_device_mid_locked(paths, &target.id)?;
-        let probe = None;
+        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
+        write_live_device_mid(paths, &mid)?;
+        ensure_virtual_arms_uid_locked(paths, &target.id)?;
+        let probe = run_switch_probe(paths, &target, Some(mid));
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -1071,7 +1064,10 @@ fn switch_to_with_process_check(
     if !new_gen {
         rematerialize_wiped_builtins(paths, &target);
     }
-    ensure_virtual_device_mid_locked(paths, &target.id)?;
+    let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
+    write_live_device_mid(paths, &mid)?;
+    let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
+    let _ = write_live_arms_uid(paths, &uid);
 
     let mut launched = false;
     if restart {
@@ -1081,7 +1077,7 @@ fn switch_to_with_process_check(
         }
     }
 
-    let probe = None;
+    let probe = run_switch_probe(paths, &target, Some(mid));
 
     Ok(SwitchResult {
         switched: true,
@@ -1216,7 +1212,6 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
 }
 
 pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
-    let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(tr("err.store.bad_id"));
     }
@@ -1224,9 +1219,7 @@ pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
     if !path.exists() {
         return Err(tr("err.store.no_account"));
     }
-    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))?;
-    crate::project_token::service().invalidate(id);
-    Ok(())
+    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))
 }
 
 pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -1252,103 +1245,21 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
     Ok(acc)
 }
 
-// Quota reads bypass helpers which repair hashes or initialize devices.
-fn read_quota_account(paths: &Paths, id: &str) -> Result<Account, String> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(tr("err.store.bad_id"));
-    }
-    let raw = fs::read_to_string(paths.accounts_dir().join(format!("{id}.json")))
-        .map_err(|_| "scope_changed".to_string())?;
-    let account: Account = serde_json::from_str(&raw).map_err(|_| "invalid_response".to_string())?;
-    if account.id != id { return Err("identity_conflict".into()); }
-    Ok(account)
-}
-
-fn read_live_quota_snapshot(paths: &Paths) -> Result<Account, String> {
-    let creds = read_live(paths)?.ok_or_else(|| tr("err.live.no_file"))?;
-    let mid = fs::read_to_string(paths.live_telemetry()).ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from));
-    Ok(crate::quota_auth::login_snapshot(LIVE_ID, creds, mid))
-}
-
-/// Pseudo account id for the login ZCode is running right now. Nothing is written
-/// to disk: claim and quota reads only borrow the live credentials and device id.
-pub const LIVE_ID: &str = "live";
-
-pub(crate) fn live_claim_snapshot(paths: &Paths) -> Result<Account, String> {
-    let creds = read_live(paths)?
-        .filter(is_logged_in)
-        .ok_or_else(|| tr("err.live.not_logged_in"))?;
-    let mid = fs::read_to_string(paths.live_telemetry()).ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from))
-        .filter(|m: &String| !m.trim().is_empty());
-    Ok(crate::quota_auth::login_snapshot(LIVE_ID, creds, mid))
-}
-
-fn query_snapshot_via(
-    snapshot: Account, secret: &str, version: &str,
-    http: &dyn crate::quota_http::Transport,
-    service: &crate::project_token::TokenService,
-    current: impl Fn() -> Result<Account, String> + Sync,
-) -> Result<quota::QuotaOverview, String> {
-    use crate::quota_auth::{quota_revision, resolve_account_context, QuotaError};
-    let revision = quota_revision(&snapshot, secret);
-    let context = resolve_account_context(&snapshot, secret, version);
-    let is_current = || current().ok().is_some_and(|latest| quota_revision(&latest, secret) == revision);
-    {
-        let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if !is_current() { return Err(QuotaError::ScopeChanged.to_string()); }
-        match &context {
-            Ok(ctx) => service.activate(&ctx.scope),
-            Err(_) => service.invalidate(&snapshot.id),
-        }
-    }
-    let result = match context {
-        Ok(ctx) => {
-            let check = || {
-                if !is_current() {
-                    service.invalidate_if_current(&ctx.scope);
-                    return Err(QuotaError::ScopeChanged);
-                }
-                service.assert_current(&ctx.scope)
-            };
-            let guarded = |request| {
-                check()?;
-                let result = http.send(request);
-                check()?;
-                result
-            };
-            let result = quota::query_with_service(&ctx, &guarded, service);
-            check().map_err(|e| e.to_string())?;
-            result
-        },
-        Err(code) => quota::unavailable(&snapshot.id, &revision, code),
-    };
-    if current().ok().is_none_or(|latest| quota_revision(&latest, secret) != revision) {
-        return Err(QuotaError::ScopeChanged.to_string());
-    }
-    Ok(result)
+fn live_quota_config(paths: &Paths) -> Option<Value> {
+    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
 }
 
 pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
-    query_snapshot_via(read_live_quota_snapshot(paths)?, &zcrypto::default_secret(&paths.home),
-        &quota::zcode_app_version(), &crate::quota_http::HttpTransport, crate::project_token::service(), || read_live_quota_snapshot(paths))
+    let creds = read_live(paths)?.ok_or(tr("err.live.no_file"))?;
+    if !is_logged_in(&creds) {
+        return Err(tr("err.live.quota"));
+    }
+    quota::quota_for_live(&paths.home, &creds, live_quota_config(paths).as_ref())
 }
 
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
-    account_quota_revision(paths, id, None)
-}
-
-pub fn account_quota_revision(paths: &Paths, id: &str, expected: Option<&str>) -> Result<quota::QuotaOverview, String> {
-    let snapshot = read_quota_account(paths, id)?;
-    let secret = zcrypto::default_secret(&paths.home);
-    if expected.is_some_and(|revision| crate::quota_auth::quota_revision(&snapshot, &secret) != revision) {
-        return Err("scope_changed".into());
-    }
-    query_snapshot_via(snapshot, &secret, &quota::zcode_app_version(), &crate::quota_http::HttpTransport,
-        crate::project_token::service(), || read_quota_account(paths, id))
+    let acc = load_account(paths, id)?;
+    quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
@@ -1385,15 +1296,14 @@ pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Stri
     ensure_virtual_device_mid_locked(paths, id)
 }
 
-/// Campaign eligibility is keyed to the device id: once the server has delivered to it,
-/// that id never sees the campaign again. Replacing it is the same move as deleting
-/// ZCode's `telemetry-state.json`, without touching the client's own identity.
+/// 营销活动按设备标识去重：投递过的 id 不再看到同一档活动。换新 id 等效于
+/// 手动删除 ZCode 的 telemetry-state.json，但不动客户端自身的设备身份。
 pub fn reset_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, String> {
-    let _guard = crate::store_guard();
-    let mut acc = load_account(paths, id)?;
-    if id == LIVE_ID {
+    if id == "live" {
         return Err("identity_conflict".into());
     }
+    let _guard = crate::store_guard();
+    let mut acc = load_account(paths, id)?;
     let mid = Uuid::new_v4().to_string();
     acc.virtual_device_mid = Some(mid.clone());
     acc.updated_at = now_ts();
@@ -1401,44 +1311,19 @@ pub fn reset_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Strin
     Ok(mid)
 }
 
-pub(crate) struct ClaimSnapshot {
-    pub account: Account,
-    pub revision: String,
-    pub device_initialized: bool,
-}
-
-// Short-lock claim preparation: validate the caller's revision, then make sure the
-// account owns a virtual device id. Never performs network I/O or repairs hashes.
-pub(crate) fn claim_snapshot_locked(
-    paths: &Paths,
-    id: &str,
-    expected: Option<&str>,
-) -> Result<ClaimSnapshot, String> {
-    let mut account = read_quota_account(paths, id)?;
-    let secret = zcrypto::default_secret(&paths.home);
-    let current = crate::quota_auth::quota_revision(&account, &secret);
-    if expected.is_some_and(|value| value != current) {
-        return Err("scope_changed".into());
+pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
+    let mut v: Value = fs::read_to_string(paths.live_telemetry())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !v.is_object() {
+        v = json!({});
     }
-    let device_initialized = account
-        .virtual_device_mid
-        .as_deref()
-        .map_or(true, |m| m.trim().is_empty());
-    if device_initialized {
-        let mid = ensure_virtual_device_mid_locked(paths, id)?;
-        account.virtual_device_mid = Some(mid);
+    if v.get("deviceMid").and_then(|m| m.as_str()) == Some(mid) {
+        return Ok(());
     }
-    let revision = crate::quota_auth::quota_revision(&account, &secret);
-    Ok(ClaimSnapshot { account, revision, device_initialized })
-}
-
-pub(crate) fn claim_revision_matches(paths: &Paths, id: &str, revision: &str) -> bool {
-    read_quota_account(paths, id)
-        .map(|account| {
-            crate::quota_auth::quota_revision(&account, &zcrypto::default_secret(&paths.home))
-                == revision
-        })
-        .unwrap_or(false)
+    v["deviceMid"] = json!(mid);
+    atomic_write(&paths.live_telemetry(), &(serde_json::to_string(&v).unwrap_or_default() + "\n"))
 }
 
 fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
@@ -1464,6 +1349,203 @@ fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), Stri
     save_account(paths, acc)
 }
 
+const ARMS_DEFAULT_STORE_FILE: &str = "ZGVmYXVsdA.json";
+
+pub fn new_arms_uid() -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let uuid = Uuid::new_v4();
+    let suffix: String = uuid.as_bytes()
+        .iter()
+        .take(16)
+        .map(|b| ALPHABET[(*b as usize) % 36] as char)
+        .collect();
+    format!("uid_{suffix}")
+}
+
+fn arms_store_dirs_from(
+    win_appdata: Option<PathBuf>,
+    mac_appsupport: Option<PathBuf>,
+    unix_base: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push_if_new = |dir: PathBuf| {
+        let lowered = dir.to_string_lossy().to_lowercase();
+        if !out.iter().any(|d| d.to_string_lossy().to_lowercase() == lowered) {
+            out.push(dir);
+        }
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let groups: [(Option<PathBuf>, &[&str]); 3] = [
+        (win_appdata, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
+        (mac_appsupport, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
+        (unix_base, &["zcode", "ZCode"]),
+    ];
+    for (base, names) in groups {
+        let Some(base) = base else { continue };
+        for name in names {
+            candidates.push(base.join(name).join("rum-electron-store"));
+        }
+        if let Ok(rd) = fs::read_dir(&base) {
+            let extras: Vec<PathBuf> = rd
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    n.starts_with("zcode") && e.path().join("rum-electron-store").is_dir()
+                })
+                .map(|e| e.path().join("rum-electron-store"))
+                .collect();
+            candidates.extend(extras);
+        }
+    }
+    let existing: Vec<PathBuf> = candidates.iter().filter(|c| c.is_dir()).cloned().collect();
+    if existing.is_empty() {
+        candidates.truncate(1);
+        candidates
+    } else {
+        for c in existing {
+            push_if_new(c);
+        }
+        out
+    }
+}
+
+fn arms_store_dirs_for(paths: &Paths) -> Vec<PathBuf> {
+    if in_sandbox() {
+        return vec![paths.home.join("arms-store-sandbox")];
+    }
+    #[cfg(windows)]
+    let (appdata, mac_base, unix_base) =
+        (std::env::var("APPDATA").ok().map(PathBuf::from), None, None);
+    #[cfg(target_os = "macos")]
+    let (appdata, mac_base, unix_base) = (
+        None,
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("Library").join("Application Support")),
+        None,
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (appdata, mac_base, unix_base) = (
+        None,
+        None,
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))),
+    );
+    arms_store_dirs_from(appdata, mac_base, unix_base)
+}
+
+fn ensure_virtual_arms_uid_locked(paths: &Paths, id: &str) -> Result<String, String> {
+    {
+        let acc = load_account(paths, id)?;
+        if let Some(u) = acc.virtual_arms_uid.clone() {
+            if !u.trim().is_empty() {
+                return Ok(u);
+            }
+        }
+    }
+    let mut acc = load_account(paths, id)?;
+    if let Some(u) = acc.virtual_arms_uid.clone() {
+        if !u.trim().is_empty() {
+            return Ok(u);
+        }
+    }
+    let u = new_arms_uid();
+    acc.virtual_arms_uid = Some(u.clone());
+    acc.updated_at = now_ts();
+    save_account(paths, &acc)?;
+    Ok(u)
+}
+
+fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
+    let read_uid = |f: &Path| -> Option<String> {
+        fs::read_to_string(f)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("_arms_uid").and_then(|u| u.as_str()).map(String::from))
+            .filter(|u| !u.trim().is_empty())
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if let Ok(rd) = fs::read_dir(d) {
+            let mut jsons: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+                .collect();
+            jsons.sort_by_key(|p| !p.file_name().map(|n| n == ARMS_DEFAULT_STORE_FILE).unwrap_or(false));
+            files.extend(jsons);
+        }
+    }
+    files.iter().find_map(|f| read_uid(f))
+}
+
+pub fn write_live_arms_uid_to(dirs: &[PathBuf], uid: &str) -> Result<(), String> {
+    for d in dirs {
+        let mut jsons: Vec<PathBuf> = fs::read_dir(d)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if jsons.is_empty() {
+            fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
+            jsons.push(d.join(ARMS_DEFAULT_STORE_FILE));
+        }
+        let mut first_err: Option<String> = None;
+        for f in jsons {
+            let mut v: Value = fs::read_to_string(&f)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({}));
+            if !v.is_object() {
+                v = json!({});
+            }
+            if v.get("_arms_uid").and_then(|u| u.as_str()) == Some(uid)
+                && v.get("_arms_session").is_none()
+            {
+                continue;
+            }
+            let obj = v.as_object_mut().unwrap();
+            obj.insert("_arms_uid".into(), json!(uid));
+            obj.remove("_arms_session");
+            if let Err(e) = atomic_write(&f, &(serde_json::to_string(&v).unwrap_or_default() + "\n")) {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+fn write_live_arms_uid(paths: &Paths, uid: &str) -> Result<(), String> {
+    write_live_arms_uid_to(&arms_store_dirs_for(paths), uid)
+}
+
+fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
+    if acc.virtual_arms_uid.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+        return Ok(());
+    }
+    let live_uid = read_live_arms_uid_from(&arms_store_dirs_for(paths));
+    let taken = |u: &str| {
+        list_accounts(paths)
+            .map(|accs| accs.iter().any(|a| a.virtual_arms_uid.as_deref() == Some(u)))
+            .unwrap_or(false)
+    };
+    let uid = match live_uid {
+        Some(u) if !taken(&u) => u,
+        _ => new_arms_uid(),
+    };
+    acc.virtual_arms_uid = Some(uid);
+    acc.updated_at = now_ts();
+    save_account(paths, acc)
+}
+
 pub fn export_bundle_value(accounts: &[Account]) -> Value {
     json!({
         "format": "zcode-accounts-bundle",
@@ -1474,12 +1556,11 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
             "createdAt": a.created_at,
             "credentials": a.credentials,
             "config": a.config,
-            "claimDeviceMid": a.virtual_device_mid,
         })).collect::<Vec<_>>(),
     })
 }
 
-type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);
+type ImportCandidate = (Option<String>, Value, Option<Value>);
 
 fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
     if v.get("format").and_then(|f| f.as_str()) == Some("zcode-accounts-bundle") {
@@ -1494,8 +1575,6 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
                 item.get("config").cloned(),
-                item.get("claimDeviceMid").and_then(Value::as_str)
-                    .filter(|mid| !mid.trim().is_empty()).map(String::from),
             ));
         }
         return Ok(out);
@@ -1517,7 +1596,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 continue;
             }
         };
-        for (name_opt, creds, config_opt, claim_mid) in cands {
+        for (name_opt, creds, config_opt) in cands {
             if !is_logged_in(&creds) {
                 report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
@@ -1541,7 +1620,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 hash,
                 credentials: creds,
                 config: config_opt,
-                virtual_device_mid: claim_mid,
+                virtual_device_mid: None,
                 virtual_arms_uid: None,
             };
             new_accounts.push(acc);
@@ -1556,14 +1635,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
 }
 
 pub fn get_state(paths: &Paths) -> Result<AppState, String> {
-    let accounts = {
-        let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let accounts = list_accounts(paths)?;
-        let secret = zcrypto::default_secret(&paths.home);
-        let revisions = accounts.iter().map(|a| (a.id.clone(),crate::quota_auth::quota_revision(a,&secret))).collect::<Vec<_>>();
-        crate::project_token::service().reconcile(&revisions);
-        accounts
-    };
+    let accounts = list_accounts(paths)?;
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);
     let live_logged_in = live.as_ref().map(is_logged_in).unwrap_or(false);
@@ -1580,7 +1652,6 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         .iter()
         .map(|a| AccountSummary {
             id: a.id.clone(),
-            quota_revision: crate::quota_auth::quota_revision(a, &zcrypto::default_secret(&paths.home)),
             name: a.name.clone(),
             created_at: a.created_at.clone(),
             updated_at: a.updated_at.clone(),

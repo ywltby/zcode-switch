@@ -1,10 +1,9 @@
-use crate::project_token::{self, Project, ProjectEndpoint, TokenService};
-use crate::quota_auth::{AccountQueryContext, PlanScope, QuotaError};
-use crate::quota_http::{Request, Transport};
-use serde_json::Value;
 
-#[cfg(test)]
-mod tests;
+use crate::zcrypto;
+use serde_json::Value;
+use std::path::Path;
+use std::thread::sleep;
+use std::time::Duration;
 
 #[cfg(windows)]
 fn no_window(prog: &str) -> std::process::Command {
@@ -18,6 +17,8 @@ fn no_window(prog: &str) -> std::process::Command {
     std::process::Command::new(prog)
 }
 
+pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
+pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
 pub const CLIENT_APP_VERSION: &str = "3.16.3";
 
@@ -56,12 +57,8 @@ pub(crate) fn device_mid() -> Option<String> {
     CACHE
         .get_or_init(|| {
             let home = crate::store::pick_home(
-                std::env::var("ZCODE_SWITCH_HOME")
-                    .ok()
-                    .map(std::path::PathBuf::from),
-                std::env::var("USERPROFILE")
-                    .ok()
-                    .map(std::path::PathBuf::from),
+                std::env::var("ZCODE_SWITCH_HOME").ok().map(std::path::PathBuf::from),
+                std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
                 std::env::var("HOME").ok().map(std::path::PathBuf::from),
             );
             let p = crate::store::resolve_data_root(&home)
@@ -71,11 +68,7 @@ pub(crate) fn device_mid() -> Option<String> {
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| {
-                    v.get("deviceMid")
-                        .and_then(|m| m.as_str())
-                        .map(String::from)
-                })
+                .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
         })
         .clone()
 }
@@ -86,21 +79,12 @@ pub(crate) fn os_version() -> Option<String> {
     CACHE
         .get_or_init(|| {
             let out = no_window("reg")
-                .args([
-                    "query",
-                    r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
-                    "/v",
-                    "CurrentBuildNumber",
-                ])
+                .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "/v", "CurrentBuildNumber"])
                 .output()
                 .ok()?;
             let txt = String::from_utf8_lossy(&out.stdout);
-            let build = txt
-                .lines()
-                .find(|l| l.contains("CurrentBuildNumber"))?
-                .rsplit(' ')
-                .find(|t| !t.is_empty())?
-                .to_string();
+            let build = txt.lines().find(|l| l.contains("CurrentBuildNumber"))?
+                .rsplit(' ').find(|t| !t.is_empty())?.to_string();
             Some(format!("10.0.{build}"))
         })
         .clone()
@@ -179,17 +163,9 @@ fn detected_app_version() -> String {
                         continue;
                     }
                     if let Some(rest) = l.strip_prefix("DisplayName") {
-                        name = rest
-                            .trim_start()
-                            .trim_start_matches("REG_SZ")
-                            .trim()
-                            .to_string();
+                        name = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
                     } else if let Some(rest) = l.strip_prefix("DisplayVersion") {
-                        ver = rest
-                            .trim_start()
-                            .trim_start_matches("REG_SZ")
-                            .trim()
-                            .to_string();
+                        ver = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
                     }
                 }
                 if is_zcode_display_name(&name) && !ver.is_empty() {
@@ -247,28 +223,17 @@ pub(crate) fn zai_billing_headers(token: &str) -> Vec<(String, String)> {
     zai_billing_headers_with_mid(token, device_mid())
 }
 
-pub(crate) fn zai_billing_headers_with_mid(
-    token: &str,
-    mid: Option<String>,
-) -> Vec<(String, String)> {
+pub(crate) fn zai_billing_headers_with_mid(token: &str, mid: Option<String>) -> Vec<(String, String)> {
     zai_headers_with_version(zcode_app_version(), token, mid)
 }
 
 pub(crate) struct OAuthFlowHeaders(pub Vec<(String, String)>);
 
 pub(crate) fn zai_oauth_headers_with_mid(token: &str, mid: Option<String>) -> OAuthFlowHeaders {
-    OAuthFlowHeaders(zai_headers_with_version(
-        CLIENT_APP_VERSION.to_string(),
-        token,
-        mid,
-    ))
+    OAuthFlowHeaders(zai_headers_with_version(CLIENT_APP_VERSION.to_string(), token, mid))
 }
 
-fn zai_headers_with_version(
-    ver: String,
-    token: &str,
-    mid: Option<String>,
-) -> Vec<(String, String)> {
+fn zai_headers_with_version(ver: String, token: &str, mid: Option<String>) -> Vec<(String, String)> {
     let mut h: Vec<(String, String)> = vec![
         ("User-Agent".into(), format!("ZCode/{ver}")),
         ("HTTP-Referer".into(), ZCODE_ORIGIN.into()),
@@ -291,10 +256,16 @@ fn zai_headers_with_version(
     h
 }
 
+fn bigmodel_headers(token: &str) -> Vec<(String, String)> {
+    vec![
+        ("Authorization".into(), format!("Bearer {token}")),
+        ("User-Agent".into(), format!("ZCode/{}", zcode_app_version())),
+        ("x-request-id".into(), uuid::Uuid::new_v4().to_string()),
+    ]
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct QuotaItem {
-    #[serde(skip_serializing)]
-    pub window_key: Option<String>,
     pub name: String,
     pub total: Option<f64>,
     pub used: Option<f64>,
@@ -314,20 +285,8 @@ pub struct QuotaItem {
     pub reset: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub struct EntitlementStart {
-    pub name: String,
-    pub effective_at: Option<i64>,
-}
-
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct PlanSlot {
-    #[serde(skip_serializing)]
-    pub entitlement_id: Option<String>,
-    #[serde(skip_serializing)]
-    pub period_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope_label: Option<String>,
     #[serde(skip_serializing)]
     pub pid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,17 +295,6 @@ pub struct PlanSlot {
     pub tier_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    // Unix milliseconds, so the UI can compare it with the current time and
-    // render in the user's local time zone.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub starts_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ends_at: Option<i64>,
-    pub pending: bool,
-    // Some (including an empty list) identifies Start Plan: its plan-level
-    // starts_at is not the activation time of its individual entitlements.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entitlement_starts: Option<Vec<EntitlementStart>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expire: Option<String>,
     pub total: Option<f64>,
@@ -358,12 +306,6 @@ pub struct PlanSlot {
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct QuotaOverview {
-    #[serde(skip_serializing)]
-    pub models: Vec<String>,
-    pub account_id: String,
-    pub revision: String,
-    pub completion: String,
-    pub errors: Vec<ScopeError>,
     pub total: Option<f64>,
     pub used: Option<f64>,
     pub remaining: Option<f64>,
@@ -379,644 +321,539 @@ pub struct QuotaOverview {
     pub plans: Vec<PlanSlot>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ScopeError {
-    pub scope: String,
-    pub code: QuotaError,
-}
-
-struct ScopedPart {
-    account: crate::quota_auth::AccountScope,
-    plan: crate::quota_auth::PlanScope,
-    value: QuotaOverview,
-}
-
-fn merge_scoped(
-    ctx: &AccountQueryContext,
-    parts: Vec<ScopedPart>,
-    errors: Vec<ScopeError>,
-) -> QuotaOverview {
-    if parts.iter().any(|part| part.account != ctx.scope) {
-        return unavailable(
-            &ctx.scope.snapshot_id,
-            &ctx.scope.revision,
-            QuotaError::ScopeChanged,
-        );
+fn safe_decrypt(value: Option<&str>, secret: &str) -> Option<String> {
+    let v = value?;
+    if zcrypto::is_encrypted(v) {
+        zcrypto::decrypt_with_secret(v, secret).ok()
+    } else {
+        Some(v.to_string())
     }
-    let success = parts.len();
-    let mut models = Vec::new();
-    let mut groups: Vec<(crate::quota_auth::PlanScope, PlanSlot, i64)> = vec![];
-    let mut refreshed = 0;
-    for part in parts {
-        for model in part.value.models {
-            if !models.contains(&model) {
-                models.push(model);
-            }
+}
+
+fn looks_like_token(v: &str) -> bool {
+    v.trim().len() > 20
+}
+
+fn coding_plan_api_keys(config: Option<&Value>) -> Vec<String> {
+    let mut keys = vec![];
+    let providers = match config.and_then(|c| c.get("provider")).and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return keys,
+    };
+    let mut ordered: Vec<(&String, &Value)> = providers.iter().collect();
+    ordered.sort_by_key(|(_, p)| if p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) { 0 } else { 1 });
+    for (id, p) in ordered {
+        if !id.contains("coding-plan") {
+            continue;
         }
-        refreshed = refreshed.max(part.value.refreshed_at);
-        for mut slot in part.value.plans {
-            let mut windows = Vec::new();
-            merge_windows(&mut windows, std::mem::take(&mut slot.items), false);
-            slot.items = windows;
-            let duplicate = groups.iter().position(|(plan, old, _)| {
-                plan == &part.plan
-                    && slot.entitlement_id.is_some()
-                    && slot.entitlement_id == old.entitlement_id
-                    && slot.period_key == old.period_key
-            });
-            if let Some(index) = duplicate {
-                let (_, old, time) = &mut groups[index];
-                let newer = part.value.refreshed_at >= *time;
-                let entitlement_starts = if newer {
-                    slot.entitlement_starts.clone().or_else(|| old.entitlement_starts.clone())
-                } else {
-                    old.entitlement_starts.clone().or_else(|| slot.entitlement_starts.clone())
-                };
-                let prefer = (slot_completeness(&slot), part.value.refreshed_at)
-                    >= (slot_completeness(old), *time);
-                let mut windows = old.items.clone();
-                merge_windows(&mut windows, slot.items.clone(), newer);
-                if prefer {
-                    *old = slot;
-                    *time = part.value.refreshed_at;
-                }
-                old.items = windows;
-                old.entitlement_starts = entitlement_starts;
-            } else {
-                groups.push((part.plan.clone(), slot, part.value.refreshed_at));
+        if let Some(k) = p.get("options").and_then(|o| o.get("apiKey")).and_then(|k| k.as_str()) {
+            if !k.starts_with("enc:") && looks_like_token(k) && !keys.contains(&k.to_string()) {
+                keys.push(k.to_string());
             }
         }
     }
-    let mut plans: Vec<_> = groups
-        .into_iter()
-        .map(|(_, mut slot, _)| {
-            set_primary(&mut slot);
-            slot
-        })
-        .collect();
-    let primary = plans
-        .iter()
-        .max_by_key(|p| tier_rank(p.tier_code.as_deref()))
-        .cloned()
-        .unwrap_or_default();
-    let items = plans.iter().flat_map(|p| p.items.iter().cloned()).collect();
-    let complete = errors.is_empty() && success > 0;
-    QuotaOverview {
-        account_id: ctx.scope.snapshot_id.clone(),
-        revision: ctx.scope.revision.clone(),
-        completion: if complete {
-            "complete"
-        } else if success > 0 {
-            "partial"
-        } else {
-            "unavailable"
-        }
-        .into(),
-        is_empty: complete && plans.is_empty(),
-        errors,
-        refreshed_at: refreshed,
-        total: primary.total,
-        used: primary.used,
-        remaining: primary.remaining,
-        percent_used: primary.percent_used,
-        plan_tier: primary.tier,
-        plan_expire: primary.expire,
-        items,
-        plans: std::mem::take(&mut plans),
-        source: "account".into(),
-        models,
-    }
+    keys
 }
 
-fn item_completeness(item: &QuotaItem) -> usize {
-    [item.total, item.used, item.remaining, item.percent_used]
-        .iter()
-        .filter(|v| v.is_some())
-        .count()
-}
-
-fn slot_completeness(slot: &PlanSlot) -> usize {
-    slot.items.iter().map(item_completeness).sum::<usize>()
-        + usize::from(slot.expire.is_some()) + usize::from(slot.starts_at.is_some())
-}
-
-// A complete window wins over an incomplete one; equally complete observations use
-// the newer response. Repeated windows are replaced, never added together.
-fn merge_windows(target: &mut Vec<QuotaItem>, incoming: Vec<QuotaItem>, newer: bool) {
-    for item in incoming {
-        if let Some(old) = target
-            .iter_mut()
-            .find(|old| item.window_key.is_some() && old.window_key == item.window_key)
-        {
-            if item_completeness(&item) > item_completeness(old)
-                || (item_completeness(&item) == item_completeness(old) && newer)
-            {
-                *old = item;
-            }
-        } else {
-            target.push(item);
-        }
-    }
-}
-
-fn set_primary(slot: &mut PlanSlot) {
-    if let Some(item) = slot.items.iter().max_by_key(|i| item_completeness(i)) {
-        slot.total = item.total;
-        slot.used = item.used;
-        slot.remaining = item
-            .remaining
-            .or_else(|| item.total.zip(item.used).map(|(t, u)| (t - u).max(0.0)));
-        slot.percent_used = item.percent_used.or_else(|| {
-            item.total
-                .zip(item.used)
-                .filter(|(t, _)| *t > 0.0)
-                .map(|(t, u)| (u / t * 100.0).clamp(0.0, 100.0))
-        });
-    }
-}
-
-fn instance_id(value: &Value) -> Option<String> {
-    ["user_plan_id", "subscription_id", "subscriptionId"]
-        .iter()
-        .find_map(|key| value.get(key).and_then(crate::quota_auth::normalized_id))
-}
-
-fn period_key(value: &Value) -> Option<String> {
-    let start = [
-        "starts_at",
-        "period_start",
-        "startTime",
-        "subscribeStartTime",
-    ]
-    .iter()
-    .find_map(|k| value.get(k));
-    let end = [
-        "ends_at",
-        "period_end",
-        "expires_at",
-        "expireTime",
-        "valid",
-        "subscribeEndTime",
-    ]
-    .iter()
-    .find_map(|k| value.get(k));
-    (start.is_some() || end.is_some()).then(|| serde_json::json!([start, end]).to_string())
-}
-
-pub(crate) fn timestamp_millis(raw: &Value) -> Option<i64> {
-    let number = raw.as_f64().or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
-    if let Some(n) = number.filter(|n| n.is_finite()) {
-        let ms = if n >= 1_000_000_000_000.0 { n }
-            else if n >= 1_000_000_000.0 { n * 1000.0 }
-            else { return None };
-        if ms > i64::MAX as f64 { return None; }
-        let ms = ms as i64;
-        return chrono::DateTime::from_timestamp_millis(ms).map(|_| ms);
-    }
-    raw.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
-        .map(|t| t.timestamp_millis())
-}
-
-pub(crate) fn entitlement_start_times(plan: &Value) -> Vec<EntitlementStart> {
-    let mut out = Vec::new();
-    for item in plan.get("entitlements").and_then(Value::as_array).into_iter().flatten() {
-        if !item.is_object() { continue; }
-        let start = EntitlementStart {
-            name: item.get("show_name").or_else(|| item.get("showName"))
-                .and_then(Value::as_str).unwrap_or("").trim().to_string(),
-            effective_at: item.get("effective_at").or_else(|| item.get("effectiveAt"))
-                .and_then(timestamp_millis),
-        };
-        if !out.contains(&start) { out.push(start); }
+fn coding_plan_keys_from_creds(creds: &Value, secret: &str) -> Vec<String> {
+    let Some(map) = creds.as_object() else { return vec![] };
+    let mut out: Vec<String> = vec![];
+    for (k, v) in map {
+        if !k.starts_with("account-provider:") || !k.ends_with(":api-key") { continue; }
+        if !k.contains("coding-plan") { continue; }
+        let Some(p) = v.as_str().and_then(|v| safe_decrypt(Some(v), secret)) else { continue };
+        if looks_like_token(&p) && !out.contains(&p) { out.push(p); }
     }
     out
 }
 
-fn extract_start_time(value: &Value) -> Option<i64> {
-    ["starts_at", "period_start", "startTime", "subscribeStartTime"]
-        .iter().find_map(|key| value.get(key).and_then(timestamp_millis))
-        .or_else(|| valid_range(value).map(|(start, _)| start))
+pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<String> {
+    let mut tokens: Vec<String> = vec![];
+    let add = |plain: Option<String>, tokens: &mut Vec<String>| {
+        if let Some(p) = plain {
+            if looks_like_token(&p) && !tokens.contains(&p) {
+                tokens.push(p);
+            }
+        }
+    };
+    let creds_keys = coding_plan_keys_from_creds(creds, secret);
+    if new_gen {
+        for k in &creds_keys {
+            add(Some(k.clone()), &mut tokens);
+        }
+    }
+    for k in coding_plan_api_keys(config) {
+        tokens.push(k);
+    }
+    let active = safe_decrypt(
+        creds.get("oauth:active_provider").and_then(|v| v.as_str()),
+        secret,
+    )
+    .unwrap_or_else(|| "zai".into());
+    let map = creds.as_object();
+    add(
+        map.and_then(|m| m.get("zcodejwttoken")).and_then(|v| v.as_str()).and_then(|v| safe_decrypt(Some(v), secret)),
+        &mut tokens,
+    );
+    for key in [
+        format!("oauth:{active}:access_token"),
+        "oauth:bigmodel:access_token".to_string(),
+        "oauth:zai:access_token".to_string(),
+    ] {
+        add(
+            map.and_then(|m| m.get(&key)).and_then(|v| v.as_str()).and_then(|v| safe_decrypt(Some(v), secret)),
+            &mut tokens,
+        );
+    }
+    if !new_gen {
+        for k in creds_keys {
+            add(Some(k), &mut tokens);
+        }
+    }
+    tokens
 }
 
-fn extract_end_time(value: &Value) -> Option<i64> {
-    ["ends_at", "subscribeEndTime", "expireTime", "endTime", "expires_at", "period_end"]
-        .iter().find_map(|key| value.get(key).and_then(timestamp_millis))
-        .or_else(|| valid_range(value).map(|(_, end)| end))
-        .or_else(|| valid_end_date(value))
+fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, String> {
+    let retry_delays = [500u64, 1500, 4000];
+    let agent = crate::net::apply_proxy(
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20)),
+    )
+    .build();
+    let headers = if url.contains("zcode.z.ai") {
+        zai_billing_headers(token)
+    } else {
+        bigmodel_headers(token)
+    };
+    let mut last_err: Option<String> = None;
+    let mut backoff: std::slice::Iter<'_, u64> = if retry_429 { retry_delays.iter() } else { [].iter() };
+    loop {
+        let mut req = agent.get(url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        let resp = req.call();
+        match resp {
+            Ok(r) => {
+                let text = r.into_string().map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+                return Ok(if text.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_str(&text).unwrap_or(Value::String(text.clone()))
+                });
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                    if v.get("code").and_then(|c| c.as_i64()) == Some(401) {
+                        return Err(crate::i18n::tr("err.token.biz401"));
+                    }
+                }
+                if code == 429 {
+                    match backoff.next() {
+                        Some(d) => {
+                            last_err = Some(crate::i18n::tr("err.quota.rate_limited"));
+                            sleep(Duration::from_millis(*d));
+                            continue;
+                        }
+                        None => return Err(last_err.unwrap_or_else(|| crate::i18n::tr("err.quota.http429"))),
+                    }
+                }
+                if code == 401 || code == 403 {
+                    return Err(crate::i18n::trf("err.token.http401", &[("code", &code.to_string())]));
+                }
+                let msg = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| ["message", "msg", "error"].iter().find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)));
+                return Err(crate::i18n::trf("err.quota.http", &[("code", &code.to_string()), ("msg", &msg.unwrap_or_default())]));
+            }
+            Err(e) => return Err(crate::i18n::trf("err.network", &[("e", &e.to_string())])),
+        }
+    }
 }
 
-fn valid_end_date(value: &Value) -> Option<i64> {
-    use chrono::{NaiveDate, TimeZone};
-    let date = NaiveDate::parse_from_str(value.get("valid")?.as_str()?.trim(), "%Y-%m-%d").ok()?;
-    let end = date.and_hms_milli_opt(23, 59, 59, 999)?;
-    chrono::Local.from_local_datetime(&end).single().map(|t| t.timestamp_millis())
+type FetchFn<'a> = dyn Fn(&str, &str) -> Result<Value, String> + 'a;
+
+fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, String> {
+    let mut best_err: Option<String>;
+
+    match fetch(QUOTA_LIMIT_URL, token) {
+        Ok(limit_resp) => {
+            if business_ok(&limit_resp) {
+                let sub = fetch(SUBSCRIPTION_URL, token).ok();
+                let mut ov = normalize_quota_limit(&limit_resp, sub.as_ref());
+                ov.refreshed_at = chrono::Local::now().timestamp_millis();
+                ov.source = "bigmodel.cn/api/monitor".into();
+                return Ok(ov);
+            }
+            let code = limit_resp.get("code").and_then(|c| c.as_i64());
+            best_err = Some(match code {
+                Some(401) => crate::i18n::tr("err.token.biz401"),
+                Some(c) => {
+                    let msg = ["msg", "message", "error"]
+                        .iter()
+                        .find_map(|k| limit_resp.get(k).and_then(|x| x.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    crate::i18n::trf("err.quota.biz", &[("code", &c.to_string()), ("msg", &msg)])
+                }
+                None => crate::i18n::tr("err.quota.bad_resp"),
+            });
+        }
+        Err(e) => best_err = Some(e),
+    }
+
+    let url = format!("{BILLING_BALANCE_URL}?app_version={}", zcode_app_version());
+    match fetch(&url, token) {
+        Ok(balance) if business_ok(&balance) => {
+            let mut ov = normalize_balance(&balance);
+            ov.refreshed_at = chrono::Local::now().timestamp_millis();
+            ov.source = "zcode.z.ai/billing".into();
+            return Ok(ov);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            if best_err.is_none() {
+                best_err = Some(e);
+            }
+        }
+    }
+
+    Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
-fn valid_range(value: &Value) -> Option<(i64, i64)> {
-    use chrono::{NaiveDateTime, TimeZone};
-    let text = value.get("valid")?.as_str()?.trim();
-    for (length, format) in [(19, "%Y-%m-%d %H:%M:%S"), (16, "%Y-%m-%d %H:%M")] {
-        let (Some(left), Some(rest)) = (text.get(..length), text.get(length..)) else { continue };
-        let Some(right) = rest.trim_start().strip_prefix('-').map(str::trim) else { continue };
-        let Ok(start) = NaiveDateTime::parse_from_str(left, format) else { continue };
-        for end_format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
-            if let Ok(end) = NaiveDateTime::parse_from_str(right, end_format) {
-                let start = chrono::Local.from_local_datetime(&start).single()?.timestamp_millis();
-                let end = chrono::Local.from_local_datetime(&end).single()?.timestamp_millis();
-                return Some((start, end));
+fn query_with_token(token: &str) -> Result<QuotaOverview, String> {
+    query_with_token_via(token, &|url, tok| http_get_json(url, tok, true))
+}
+
+pub(crate) fn business_ok(v: &Value) -> bool {
+    let code = v.get("code").and_then(|c| c.as_i64());
+    let success = v.get("success").and_then(|s| s.as_bool());
+    (code.is_none() || code == Some(200) || code == Some(0)) && success != Some(false)
+}
+
+pub(crate) fn is_active_coding_plan_entry(s: &Value) -> bool {
+    let coding_name = ["productId", "productName"].iter().any(|k| {
+        s.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_lowercase().contains("coding"))
+            .unwrap_or(false)
+    });
+    if !coding_name {
+        return false;
+    }
+    s.get("inCurrentPeriod").and_then(|v| v.as_bool()) == Some(true)
+        && s.get("status").and_then(|v| v.as_str()) == Some("VALID")
+}
+
+pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
+    if tokens.is_empty() {
+        return Err(crate::i18n::tr("err.quota.no_token"));
+    }
+    let mut last_err: Option<String> = None;
+    let mut first_business: Option<String> = None;
+    let mut auth_fail = 0usize;
+    for t in tokens {
+        match query_with_token(t) {
+            Ok(ov) => return Ok(ov),
+            Err(e) => {
+                if e.contains("401") {
+                    auth_fail += 1;
+                } else if first_business.is_none() {
+                    first_business = Some(e.clone());
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    if auth_fail > 0 && auth_fail == tokens.len() {
+        sleep(Duration::from_millis(1500));
+        if let Ok(ov) = query_with_token(&tokens[0]) {
+            return Ok(ov);
+        }
+        return Err(crate::i18n::tr("err.token.expired"));
+    }
+    Err(first_business.or(last_err).unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Channel {
+    Monitor(String),
+    ZaiBilling(String),
+}
+
+pub(crate) fn is_no_plan_message(msg: &str) -> bool {
+    msg.contains("不存在coding plan") || msg.contains("没有资格")
+}
+
+pub(crate) fn zai_billing_token(creds: &Value, config: Option<&Value>, secret: &str) -> Option<String> {
+    let jwt = safe_decrypt(creds.get("zcodejwttoken").and_then(|v| v.as_str()), secret);
+    let active = safe_decrypt(
+        creds.get("oauth:active_provider").and_then(|v| v.as_str()),
+        secret,
+    );
+    let use_jwt = if active.as_deref() != Some("bigmodel") {
+        jwt.is_some()
+    } else {
+        false
+    };
+    if use_jwt {
+        return jwt;
+    }
+    let providers = config?.get("provider")?.as_object()?;
+    let mut ordered: Vec<(&String, &Value)> = providers.iter().collect();
+    ordered.sort_by_key(|(_, p)| if p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) { 0 } else { 1 });
+    for (id, p) in ordered {
+        if id.contains("start-plan") {
+            if let Some(k) = p.get("options").and_then(|o| o.get("apiKey")).and_then(|k| k.as_str()) {
+                if !k.starts_with("enc:") && looks_like_token(k) {
+                    return Some(k.to_string());
+                }
             }
         }
     }
     None
 }
 
-pub(crate) fn business_ok(v: &Value) -> bool {
-    crate::quota_http::successful_data(v, false).is_ok()
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BizErrFamily { Auth, QuotaExhausted, RateLimited, SecurityReject, Param, Server, Unknown }
+
+pub(crate) fn classify_biz_err(code: i64) -> BizErrFamily {
+    use BizErrFamily::*;
+    match code {
+        401 | 1006 => Auth,
+        1005 => QuotaExhausted,
+        3002 | 3008 | 3009 | 3010 => RateLimited,
+        3007 => SecurityReject,
+        3001 | 3006 | 3102 => Param,
+        2007 => Server,
+        _ => Unknown,
+    }
 }
 
-pub(crate) fn is_active_coding_plan_entry(s: &Value) -> bool {
-    ["productId", "productName"].iter().any(|k| {
-        s.get(k)
-            .and_then(Value::as_str)
-            .is_some_and(|v| v.to_lowercase().contains("coding"))
-    }) && s.get("status").and_then(Value::as_str) == Some("VALID")
-        && s.get("inCurrentPeriod").and_then(Value::as_bool) == Some(true)
+pub(crate) fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<Channel> {
+    let mut chans: Vec<Channel> = vec![];
+    if new_gen {
+        for k in coding_plan_keys_from_creds(creds, secret) {
+            if !chans.contains(&Channel::Monitor(k.clone())) {
+                chans.push(Channel::Monitor(k));
+            }
+        }
+        if let Some(t) = zai_billing_token(creds, config, secret) {
+            if !chans.contains(&Channel::ZaiBilling(t.clone())) {
+                chans.push(Channel::ZaiBilling(t));
+            }
+        }
+    }
+    let providers = match config.and_then(|c| c.get("provider")).and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return chans,
+    };
+    let mut ordered: Vec<(&String, &Value)> = providers.iter().collect();
+    ordered.sort_by_key(|(_, p)| if p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) { 0 } else { 1 });
+    let provider_key = |p: &Value| -> Option<String> {
+        let k = p.get("options").and_then(|o| o.get("apiKey")).and_then(|k| k.as_str())?;
+        (!k.starts_with("enc:") && looks_like_token(k)).then(|| k.to_string())
+    };
+    for (id, p) in ordered {
+        let key = provider_key(p);
+        if id.contains("start-plan") {
+            let jwt = safe_decrypt(
+                creds.get("zcodejwttoken").and_then(|v| v.as_str()),
+                secret,
+            );
+            let active = safe_decrypt(
+                creds.get("oauth:active_provider").and_then(|v| v.as_str()),
+                secret,
+            );
+            let use_jwt = if id.starts_with("builtin:zai") {
+                jwt.is_some()
+            } else {
+                jwt.is_some() && active.as_deref() == Some("bigmodel")
+            };
+            let tok = if use_jwt { jwt } else { None }.or(key);
+            if let Some(t) = tok {
+                if !chans.contains(&Channel::ZaiBilling(t.clone())) {
+                    chans.push(Channel::ZaiBilling(t));
+                }
+            }
+        } else if id.contains("coding-plan") {
+            if let Some(k) = key {
+                if !chans.contains(&Channel::Monitor(k.clone())) {
+                    chans.push(Channel::Monitor(k));
+                }
+            }
+        }
+    }
+    if !new_gen {
+        for k in coding_plan_keys_from_creds(creds, secret) {
+            if !chans.contains(&Channel::Monitor(k.clone())) {
+                chans.push(Channel::Monitor(k));
+            }
+        }
+    }
+    chans
 }
 
-fn is_pending_coding_plan(s: &Value) -> bool {
-    s.get("status").and_then(Value::as_str) == Some("VALID")
-        && s.get("inCurrentPeriod").and_then(Value::as_bool) == Some(false)
-}
-
-pub(crate) fn unavailable(id: &str, revision: &str, code: QuotaError) -> QuotaOverview {
+fn no_plan_overview() -> QuotaOverview {
     QuotaOverview {
-        account_id: id.into(),
-        revision: revision.into(),
-        completion: "unavailable".into(),
-        errors: vec![ScopeError {
-            scope: "account".into(),
-            code,
-        }],
+        plan_tier: None,
+        is_empty: true,
+        source: "no_plan".into(),
         ..Default::default()
     }
 }
 
-#[cfg(test)]
-pub(crate) fn query_context_via(ctx: &AccountQueryContext, http: &dyn Transport) -> QuotaOverview {
-    let service = TokenService::new(
-        std::sync::Arc::new(|| chrono::Utc::now().timestamp_millis()),
-        std::sync::Arc::new(|| 0),
-    );
-    service.activate(&ctx.scope);
-    query_with_service(ctx, http, &service)
-}
-
-pub(crate) fn query_with_service(
-    ctx: &AccountQueryContext,
-    http: &dyn Transport,
-    service: &TokenService,
-) -> QuotaOverview {
-    let mut parts = Vec::new();
-    let mut errors = Vec::new();
-    let start = (|| {
-        let token = ctx.start_token()?;
-        let raw = http.send(Request {
-            method: "GET",
-            url: format!("{BILLING_BALANCE_URL}?app_version={}", ctx.app_version),
-            headers: zai_headers_with_version(
-                ctx.app_version.clone(),
-                token,
-                ctx.device_mid.clone(),
-            ),
-            body: None,
-        })?;
-        validate_balance(&raw)?;
-        Ok(normalize_balance(&raw))
-    })();
-    push_part(
-        ctx,
-        PlanScope::Start,
-        "Start Plan",
-        start,
-        &mut parts,
-        &mut errors,
-    );
-    match project_token::discover(ctx, http) {
-        Err(code) => errors.push(ScopeError {
-            scope: "Coding Plan".into(),
-            code,
-        }),
-        Ok(discovery) => {
-            if let Some(project) = discovery.personal {
-                let scope = PlanScope::Personal {
-                    organization_id: project.organization_id.clone(),
-                    project_id: project.project_id.clone(),
-                };
-                query_project(
-                    ctx,
-                    &project,
-                    scope,
-                    None,
-                    http,
-                    service,
-                    &mut parts,
-                    &mut errors,
-                );
-            } else {
-                errors.push(ScopeError {
-                    scope: "Coding Plan".into(),
-                    code: QuotaError::ProjectUnavailable,
-                });
-            }
-            for project in discovery.teams {
-                match project_token::team_subscription(ctx, &project, http) {
-                    Err(code) => errors.push(ScopeError {
-                        scope: project.label.clone(),
-                        code,
-                    }),
-                    Ok(subscription) => {
-                        let scope = PlanScope::Team {
-                            organization_id: project.organization_id.clone(),
-                            project_id: project.project_id.clone(),
-                            product_id: subscription
-                                .as_ref()
-                                .and_then(|s| s.get("productId"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .into(),
-                        };
-                        if let Some(subscription) = subscription {
-                            query_project(
-                                ctx,
-                                &project,
-                                scope,
-                                Some(subscription),
-                                http,
-                                service,
-                                &mut parts,
-                                &mut errors,
-                            );
+fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOverview, String> {
+    let mut best_err: Option<String> = None;
+    let mut saw_no_plan = false;
+    let mut parts: Vec<QuotaOverview> = vec![];
+    for ch in channels {
+        match ch {
+            Channel::Monitor(key) => match fetch(QUOTA_LIMIT_URL, key) {
+                Ok(resp) => {
+                    if business_ok(&resp) {
+                        let sub = fetch(SUBSCRIPTION_URL, key).ok();
+                        let mut ov = normalize_quota_limit(&resp, sub.as_ref());
+                        ov.refreshed_at = chrono::Local::now().timestamp_millis();
+                        ov.source = "bigmodel.cn/api/monitor".into();
+                        parts.push(ov);
+                    } else {
+                        let msg = ["msg", "message", "error"]
+                            .iter()
+                            .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
+                            .unwrap_or_default();
+                        if is_no_plan_message(&msg) {
+                            saw_no_plan = true;
+                        } else if best_err.is_none() {
+                            let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                            best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if best_err.is_none() {
+                        best_err = Some(e);
+                    }
+                }
+            },
+            Channel::ZaiBilling(tok) => {
+                let url = format!("{BILLING_BALANCE_URL}?app_version={}", zcode_app_version());
+                match fetch(&url, tok) {
+                    Ok(balance) if business_ok(&balance) => {
+                        let mut ov = normalize_balance(&balance);
+                        ov.refreshed_at = chrono::Local::now().timestamp_millis();
+                        ov.source = "zcode.z.ai/billing".into();
+                        let has_plan = ov.plan_tier.is_some() || !ov.plans.is_empty();
+                        if has_plan {
+                            parts.push(ov);
                         } else {
-                            push_part(
-                                ctx,
-                                scope,
-                                &project.label,
-                                Ok(QuotaOverview::default()),
-                                &mut parts,
-                                &mut errors,
-                            );
+                            saw_no_plan = true;
+                        }
+                    }
+                    Ok(resp) => {
+                        if best_err.is_none() {
+                            let msg = ["msg", "message", "error"]
+                                .iter()
+                                .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
+                                .unwrap_or_default();
+                            let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                            best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
+                        }
+                    }
+                    Err(e) => {
+                        if best_err.is_none() {
+                            best_err = Some(e);
                         }
                     }
                 }
             }
         }
     }
-    let mut result = merge_scoped(ctx, parts, errors);
-    result.refreshed_at = chrono::Utc::now().timestamp_millis();
-    result
-}
-
-fn push_part(
-    ctx: &AccountQueryContext,
-    plan: PlanScope,
-    label: &str,
-    value: Result<QuotaOverview, QuotaError>,
-    parts: &mut Vec<ScopedPart>,
-    errors: &mut Vec<ScopeError>,
-) {
-    match value {
-        Ok(mut value) => {
-            value.refreshed_at = chrono::Utc::now().timestamp_millis();
-            for slot in &mut value.plans {
-                slot.scope_label = Some(label.into());
-            }
-            parts.push(ScopedPart {
-                account: ctx.scope.clone(),
-                plan,
-                value,
-            });
+    if parts.is_empty() {
+        if saw_no_plan {
+            return Ok(no_plan_overview());
         }
-        Err(code) => errors.push(ScopeError {
-            scope: label.into(),
-            code,
-        }),
+        return Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")));
     }
+    Ok(merge_parts(parts))
 }
 
-fn query_project(
-    ctx: &AccountQueryContext,
-    project: &Project,
-    scope: PlanScope,
-    team_subscription: Option<Value>,
-    http: &dyn Transport,
-    service: &TokenService,
-    parts: &mut Vec<ScopedPart>,
-    errors: &mut Vec<ScopeError>,
-) {
-    let confirmed_team = team_subscription.as_ref().map(|detail| {
-        subscription_slot(&serde_json::json!({
-            "productId":detail.get("productId"),"productName":detail.get("productName"),
-            "subscriptionId":detail.get("subscriptionId"),"valid":detail.get("subscribeEndTime"),
-            "subscribeStartTime":detail.get("subscribeStartTime"),
-            "subscribeEndTime":detail.get("subscribeEndTime"),
-        }))
-    });
-    let result = (|| {
-        let location = project_token::locate_key(ctx, project, http)?;
-        let (subscriptions, malformed) = if let Some(detail) = team_subscription {
-            (
-                vec![serde_json::json!({
-                    "productId":detail.get("productId"), "productName":detail.get("productName"),
-                    "subscriptionId":detail.get("subscriptionId"), "valid":detail.get("subscribeEndTime"),
-                    "subscribeStartTime":detail.get("subscribeStartTime"),
-                    "subscribeEndTime":detail.get("subscribeEndTime"),
-                    "status":"VALID", "inCurrentPeriod":true,
-                })],
-                false,
-            )
-        } else {
-            let raw = service.fetch(ctx, &location, ProjectEndpoint::Subscriptions, http)?;
-            personal_subscriptions(&raw)?
-        };
-        if malformed {
-            errors.push(ScopeError {
-                scope: project.label.clone(),
-                code: QuotaError::InvalidResponse,
+fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
+    let mut slots: Vec<PlanSlot> = vec![];
+    let mut slot_src: Vec<String> = vec![];
+    let mut sources: Vec<&str> = vec![];
+    let mut refreshed = 0i64;
+    for p in &parts {
+        if !sources.contains(&p.source.as_str()) {
+            sources.push(&p.source);
+        }
+        refreshed = refreshed.max(p.refreshed_at);
+        for s in &p.plans {
+            let dup = slot_src.iter().enumerate().any(|(i, src)| {
+                src != &p.source
+                    && slots[i].tier == s.tier
+                    && slots[i].name == s.name
+                    && !slots[i].items.is_empty()
+                    && !s.items.is_empty()
             });
-        }
-        if subscriptions.is_empty() {
-            return Ok(QuotaOverview::default());
-        }
-        let raw = match service
-            .fetch(ctx, &location, ProjectEndpoint::Quota, http)
-            .and_then(|v| {
-                validate_limits(&v)?;
-                Ok(v)
-            }) {
-            Ok(raw) => raw,
-            Err(code) => {
-                errors.push(ScopeError {
-                    scope: project.label.clone(),
-                    code,
-                });
-                serde_json::json!({"code":0,"data":{"limits":[]}})
+            if !dup {
+                slots.push(s.clone());
+                slot_src.push(p.source.clone());
             }
+        }
+    }
+    let items: Vec<QuotaItem> = slots.iter().flat_map(|s| s.items.iter().cloned()).collect();
+    let content = |s: &PlanSlot| s.tier.is_some() || !s.items.is_empty() || s.total.is_some();
+    let mut pri_idx: Option<usize> = None;
+    for (i, s) in slots.iter().enumerate() {
+        if !content(s) {
+            continue;
+        }
+        pri_idx = match pri_idx {
+            None => Some(i),
+            Some(p) if tier_rank(s.tier_code.as_deref()) > tier_rank(slots[p].tier_code.as_deref()) => Some(i),
+            _ => pri_idx,
         };
-        let mut overview = normalize_quota_limit(
-            &raw,
-            Some(&serde_json::json!({"code":0,"data":subscriptions})),
-        );
-        if subscriptions.len() > 1 {
-            // The monitor response is project-wide. Keep each subscription, but do
-            // not copy the same project's usage into every entitlement instance.
-            let usage = std::mem::take(&mut overview.plans);
-            overview.plans = subscriptions.iter().map(subscription_slot).collect();
-            if !overview.items.is_empty() {
-                overview.plans.extend(usage.into_iter().map(|mut p| {
-                    p.entitlement_id = None;
-                    p.name = Some(project.label.clone());
-                    p
-                }));
-            }
-        } else if let Some(slot) = overview.plans.first_mut() {
-            slot.entitlement_id = instance_id(&subscriptions[0]);
-            slot.period_key = period_key(&subscriptions[0]);
-        }
-        Ok(overview)
-    })();
-    let result = match (result, confirmed_team) {
-        (Err(code), Some(slot)) => {
-            errors.push(ScopeError {
-                scope: project.label.clone(),
-                code,
-            });
-            Ok(QuotaOverview {
-                plans: vec![slot],
-                ..Default::default()
-            })
-        }
-        (result, _) => result,
+    }
+    let (total, used, remaining, percent_used) = match pri_idx.map(|i| &slots[i]) {
+        Some(p) => (p.total, p.used, p.remaining, p.percent_used),
+        None => (None, None, None, None),
     };
-    push_part(ctx, scope, &project.label, result, parts, errors);
-}
-
-fn subscription_slot(value: &Value) -> PlanSlot {
-    let name = value
-        .get("productName")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let tier = name.as_deref().map(tier_from_level);
-    PlanSlot {
-        entitlement_id: instance_id(value),
-        period_key: period_key(value),
-        name,
-        pid: value
-            .get("productId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .into(),
-        tier_code: tier.as_deref().map(tier_code_from_display),
-        tier,
-        starts_at: extract_start_time(value),
-        ends_at: extract_end_time(value),
-        pending: is_pending_coding_plan(value),
-        expire: extract_expire(value),
-        ..Default::default()
+    QuotaOverview {
+        total,
+        used,
+        remaining,
+        percent_used,
+        plan_tier: pri_idx.map(|i| slots[i].tier.clone()).flatten(),
+        plan_expire: pri_idx.map(|i| slots[i].expire.clone()).flatten(),
+        is_empty: slots.is_empty(),
+        items,
+        refreshed_at: refreshed,
+        source: sources.join(" + "),
+        plans: slots,
     }
 }
 
-fn personal_subscriptions(raw: &Value) -> Result<(Vec<Value>, bool), QuotaError> {
-    let list = crate::quota_http::successful_data(raw, false)?
-        .as_array()
-        .ok_or(QuotaError::InvalidResponse)?;
-    let mut active = Vec::new();
-    let mut malformed = false;
-    for value in list {
-        let coding = ["productId", "productName"].iter().any(|k| {
-            value
-                .get(k)
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.to_lowercase().contains("coding"))
-        });
-        if !coding {
-            if !value.is_object() {
-                malformed = true;
-            }
-            continue;
-        }
-        let status = value.get("status").and_then(Value::as_str);
-        if value
-            .get("inCurrentPeriod")
-            .and_then(Value::as_bool)
-            .is_none()
-            || !matches!(status, Some("VALID" | "EXPIRED" | "INVALID" | "CANCELLED"))
-        {
-            malformed = true;
-            continue;
-        }
-        let unexpired_pending = is_pending_coding_plan(value)
-            && !extract_end_time(value).is_some_and(|end| end <= chrono::Utc::now().timestamp_millis());
-        if is_active_coding_plan_entry(value) || unexpired_pending {
-            active.push(value.clone());
+fn query_channels(channels: &[Channel]) -> Result<QuotaOverview, String> {
+    query_channels_via(channels, &|url, tok| http_get_json(url, tok, true))
+}
+
+pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
+    let secret = zcrypto::default_secret(home);
+    let new_gen = crate::store::new_gen_provider_config(home);
+    let channels = pick_channels(creds, config, &secret, new_gen);
+    if !channels.is_empty() {
+        if let Ok(ov) = query_channels(&channels) {
+            return Ok(ov);
         }
     }
-    if active.is_empty() && malformed {
-        Err(QuotaError::InvalidResponse)
-    } else {
-        Ok((active, malformed))
-    }
+    let tokens = candidate_tokens(creds, config, &secret, new_gen);
+    query_quota(&tokens)
 }
 
-fn validate_balance(raw: &Value) -> Result<(), QuotaError> {
-    let data = crate::quota_http::successful_data(raw, false)?;
-    let plans = data
-        .get("plans")
-        .and_then(Value::as_array)
-        .ok_or(QuotaError::InvalidResponse)?;
-    let balances = data
-        .get("balances")
-        .and_then(Value::as_array)
-        .ok_or(QuotaError::InvalidResponse)?;
-    if plans.iter().any(|p| {
-        !p.is_object()
-            || !p.get("status").and_then(Value::as_str).is_some_and(|s| {
-                matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "active" | "expired" | "cancelled" | "inactive"
-                )
-            })
-    }) || balances.iter().any(|p| {
-        !p.is_object()
-            || ![
-                "total_units",
-                "used_units",
-                "remaining_units",
-                "available_units",
-            ]
-            .iter()
-            .any(|k| p.get(k).and_then(to_number).is_some())
-    }) {
-        return Err(QuotaError::InvalidResponse);
-    }
-    Ok(())
-}
-
-fn validate_limits(raw: &Value) -> Result<(), QuotaError> {
-    let data = crate::quota_http::successful_data(raw, false)?;
-    let limits = data
-        .get("limits")
-        .and_then(Value::as_array)
-        .ok_or(QuotaError::InvalidResponse)?;
-    if limits.iter().any(|limit| {
-        !limit.is_object()
-            || !matches!(
-                limit.get("type").and_then(Value::as_str),
-                Some("TOKENS_LIMIT" | "TIME_LIMIT" | "CREDIT_LIMIT")
-            )
-    }) {
-        return Err(QuotaError::InvalidResponse);
-    }
-    Ok(())
+pub fn quota_for_snapshot(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
+    quota_for_live(home, creds, config)
 }
 
 fn unit_label(unit: Option<i64>, number: Option<i64>) -> (String, String) {
@@ -1038,13 +875,7 @@ fn fmt_reset_time(ms: Option<i64>) -> Option<String> {
         return None;
     }
     use chrono::TimeZone;
-    Some(
-        chrono::Local
-            .timestamp_millis_opt(ms)
-            .single()?
-            .format("%m-%d %H:%M")
-            .to_string(),
-    )
+    Some(chrono::Local.timestamp_millis_opt(ms).single()?.format("%m-%d %H:%M").to_string())
 }
 
 fn safe_prefix(s: &str, n: usize) -> &str {
@@ -1079,10 +910,7 @@ fn looks_like_dt(s: &str) -> bool {
         return false;
     }
     let p = &b[..16];
-    p[4] == b'-'
-        && p[7] == b'-'
-        && p[10] == b' '
-        && p[13] == b':'
+    p[4] == b'-' && p[7] == b'-' && p[10] == b' ' && p[13] == b':'
         && (0..16).all(|i| match i {
             0..=3 | 5..=6 | 8..=9 | 11..=12 | 14..=15 => p[i].is_ascii_digit(),
             _ => true,
@@ -1090,37 +918,19 @@ fn looks_like_dt(s: &str) -> bool {
 }
 
 fn extract_expire(obj: &Value) -> Option<String> {
-    const KEYS: [&str; 14] = [
-        "ends_at",
-        "subscribeEndTime",
-        "nextRenewTime",
-        "expireTime",
-        "expire_time",
-        "endTime",
-        "end_time",
-        "expireAt",
-        "expiredTime",
-        "validEndTime",
-        "expires_at",
-        "expiresAt",
-        "expired_at",
-        "period_end",
+    const KEYS: [&str; 12] = [
+        "nextRenewTime", "expireTime", "expire_time", "endTime", "end_time", "expireAt", "expiredTime", "validEndTime",
+        "expires_at", "expiresAt", "expired_at", "period_end",
     ];
     for k in KEYS {
         let Some(v) = obj.get(k) else { continue };
         if let Some(n) = v.as_i64() {
             use chrono::TimeZone;
             if n > 1_000_000_000_000 {
-                return chrono::Local
-                    .timestamp_millis_opt(n)
-                    .single()
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string());
+                return chrono::Local.timestamp_millis_opt(n).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string());
             }
             if n > 1_000_000_000 {
-                return chrono::Local
-                    .timestamp_opt(n, 0)
-                    .single()
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string());
+                return chrono::Local.timestamp_opt(n, 0).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string());
             }
         }
         if let Some(s) = v.as_str() {
@@ -1141,11 +951,7 @@ fn extract_expire(obj: &Value) -> Option<String> {
                 }
             }
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
-                return Some(
-                    dt.with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %H:%M")
-                        .to_string(),
-                );
+                return Some(dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string());
             }
             let t = if t.as_bytes().get(10) == Some(&b'T') {
                 format!("{} {}", &t[..10], &t[11..])
@@ -1208,11 +1014,7 @@ fn tier_from_level(level: &str) -> String {
 
 fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaOverview {
     let data = limit_resp.get("data").cloned().unwrap_or(Value::Null);
-    let limits = data
-        .get("limits")
-        .and_then(|l| l.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let limits = data.get("limits").and_then(|l| l.as_array()).cloned().unwrap_or_default();
 
     let mut items = vec![];
     let mut main: Option<QuotaItem> = None;
@@ -1227,41 +1029,17 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
         let reset_ms = l.get("nextResetTime").and_then(|v| v.as_i64());
         let (period, window) = unit_label(unit, number);
         let (kind, name, unit_str, unit_code) = match typ {
-            "TOKENS_LIMIT" => (
-                "prompt_count",
-                format!("提示次数（{period}）"),
-                "次".to_string(),
-                "count",
-            ),
-            "TIME_LIMIT" => (
-                "duration",
-                format!("使用时长（{period}）"),
-                "分钟".to_string(),
-                "minutes",
-            ),
+            "TOKENS_LIMIT" => ("prompt_count", format!("提示次数（{period}）"), "次".to_string(), "count"),
+            "TIME_LIMIT" => ("duration", format!("使用时长（{period}）"), "分钟".to_string(), "minutes"),
             _ => ("raw", format!("{typ}（{period}）"), String::new(), ""),
         };
         let percent_used = if let (Some(t), Some(u)) = (total, used) {
-            if t > 0.0 {
-                Some((u / t * 100.0).clamp(0.0, 100.0))
-            } else {
-                None
-            }
+            if t > 0.0 { Some((u / t * 100.0).clamp(0.0, 100.0)) } else { None }
         } else {
             percentage.map(|p| p.clamp(0.0, 100.0))
         };
         let reset = fmt_reset_time(reset_ms);
         let item = QuotaItem {
-            window_key: Some(
-                serde_json::json!([
-                    typ,
-                    unit,
-                    number,
-                    l.get("nextResetTime"),
-                    l.get("startTime")
-                ])
-                .to_string(),
-            ),
             name,
             total,
             used,
@@ -1284,12 +1062,12 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
     let level = data.get("level").and_then(|l| l.as_str()).map(String::from);
     let mut plan_tier = level.as_deref().map(tier_from_level);
     let mut plan_expire: Option<String> = None;
-    let mut plan_start: Option<i64> = None;
-    let mut plan_end: Option<i64> = None;
-    let mut plan_pending = false;
     let mut product_name: Option<String> = None;
     if let Some(sub) = sub_resp {
         if business_ok(sub) {
+            if std::env::var("ZSW_DUMP_SUB").is_ok() {
+                eprintln!("[zsw] subscription/list raw: {sub}");
+            }
             if let Some(arr) = sub.get("data").and_then(|d| d.as_array()) {
                 let current = arr
                     .iter()
@@ -1303,9 +1081,6 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
                         }
                     }
                     plan_expire = extract_expire(s);
-                    plan_start = extract_start_time(s);
-                    plan_end = extract_end_time(s);
-                    plan_pending = is_pending_coding_plan(s);
                 }
             }
         }
@@ -1326,16 +1101,12 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             tier: plan_tier.clone(),
             tier_code: plan_tier.as_deref().map(tier_code_from_display),
             name: product_name,
-            starts_at: plan_start,
-            ends_at: plan_end,
-            pending: plan_pending,
             expire: plan_expire.clone(),
             total,
             used,
             remaining,
             percent_used,
             items: items.clone(),
-            ..Default::default()
         }]
     } else {
         vec![]
@@ -1353,7 +1124,6 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
         refreshed_at: 0,
         source: String::new(),
         plans,
-        ..Default::default()
     }
 }
 
@@ -1376,6 +1146,28 @@ fn unwrap(data: &Value) -> Value {
     cur
 }
 
+fn flatten_numbers(obj: &Value, prefix: &str, out: &mut Vec<(String, f64)>) {
+    if let Some(m) = obj.as_object() {
+        for (k, v) in m {
+            let p = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            if let Some(n) = to_number(v) {
+                out.push((p, n));
+            } else {
+                flatten_numbers(v, &p, out);
+            }
+        }
+    } else if let Some(arr) = obj.as_array() {
+        for (i, v) in arr.iter().enumerate() {
+            let p = format!("{prefix}.{i}");
+            if let Some(n) = to_number(v) {
+                out.push((p, n));
+            } else {
+                flatten_numbers(v, &p, out);
+            }
+        }
+    }
+}
+
 fn to_number(v: &Value) -> Option<f64> {
     if let Some(n) = v.as_f64() {
         return if n.is_finite() { Some(n) } else { None };
@@ -1385,6 +1177,59 @@ fn to_number(v: &Value) -> Option<f64> {
         return t.trim().parse::<f64>().ok();
     }
     None
+}
+
+fn sum_numbers(pool: &[(String, f64)], keys: &[&str]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0;
+    for (path, v) in pool {
+        let name = path.rsplit('.').next().unwrap_or("");
+        if keys.contains(&name) {
+            total += v;
+            count += 1;
+        }
+    }
+    if count > 0 { Some(total) } else { None }
+}
+
+fn first_number(pool: &[(String, f64)], keys: &[&str]) -> Option<f64> {
+    for (path, v) in pool {
+        let name = path.rsplit('.').next().unwrap_or("");
+        if keys.contains(&name) {
+            return Some(*v);
+        }
+    }
+    None
+}
+
+pub fn extract_plan_tier(current_data: &Value) -> Option<String> {
+    let cur = unwrap(current_data);
+    let plans = cur.get("plans").and_then(|p| p.as_array())?;
+    let active: Vec<&Value> = plans
+        .iter()
+        .filter(|p| p.get("status").and_then(|s| s.as_str()).unwrap_or("").to_lowercase() == "active")
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    let matches = |kw: &[&str]| {
+        active.iter().any(|p| {
+            let id = p.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            kw.iter().any(|k| id.contains(k) || name.contains(k))
+        })
+    };
+    if matches(&["max"]) {
+        Some("Max".into())
+    } else if matches(&["pro"]) {
+        Some("Pro".into())
+    } else if matches(&["lite"]) {
+        Some("Lite".into())
+    } else if matches(&["start-plan", "start plan", "start"]) {
+        Some("Start Plan".into())
+    } else {
+        None
+    }
 }
 
 fn plan_tier_from_id(plan_id: &str, name: Option<&str>) -> (String, String) {
@@ -1401,18 +1246,9 @@ fn plan_tier_from_id(plan_id: &str, name: Option<&str>) -> (String, String) {
         ("Lite".into(), "lite".into())
     } else if hay.contains("start") {
         ("Start Plan".into(), "start".into())
-    } else if [
-        "trial",
-        "taste",
-        "experience",
-        "gift",
-        "weekend",
-        "promo",
-        "activity",
-        "体验",
-    ]
-    .iter()
-    .any(|k| hay.contains(k))
+    } else if ["trial", "taste", "experience", "gift", "weekend", "promo", "activity", "体验"]
+        .iter()
+        .any(|k| hay.contains(k))
     {
         ("体验".into(), "trial".into())
     } else {
@@ -1449,171 +1285,230 @@ fn tier_rank(code: Option<&str>) -> u8 {
 }
 
 fn normalize_balance(balance_data: &Value) -> QuotaOverview {
-    let mut balance = unwrap(balance_data);
-    let now = balance.get("server_time").and_then(timestamp_millis)
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-    let all_plans = balance
+    let balance = unwrap(balance_data);
+    if std::env::var("ZSW_DUMP_SUB").is_ok() {
+        eprintln!("[zsw] billing/balance raw: {balance_data}");
+    }
+    let mut pool = vec![];
+    flatten_numbers(&balance, "", &mut pool);
+
+    let mut slots: Vec<PlanSlot> = balance
         .get("plans")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let expired = |plan: &Value| {
-        plan.get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.trim().eq_ignore_ascii_case("expired"))
-            || extract_end_time(plan).is_some_and(|end| end <= now)
-    };
-    // Filter buckets using their user-plan instance. A product ID is only a fallback
-    // when it cannot select a different instance of the same product.
-    if let Some(balances) = balance.get_mut("balances").and_then(Value::as_array_mut) {
-        balances.retain(|bucket| {
-            let owners: Vec<_> = all_plans
-                .iter()
-                .filter(|plan| {
-                    let instance = instance_id(bucket);
-                    if instance.is_some() && instance_id(plan).is_some() {
-                        instance == instance_id(plan)
-                    } else {
-                        bpid_for(bucket).is_some() && bpid_for(bucket) == bpid_for(plan)
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|pl| {
+                    pl.get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("active"))
+                        .unwrap_or(false)
+                })
+                .map(|pl| {
+                    let pid = pl.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let pname = pl.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                    let (tier, tier_code) = plan_tier_from_id(&pid, pname.as_deref());
+                    PlanSlot {
+                        pid: pid.clone(),
+                        tier: Some(tier),
+                        tier_code: Some(tier_code),
+                        name: Some(pname.filter(|s| !s.trim().is_empty()).unwrap_or(pid)),
+                        expire: extract_expire(pl),
+                        ..Default::default()
                     }
                 })
-                .collect();
-            owners.is_empty() || owners.iter().any(|plan| !expired(plan))
-        });
-    }
-    let mut slots: Vec<PlanSlot> = all_plans
-        .iter()
-        .filter(|plan| {
-            !expired(plan)
-                && plan
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| s.trim().eq_ignore_ascii_case("active"))
+                .collect()
         })
-        .map(|plan| {
-            let pid = bpid_for(plan).unwrap_or("").to_string();
-            let name = plan
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(String::from);
-            let (tier, tier_code) = plan_tier_from_id(&pid, name.as_deref());
-            PlanSlot {
-                entitlement_id: instance_id(plan),
-                period_key: period_key(plan),
-                name: Some(name.unwrap_or_else(|| pid.clone())),
-                pid,
-                tier: Some(tier),
-                tier_code: Some(tier_code),
-                starts_at: extract_start_time(plan),
-                ends_at: extract_end_time(plan),
-                entitlement_starts: Some(entitlement_start_times(plan)),
-                expire: extract_expire(plan),
-                ..Default::default()
-            }
-        })
-        .collect();
-    let mut loose = Vec::new();
-    if let Some(balances) = balance.get("balances").and_then(Value::as_array) {
-        for bucket in balances {
-            let total = bucket.get("total_units").and_then(to_number);
-            let used = bucket.get("used_units").and_then(to_number);
-            let remaining = bucket.get("remaining_units").and_then(to_number);
-            let window_key = bucket
-                .get("bucket_id")
-                .and_then(Value::as_str)
-                .map(|id| format!("bucket:{id}"))
-                .or_else(|| {
-                    let entitlement = bucket.get("entitlement_id").and_then(Value::as_str)?;
-                    let period = period_key(bucket)?;
-                    Some(
-                        serde_json::json!([
-                            instance_id(bucket),
-                            entitlement,
-                            period,
-                            bucket.get("meter"),
-                            bucket.get("unit_type")
-                        ])
-                        .to_string(),
-                    )
-                });
-            let item = QuotaItem {
-                window_key,
-                name: ["show_name", "name", "entitlement_id"]
+        .unwrap_or_default();
+
+    let mut loose: Vec<QuotaItem> = vec![];
+    let any_pid = balance
+        .get("balances")
+        .and_then(|b| b.as_array())
+        .map(|arr| {
+            arr.iter().any(|item| {
+                ["plan_id", "planId", "entitlement_id"]
                     .iter()
-                    .find_map(|k| bucket.get(k).and_then(Value::as_str))
+                    .any(|k| item.get(k).and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false))
+            })
+        })
+        .unwrap_or(false);
+    if let Some(arr) = balance.get("balances").and_then(|b| b.as_array()) {
+        for item in arr {
+            let it_total = item.get("total_units").and_then(to_number);
+            let it_used = item.get("used_units").and_then(to_number);
+            let it_remaining = item
+                .get("remaining_units")
+                .and_then(to_number)
+                .or_else(|| item.get("available_units").and_then(to_number));
+            let it = QuotaItem {
+                name: ["show_name", "name", "entitlement_id", "plan_id"]
+                    .iter()
+                    .find_map(|k| item.get(k).and_then(Value::as_str))
                     .unwrap_or("Unknown")
-                    .into(),
-                total,
-                used,
-                remaining,
-                percent_used: total
-                    .zip(used)
-                    .filter(|(t, _)| *t > 0.0)
-                    .map(|(t, u)| (u / t * 100.0).clamp(0.0, 100.0)),
-                unit: bucket
-                    .get("unit_type")
-                    .or_else(|| bucket.get("meter"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("quota")
-                    .into(),
-                period_end: bucket
-                    .get("expires_at")
-                    .or_else(|| bucket.get("period_end"))
-                    .and_then(expiry_field),
+                    .to_string(),
+                total: it_total,
+                used: it_used,
+                remaining: it_remaining,
+                percent_used: match (it_total, it_used) {
+                    (Some(t), Some(u)) if t > 0.0 => Some((u / t * 100.0).clamp(0.0, 100.0)),
+                    _ => None,
+                },
+                server_percentage: None,
+                unit: item.get("unit_type").or_else(|| item.get("meter")).and_then(Value::as_str).unwrap_or("quota").to_string(),
+                period_end: ["period_end", "expires_at"].iter().find_map(|k| item.get(k).and_then(expiry_field)),
                 ..Default::default()
             };
-            let instance = instance_id(bucket);
-            let matches: Vec<usize> = slots
+            let bpid = ["plan_id", "planId", "entitlement_id"]
                 .iter()
-                .enumerate()
-                .filter(|(_, slot)| {
-                    if instance.is_some() {
-                        slot.entitlement_id == instance
-                    } else {
-                        bpid_for(bucket).is_some_and(|pid| slot.pid == pid)
-                    }
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if matches.len() == 1 {
-                slots[matches[0]].items.push(item);
+                .find_map(|k| item.get(k).and_then(Value::as_str))
+                .unwrap_or("");
+            let target = if !bpid.is_empty() {
+                slots.iter_mut().find(|s| s.pid == bpid)
+            } else if slots.len() == 1 && !any_pid {
+                slots.first_mut()
             } else {
-                loose.push(item);
+                None
+            };
+            match target {
+                Some(s) => {
+                    if s.expire.is_none() {
+                        s.expire = extract_expire(item);
+                    }
+                    s.items.push(it);
+                }
+                None => loose.push(it),
             }
         }
     }
-    if !loose.is_empty() {
+
+    if slots.is_empty() {
+        if !loose.is_empty() {
+            let t = extract_plan_tier(balance_data);
+            slots.push(PlanSlot {
+                tier_code: t.as_deref().map(tier_code_from_display),
+                tier: t,
+                items: std::mem::take(&mut loose),
+                ..Default::default()
+            });
+        } else {
+            let ptot = sum_numbers(&pool, &["total_units"]).or_else(|| {
+                first_number(&pool, &["total", "totalQuota", "totalCredits", "quotaTotal", "amountTotal", "creditTotal"])
+            });
+            let pused = sum_numbers(&pool, &["used_units"]).or_else(|| {
+                first_number(&pool, &["used", "usedQuota", "usedCredits", "quotaUsed", "amountUsed", "consumed", "totalUsed"])
+            });
+            let prem = sum_numbers(&pool, &["remaining_units"]).or_else(|| {
+                first_number(&pool, &["remaining", "remain", "balance", "available", "availableQuota", "left", "quotaRemaining"])
+            });
+            if ptot.is_some() || pused.is_some() || prem.is_some() {
+                let t = extract_plan_tier(balance_data);
+                slots.push(PlanSlot {
+                    tier_code: t.as_deref().map(tier_code_from_display),
+                    tier: t,
+                    total: ptot,
+                    used: pused,
+                    remaining: prem,
+                    ..Default::default()
+                });
+            }
+        }
+    } else if !loose.is_empty() {
         slots.push(PlanSlot {
-            name: Some("Other quota".into()),
+            name: Some("其他额度".into()),
             tier_code: Some("other".into()),
             items: loose,
             ..Default::default()
         });
     }
-    for slot in &mut slots {
-        let mut items = Vec::new();
-        merge_windows(&mut items, std::mem::take(&mut slot.items), false);
-        slot.items = items;
-        set_primary(slot);
+
+    for s in &mut slots {
+        let sum = |f: fn(&QuotaItem) -> Option<f64>| -> Option<f64> {
+            let vals: Vec<f64> = s.items.iter().filter_map(f).collect();
+            (!vals.is_empty()).then(|| vals.iter().sum())
+        };
+        if s.items.is_empty() && s.total.is_none() {
+            continue;
+        }
+        s.total = sum(|i| i.total).or(s.total);
+        s.used = sum(|i| i.used).or(s.used);
+        s.remaining = sum(|i| i.remaining).or(s.remaining);
+        if s.total.is_none() {
+            if let (Some(u), Some(r)) = (s.used, s.remaining) {
+                s.total = Some(u + r);
+            }
+        }
+        if s.used.is_none() {
+            if let (Some(t), Some(r)) = (s.total, s.remaining) {
+                s.used = Some((t - r).max(0.0));
+            }
+        }
+        if s.remaining.is_none() {
+            if let (Some(t), Some(u)) = (s.total, s.used) {
+                s.remaining = Some((t - u).max(0.0));
+            }
+        }
+        if s.percent_used.is_none() {
+            s.percent_used = match (s.total, s.used) {
+                (Some(t), Some(u)) if t > 0.0 => Some((u / t * 100.0).clamp(0.0, 100.0)),
+                _ => None,
+            };
+        }
     }
-    let primary = slots
-        .iter()
-        .max_by_key(|slot| tier_rank(slot.tier_code.as_deref()))
-        .cloned()
-        .unwrap_or_default();
+    let mut pri_idx = 0usize;
+    for (i, s) in slots.iter().enumerate() {
+        if tier_rank(s.tier_code.as_deref()) > tier_rank(slots[pri_idx].tier_code.as_deref()) {
+            pri_idx = i;
+        }
+    }
+
+    let items: Vec<QuotaItem> = slots.iter().flat_map(|s| s.items.iter().cloned()).collect();
+
+    let plan_expire_chain = extract_expire(&balance)
+        .or_else(|| {
+            balance.get("plans").and_then(|p| p.as_array()).and_then(|arr| {
+                arr.iter()
+                    .find(|pl| pl.get("status").and_then(|s| s.as_str()).map(|s| s.eq_ignore_ascii_case("active")).unwrap_or(false))
+                    .and_then(extract_expire)
+                    .or_else(|| arr.first().and_then(extract_expire))
+            })
+        })
+        .or_else(|| {
+            balance.get("balances").and_then(|b| b.as_array()).and_then(|arr| {
+                arr.iter()
+                    .filter_map(|it| it.get("expires_at").and_then(|v| v.as_i64()))
+                    .filter(|n| *n > 1_000_000_000)
+                    .max()
+                    .and_then(|n| {
+                        use chrono::TimeZone;
+                        chrono::Local.timestamp_opt(n, 0).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    })
+            })
+        })
+        .or_else(|| items.iter().find_map(|i| i.period_end.clone().filter(|s| !s.is_empty())));
+
+    if slots.len() == 1 && slots[0].expire.is_none() {
+        slots[0].expire = plan_expire_chain.clone();
+    }
+    let (total, used, remaining, percent_used) = match slots.get(pri_idx) {
+        Some(p) => (p.total, p.used, p.remaining, p.percent_used),
+        None => {
+            let p = items.iter().find_map(|i| i.percent_used);
+            (None, None, None, p)
+        }
+    };
+
     QuotaOverview {
-        total: primary.total,
-        used: primary.used,
-        remaining: primary.remaining,
-        percent_used: primary.percent_used,
-        plan_tier: primary.tier,
-        plan_expire: primary.expire,
-        is_empty: slots.is_empty(),
-        items: slots.iter().flat_map(|p| p.items.iter().cloned()).collect(),
+        total,
+        used,
+        remaining,
+        percent_used,
+        plan_tier: slots.get(pri_idx).and_then(|p| p.tier.clone()),
+        plan_expire: slots.get(pri_idx).and_then(|p| p.expire.clone()).or(plan_expire_chain),
+        is_empty: balance.get("balances").and_then(|b| b.as_array()).map(|a| a.is_empty()).unwrap_or(false),
+        items,
+        refreshed_at: 0,
+        source: String::new(),
         plans: slots,
-        models: balance_models(&balance),
-        ..Default::default()
     }
 }
 

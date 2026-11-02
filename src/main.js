@@ -676,6 +676,18 @@ const actions = {
     });
   },
 
+  async resetDevice(id) {
+    if (renaming !== null) return;
+    try {
+      await invoke("reset_device", { id });
+      await refresh();
+      render();
+      toast(t("m.resetDeviceOk", { name: claimDisplayName(id) }), "ok", t("m.resetDeviceOkDetail"));
+    } catch (e) {
+      toast(stripErr(e), "err");
+    }
+  },
+
   async checkUnknown(id) {
     await checkUnknownResult(id);
     toast(t("m.claimChecked"), "ok", t("m.claimCheckedDetail"));

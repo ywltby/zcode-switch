@@ -55,7 +55,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         out
     };
     let paths = Paths::detect();
-    crate::quota_http::set_proxy(load_settings(&paths).auth_proxy().map(str::to_string));
+    crate::net::set_proxy(load_settings(&paths).auth_proxy().map(str::to_string));
 
     if let Some(l) = lang_override {
         crate::i18n::set(l);
@@ -140,8 +140,7 @@ pub fn run(args: &[String]) -> (String, i32) {
                 settings.hot_switch()
             };
             match switch_to(&paths, &id, force, restart, hot) {
-                Ok(mut r) => {
-                    r.probe = run_switch_probe(&paths, &id);
+                Ok(r) => {
                     if let Some(p) = &r.probe {
                         let msg = crate::probe::probe_message(p);
                         if !msg.is_empty() {
@@ -170,30 +169,10 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "claim-preview" => {
             let only = flag(rest, "--id");
-            let wants = |id: &str| only.as_deref().map_or(true, |want| want == id);
-            let mut targets: Vec<(String, String, Account)> = vec![];
-            if wants(LIVE_ID) {
-                match live_claim_snapshot(&paths) {
-                    Ok(mut acc) => {
-                        acc.name = crate::zcrypto::account_identity(&acc.credentials, &paths.home)
-                            .label()
-                            .unwrap_or_else(|| crate::i18n::tr("claim.live_name"));
-                        targets.push((LIVE_ID.to_string(), acc.name.clone(), acc));
-                    }
-                    Err(e) => {
-                        if only.as_deref() == Some(LIVE_ID) {
-                            return (err(&e), 1);
-                        }
-                    }
-                }
-            }
             let accounts = match list_accounts(&paths) {
                 Ok(a) => a,
                 Err(e) => return (err(&e), 1),
             };
-            for acc in accounts.iter().filter(|a| wants(&a.id)) {
-                targets.push((acc.id.clone(), acc.name.clone(), acc.clone()));
-            }
             let mut any = false;
             let mut items = vec![];
             for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
@@ -206,14 +185,14 @@ pub fn run(args: &[String]) -> (String, i32) {
                             any = true;
                         }
                         items.push(json!({
-                            "id": id,
-                            "name": name,
+                            "id": acc.id,
+                            "name": acc.name,
                             "plans": plans,
                         }));
                     }
                     Err(e) => items.push(json!({
-                        "id": id,
-                        "name": name,
+                        "id": acc.id,
+                        "name": acc.name,
                         "error": e,
                     })),
                 }
@@ -302,6 +281,15 @@ pub fn run(args: &[String]) -> (String, i32) {
                     "plans": plans,
                     "history": claim_history_for(&paths, &id),
                 })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
+        "reset-device" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err(&crate::i18n::tr("cli.usage.reset_device")), 2);
+            };
+            match reset_virtual_device_mid(&paths, &id) {
+                Ok(mid) => ok(json!({ "id": id, "device_mid": mid })),
                 Err(e) => return (err(&e), 1),
             }
         }

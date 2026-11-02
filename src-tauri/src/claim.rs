@@ -1,8 +1,6 @@
 
 use crate::flowlog;
 use crate::quota;
-#[cfg(test)]
-mod tests;
 use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
@@ -36,7 +34,6 @@ pub(crate) fn marketing_touch_url() -> String {
 }
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
-const MARKETING_SEQ: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ClaimGrant {
@@ -107,9 +104,6 @@ pub struct ClaimError {
     pub code: i64,
     pub message: String,
     pub next_at: Option<i64>,
-    /// True when the request may have reached the server but no definitive
-    /// business outcome was observed.
-    pub unknown: bool,
 }
 
 impl ClaimError {
@@ -136,7 +130,6 @@ impl From<String> for ClaimError {
             code: -1,
             message,
             next_at: None,
-            unknown: false,
         }
     }
 }
@@ -153,16 +146,6 @@ fn claim_error(code: i64, body: &Value) -> ClaimError {
         code,
         message: failure_message(code, body),
         next_at,
-        unknown: false,
-    }
-}
-
-fn unknown_claim_error(message: String) -> ClaimError {
-    ClaimError {
-        code: -1,
-        message,
-        next_at: None,
-        unknown: true,
     }
 }
 
@@ -185,20 +168,18 @@ pub fn failure_payload(
     })
 }
 
-/// Structured scope failure. `notStarted` is true only when no activation report,
-/// preview, or claim request was sent for this attempt.
-pub fn scope_payload(account_id: &str, revision: &str, not_started: bool) -> String {
-    serde_json::json!({
-        "code": "scope_changed",
-        "accountId": account_id,
-        "revision": revision,
-        "notStarted": not_started,
-    })
-    .to_string()
-}
-
-fn claim_token(creds: &Value, _config: Option<&Value>, secret: &str) -> Result<String, String> {
-    crate::quota_auth::strict_zcode_jwt(creds, secret).map_err(|_| crate::i18n::tr("err.claim.no_jwt"))
+fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<String, String> {
+    let jwt = creds
+        .get("zcodejwttoken")
+        .and_then(|v| v.as_str())
+        .and_then(|v| decrypt_credential(v, secret));
+    if let Some(t) = jwt.filter(|t| t.trim().len() > 20) {
+        return Ok(t);
+    }
+    if let Some(t) = quota::zai_billing_token(creds, config, secret) {
+        return Ok(t);
+    }
+    Err(crate::i18n::tr("err.claim.no_jwt"))
 }
 
 fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
@@ -210,7 +191,7 @@ fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
 }
 
 fn agent() -> ureq::Agent {
-    crate::quota_http::apply_proxy(
+    crate::net::apply_proxy(
         ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS)),
@@ -276,7 +257,7 @@ fn device_os_category() -> &'static str {
 }
 
 pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
-    let agent = crate::quota_http::apply_proxy(
+    let agent = crate::net::apply_proxy(
         ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS)),
@@ -307,9 +288,7 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
     Ok(())
 }
 
-/// Claimable plans from every source the official client uses: the billing preview
-/// and the marketing campaign that drives the in-app "可领取" banner.
-pub fn claim_plans(
+pub fn preview_plans(
     home: &Path,
     creds: &Value,
     config: Option<&Value>,
@@ -322,82 +301,8 @@ pub fn claim_plans(
         billing_preview_url(),
         quota::zcode_app_version(),
         quota::client_platform()
-    )
-}
-
-fn marketing_plans(token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
-    let url = format!("{MARKETING_TOUCH_URL}?seq={MARKETING_SEQ}");
-    let mut req = agent().get(&url);
-    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
-        req = req.set(&k, &v);
-    }
-    let resp = req
-        .call()
-        .map_err(|e| http_err(&crate::i18n::tr("err.claim.touch_req"), e))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        return Err(failure_message(code, &v));
-    }
-    Ok(parse_marketing_plans(&v))
-}
-
-/// Campaign deliveries carry `claim_zcode_plan` buttons plus the plan body that the
-/// banner renders. Both live under `banner` / `popup`, so both slots are scanned.
-fn parse_marketing_plans(body: &Value) -> Vec<ClaimPlan> {
-    let mut out: Vec<ClaimPlan> = Vec::new();
-    let Some(deliveries) = body.pointer("/data/deliveries").and_then(Value::as_array) else {
-        return out;
-    };
-    for delivery in deliveries {
-        for slot in ["banner", "popup"] {
-            let Some(node) = delivery.get(slot).filter(|n| n.is_object()) else {
-                continue;
-            };
-            let buttons = node.get("buttons").and_then(Value::as_array);
-            for button in buttons.into_iter().flatten() {
-                let action = button.get("action");
-                if action.and_then(|a| a.get("type")).and_then(Value::as_str)
-                    != Some("claim_zcode_plan")
-                {
-                    continue;
-                }
-                let Some(plan_id) = action
-                    .and_then(|a| a.pointer("/args/plan_id"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                else {
-                    continue;
-                };
-                if out.iter().any(|p| p.plan_id == plan_id) {
-                    continue;
-                }
-                let detail = [
-                    node.pointer("/background/args/zcode_plan"),
-                    node.pointer("/success_popup/hero/args/zcode_plan"),
-                    node.pointer("/hero/args/zcode_plan"),
-                ]
-                .into_iter()
-                .flatten()
-                .find(|plan| plan.get("plan_id").and_then(Value::as_str) == Some(plan_id));
-                out.push(match detail.and_then(parse_plan) {
-                    Some(plan) => plan,
-                    None => ClaimPlan {
-                        plan_id: plan_id.to_string(),
-                        name: plan_id.to_string(),
-                        description: String::new(),
-                        priority: 0,
-                        grants: Vec::new(),
-                        grant_items: Vec::new(),
-                    },
-                });
-            }
-        }
-    }
-    out
+    );
+    preview_once(&url, &token, device_mid)
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {
@@ -1026,66 +931,12 @@ fn fetch_captcha_config_remote() -> Result<CaptchaConfig, String> {
     for (k, v) in quota::zai_billing_headers("") {
         req = req.set(&k, &v);
     }
-
-    /// Shared, endpoint-scoped cache. Only a usable config is cached; failures,
-    /// disabled configs, and missing scene ids are fetched again next time.
-    pub(crate) fn fetch(
-        &self,
-        endpoint: &str,
-        http: &CaptchaHttp,
-        now: i64,
-    ) -> Result<CaptchaConfig, String> {
-        if let Some(config) = self.cached(endpoint, now) {
-            return Ok(config);
-        }
-        let _fetch = self.fetch_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(config) = self.cached(endpoint, now) {
-            return Ok(config);
-        }
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match http(endpoint) {
-                Ok((status, body)) => {
-                    if status == 401 || status == 429 {
-                        return Err(crate::i18n::tr("err.claim.config_unavailable"));
-                    }
-                    if status >= 400 {
-                        if status >= 500 && attempt == 1 {
-                            std::thread::sleep(Duration::from_millis(300));
-                            continue;
-                        }
-                        return Err(crate::i18n::trf("err.claim.config_req", &[("e", &format!("HTTP {status}"))]));
-                    }
-                    let config = parse_captcha_config(&body)?;
-                    if config.enabled && !config.scene_id.trim().is_empty() {
-                        self.entries
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(endpoint.to_string(), (now, config.clone()));
-                    }
-                    return Ok(config);
-                }
-                Err(CaptchaFetchError::Transient) if attempt == 1 => {
-                    std::thread::sleep(Duration::from_millis(300));
-                    continue;
-                }
-                Err(error) => {
-                    let detail = if error == CaptchaFetchError::Transient { "transient" } else { "rejected" };
-                    return Err(crate::i18n::trf("err.claim.config_req", &[("e", detail)]));
-                }
-            }
-        }
-    }
-
-    fn cached(&self, endpoint: &str, now: i64) -> Option<CaptchaConfig> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let (at, config) = entries.get(endpoint)?;
-        (now.saturating_sub(*at) < CAPTCHA_CONFIG_TTL_MS).then(|| config.clone())
-    }
-}
-
-fn parse_captcha_config(v: &Value) -> Result<CaptchaConfig, String> {
+    let resp = req
+        .call()
+        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
         return Err(crate::i18n::tr("err.claim.config_unavailable"));
     }
@@ -1097,29 +948,6 @@ fn parse_captcha_config(v: &Value) -> Result<CaptchaConfig, String> {
         prefix: s("prefix"),
         scene_id: s("sceneId"),
     })
-}
-
-fn fetch_config_http(url: &str) -> Result<(u16, Value), CaptchaFetchError> {
-    let mut req = agent().get(url);
-    for (k, v) in quota::zai_billing_headers("") {
-        req = req.set(&k, &v);
-    }
-    match req.call() {
-        Ok(response) => {
-            let status = response.status();
-            let text = response
-                .into_string()
-                .map_err(|_| CaptchaFetchError::Transient)?;
-            let value = serde_json::from_str(&text).map_err(|_| CaptchaFetchError::Rejected)?;
-            Ok((status, value))
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            let value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            Ok((status, value))
-        }
-        Err(_) => Err(CaptchaFetchError::Transient),
-    }
 }
 
 fn str_field<'a>(e: &'a Value, snake: &str, camel: &str) -> Option<&'a str> {

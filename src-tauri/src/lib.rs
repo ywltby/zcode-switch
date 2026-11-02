@@ -4,14 +4,13 @@ pub mod i18n;
 pub mod changelog;
 pub mod claim;
 mod flowlog;
+mod net;
 mod oauth;
 mod probe;
 mod quota;
 mod risk;
 mod store;
 mod zcrypto;
-#[cfg(test)]
-mod test_support;
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,65 +50,13 @@ struct PendingClaim {
     device_mid: String,
 }
 
-fn claim_registry_guard() -> std::sync::MutexGuard<'static, Option<claim_session::ClaimRegistry>> {
-    let mut guard = match CLAIM_REGISTRY.lock() {
+static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
+
+fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
+    match PENDING_CLAIM.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
-    };
-    if guard.is_none() {
-        let paths = Paths::detect();
-        *guard = Some(claim_session::ClaimRegistry::load(
-            claim_session::attempts_path(&paths.store_dir()),
-        ));
     }
-    guard
-}
-
-/// Claim snapshots cover two identities: a stored account (which owns a virtual
-/// device id) and the login ZCode runs right now (`live`, real device id, nothing
-/// written to disk).
-fn claim_snapshot(paths: &Paths, id: &str, expected: Option<&str>) -> Result<ClaimSnapshot, String> {
-    if id != store::LIVE_ID {
-        return store::claim_snapshot_locked(paths, id, expected);
-    }
-    let mut account = store::live_claim_snapshot(paths)?;
-    account.name = zcrypto::account_identity(&account.credentials, &paths.home)
-        .label()
-        .unwrap_or_else(|| i18n::tr("claim.live_name"));
-    let revision = crate::quota_auth::quota_revision(&account, &zcrypto::default_secret(&paths.home));
-    if expected.is_some_and(|value| value != revision) {
-        return Err("scope_changed".into());
-    }
-    Ok(ClaimSnapshot { account, revision, device_initialized: false })
-}
-
-/// Re-reading must not revive a claim prepared for a different login.
-fn claim_revision_ok(paths: &Paths, id: &str, revision: &str) -> bool {
-    if id != store::LIVE_ID {
-        return store::claim_revision_matches(paths, id, revision);
-    }
-    store::live_claim_snapshot(paths)
-        .map(|account| {
-            crate::quota_auth::quota_revision(&account, &zcrypto::default_secret(&paths.home)) == revision
-        })
-        .unwrap_or(false)
-}
-
-fn claim_now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
-fn finish_claim(claim_id: &str, phase: claim_session::ClaimPhase, result: Option<Value>) -> bool {
-    claim_registry_guard()
-        .as_mut()
-        .map(|registry| registry.finish(claim_id, phase, result))
-        .unwrap_or(false)
-}
-
-fn claim_summary_json(claim_id: &str) -> Option<Value> {
-    let registry = claim_registry_guard();
-    let summary = registry.as_ref()?.status(claim_id)?;
-    serde_json::to_value(summary).ok()
 }
 
 fn store_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -303,16 +250,10 @@ async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account,
 
 #[tauri::command]
 async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Result<SwitchResult, String> {
-    let r = tauri::async_runtime::spawn_blocking(move || {
-        let paths = Paths::detect();
-        let mut result = {
-            let _guard = store_guard();
-            let hot = load_settings(&paths).hot_switch();
-            store::switch_to(&paths, &id, force, restart, hot)?
-        };
-        result.probe = store::run_switch_probe(&paths, &id);
-        Ok::<_, String>(result)
-    }).await.map_err(|_| "quota_worker_failed".to_string())?;
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let hot = load_settings(&paths).hot_switch();
+    let r = store::switch_to(&paths, &id, force, restart, hot);
     rebuild_tray(&app);
     r
 }
@@ -320,6 +261,19 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
 #[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
     run_blocking(|| store::live_quota(&Paths::detect())).await
+}
+
+/// 营销活动按设备标识去重：投递过的 id 不再看到同一档活动。换新 id 等效于
+/// 手动删除 ZCode 的 telemetry-state.json，但不动客户端自身的设备身份。
+#[tauri::command]
+async fn reset_device(id: String) -> Result<serde_json::Value, String> {
+    let account_id = id.clone();
+    let mid = run_blocking(move || {
+        let paths = Paths::detect();
+        store::reset_virtual_device_mid(&paths, &account_id)
+    })
+    .await?;
+    Ok(json!({ "id": id, "deviceMid": mid }))
 }
 
 #[tauri::command]
@@ -394,8 +348,6 @@ async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaimRefreshResult {
-    account_id: String,
-    revision: String,
     plans: Vec<claim::ClaimPlan>,
     activated: bool,
     activation_error: Option<String>,
@@ -434,10 +386,8 @@ async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshRe
 async fn claim_start(
     app: AppHandle,
     id: String,
-    revision: Option<String>,
     plan_id: String,
-    claim_id: Option<String>,
-    mode: Option<String>,
+    auto: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let app2 = app.clone();
     run_blocking(move || {
@@ -487,7 +437,6 @@ async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
 #[tauri::command]
 async fn claim_captcha_submit(
     app: AppHandle,
-    claim_id: String,
     param: String,
     region: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -575,23 +524,10 @@ async fn claim_captcha_submit(
 }
 
 #[tauri::command]
-async fn claim_cancel(app: AppHandle, claim_id: String) -> Result<serde_json::Value, String> {
-    let outcome = {
-        let mut registry = claim_registry_guard();
-        match registry.as_mut() {
-            Some(registry) => registry.cancel(&claim_id),
-            None => claim_session::CancelOutcome {
-                phase: claim_session::ClaimPhase::Cancelled.as_str().to_string(),
-                cancelled: false,
-                submission_in_flight: false,
-            },
-        }
-    };
-    if outcome.cancelled {
-        close_captcha_window(&app, &claim_id);
-        let _ = app.emit("claim://cancelled", json!({ "claimId": claim_id }));
-    }
-    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+async fn claim_cancel(app: AppHandle) -> Result<(), String> {
+    *pending_guard() = None;
+    close_captcha_window(&app);
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -1166,7 +1102,7 @@ async fn set_auth_proxy(app: AppHandle, on: bool, url: Option<String>) -> Result
         s.auth_proxy_on = Some(on);
         s.auth_proxy_url = normalized;
         save_settings(&paths, &s)?;
-        crate::quota_http::set_proxy(s.auth_proxy().map(str::to_string));
+        net::set_proxy(s.auth_proxy().map(str::to_string));
     }
     let _ = app.emit("state-changed", ());
     Ok(())
@@ -1341,7 +1277,7 @@ fn persist_oauth_account(
         credentials,
         config: Some(config),
         virtual_device_mid: Some(mid.to_string()),
-        virtual_arms_uid: None,
+        virtual_arms_uid: Some(store::new_arms_uid()),
     };
     if !flow_still_ours() {
         return Err("__superseded__".into());
@@ -1432,14 +1368,9 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
     });
 }
 
-fn captcha_label(claim_id: &str) -> String {
-    format!("captcha-{claim_id}")
-}
-
-fn open_captcha_window(app: &AppHandle, claim_id: &str, auto: bool) -> Result<(), String> {
+fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     let (w, h) = (380.0, 320.0);
-    let label = captcha_label(claim_id);
-    if let Some(win) = app.get_webview_window(&label) {
+    if let Some(win) = app.get_webview_window("captcha") {
         let _ = win.eval("location.reload()");
         center_over_main(app, &win, w, h);
         if auto {
@@ -1452,8 +1383,8 @@ fn open_captcha_window(app: &AppHandle, claim_id: &str, auto: bool) -> Result<()
     }
     let win = tauri::WebviewWindowBuilder::new(
         app,
-        label,
-        tauri::WebviewUrl::App(format!("captcha.html?claimId={claim_id}&auto={}", u8::from(auto)).into()),
+        "captcha",
+        tauri::WebviewUrl::App("captcha.html".into()),
     )
     .title(i18n::tr("title.captcha"))
     .theme(Some(tauri::Theme::Dark))
@@ -1532,17 +1463,10 @@ async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
     }
     i18n::set(l);
     rebuild_tray(&app);
-    for (label, window) in app.webview_windows() {
-        let key = if label == "settings" {
-            "title.settings"
-        } else if label == "login" {
-            "title.login"
-        } else if label.starts_with("captcha-") {
-            "title.captcha"
-        } else {
-            continue;
-        };
-        let _ = window.set_title(&i18n::tr(key));
+    for (label, key) in [("settings", "title.settings"), ("captcha", "title.captcha"), ("login", "title.login")] {
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.set_title(&i18n::tr(key));
+        }
     }
     let _ = app.emit("state-changed", ());
     Ok(())
@@ -1849,27 +1773,15 @@ pub fn run() {
                         let _ = window.hide();
                     }
                 }
-                if let Some(claim_id) = window.label().strip_prefix("captcha-") {
-                    let claim_id = claim_id.to_string();
-                    let cancelled = {
-                        let mut registry = claim_registry_guard();
-                        registry
-                            .as_mut()
-                            .map(|registry| registry.cancel(&claim_id).cancelled)
-                            .unwrap_or(false)
-                    };
-                    if cancelled {
-                        let _ = window
-                            .app_handle()
-                            .emit("claim://cancelled", json!({ "claimId": claim_id }));
-                    }
+                if window.label() == "captcha" {
+                    *pending_guard() = None;
                 }
             }
         })
         .setup(|app| {
             let settings = store::load_settings(&Paths::detect());
             i18n::init_from_settings(&settings);
-            crate::quota_http::set_proxy(settings.auth_proxy().map(str::to_string));
+            net::set_proxy(settings.auth_proxy().map(str::to_string));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
             }
