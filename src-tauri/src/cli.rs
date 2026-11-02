@@ -169,30 +169,64 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "claim-preview" => {
             let only = flag(rest, "--id");
+            let wants = |id: &str| only.as_deref().map_or(true, |want| want == id);
+            let mut targets: Vec<(String, String, Account)> = vec![];
+            if wants(LIVE_ID) {
+                match live_claim_snapshot(&paths) {
+                    Ok(mut acc) => {
+                        acc.name = crate::zcrypto::account_identity(&acc.credentials, &paths.home)
+                            .label()
+                            .unwrap_or_else(|| crate::i18n::tr("claim.live_name"));
+                        targets.push((LIVE_ID.to_string(), acc.name.clone(), acc));
+                    }
+                    Err(e) => {
+                        if only.as_deref() == Some(LIVE_ID) {
+                            return (err(&e), 1);
+                        }
+                    }
+                }
+            }
             let accounts = match list_accounts(&paths) {
                 Ok(a) => a,
                 Err(e) => return (err(&e), 1),
             };
+            for acc in accounts.iter().filter(|a| wants(&a.id)) {
+                targets.push((acc.id.clone(), acc.name.clone(), acc.clone()));
+            }
             let mut any = false;
             let mut items = vec![];
-            for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
-                let res = ensure_virtual_device_mid(&paths, &acc.id).and_then(|mid| {
-                    crate::claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
-                });
+            for (id, name, acc) in targets {
+                let mid = if id == LIVE_ID {
+                    acc.virtual_device_mid.clone()
+                } else {
+                    match ensure_virtual_device_mid(&paths, &id) {
+                        Ok(mid) => Some(mid),
+                        Err(e) => {
+                            items.push(json!({ "id": id, "name": name, "error": e }));
+                            continue;
+                        }
+                    }
+                };
+                let res = crate::claim::claim_plans(
+                    &paths.home,
+                    &acc.credentials,
+                    acc.config.as_ref(),
+                    mid,
+                );
                 match res {
                     Ok(plans) => {
                         if !plans.is_empty() {
                             any = true;
                         }
                         items.push(json!({
-                            "id": acc.id,
-                            "name": acc.name,
+                            "id": id,
+                            "name": name,
                             "plans": plans,
                         }));
                     }
                     Err(e) => items.push(json!({
-                        "id": acc.id,
-                        "name": acc.name,
+                        "id": id,
+                        "name": name,
                         "error": e,
                     })),
                 }

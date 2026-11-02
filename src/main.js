@@ -14,6 +14,11 @@ let quotaState = createQuotaState();
 let acctQuota = quotaState.entries;
 let stateSequence = 0;
 let claimable = {};
+// The login ZCode is running right now can be checked and claimed without saving it.
+const LIVE_CLAIM_ID = "live";
+// Campaign impressions are rate limited upstream, so the automatic check is lazy.
+const LIVE_CLAIM_AUTO_MS = 30 * 60 * 1000;
+let liveClaimCheckedAt = 0;
 let claimAllRunning = false;
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
@@ -83,6 +88,7 @@ function applyState(next) {
   if (state?.language) init(state.language);
   setQuotaState(syncQuotaAccounts(quotaState, state?.accounts || []));
   enrollAccounts();
+  maybeLoadLiveClaim();
 }
 
 function invalidateQuotaFor(id) {
@@ -167,6 +173,24 @@ async function awaitClaimPreviewFresh(id) {
 }
 
 const accountName = (id) => (state?.accounts || []).find((a) => a.id === id)?.name || id;
+
+// Only an unsaved live login needs its own row; a saved snapshot already covers it.
+const liveClaimTarget = () =>
+  state?.live_logged_in && !(state?.accounts || []).some((a) => a.is_active) ? LIVE_CLAIM_ID : null;
+
+function claimDisplayName(id) {
+  if (id === LIVE_CLAIM_ID) return idLabel(state?.live_identity) || t("m.status.unsaved");
+  return accountName(id);
+}
+
+async function maybeLoadLiveClaim() {
+  if (!liveClaimTarget()) return;
+  if (claimable[LIVE_CLAIM_ID]?.busy || claimActive || claimAllRunning || refreshClaim.running) return;
+  if (Date.now() - liveClaimCheckedAt < LIVE_CLAIM_AUTO_MS) return;
+  liveClaimCheckedAt = Date.now();
+  await loadClaimPreview(LIVE_CLAIM_ID);
+  if (!uiLocked()) render();
+}
 
 function autoPillTitle(s) {
   const bits = [t("btn.autoClaimTitle")];
@@ -387,7 +411,7 @@ const actions = {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
         const plan = claimable[id].plans[0];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
+        const name = claimDisplayName(id);
         try {
           await invoke("claim_start", { id, planId: plan.plan_id });
         } catch (e) {
@@ -409,6 +433,7 @@ const actions = {
 
   async refreshClaim() {
     const ids = (state?.accounts || []).map((a) => a.id);
+    if (liveClaimTarget()) ids.push(LIVE_CLAIM_ID);
     if (!ids.length) return;
     const now = Date.now();
     if (refreshClaim.running || claimAllRunning || (claimActive && !autoClaimRunning)) return;
@@ -436,7 +461,7 @@ const actions = {
     try {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
+        const name = claimDisplayName(id);
         refreshClaim.done = i + 1;
         claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
         if (!uiLocked()) render();
@@ -681,15 +706,29 @@ function claimStripHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
   if (!plan) return "";
+  const live = id === LIVE_CLAIM_ID;
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
   return `
-  <div class="claim-strip" title="${esc(plan.description || label)}">
+  <div class="claim-strip${live ? " live" : ""}" title="${esc(plan.description || label)}">
     ${ic("gift", 15)}
+    ${live ? `<span class="claim-badge">${esc(t("m.claimLiveBadge"))}</span>` : ""}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
     <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
   </div>`;
+}
+
+function liveClaimSlotHtml() {
+  if (!liveClaimTarget()) return "";
+  const c = claimable[LIVE_CLAIM_ID];
+  if (c?.busy) return `<div class="claim-strip live"><span class="aq-loading">${t("q.loading")}</span></div>`;
+  const strip = claimStripHtml(LIVE_CLAIM_ID);
+  if (strip) return strip;
+  if (c?.err) {
+    return `<div class="claim-strip live"><span class="claim-name">${esc(t("m.claimLiveBadge"))}</span><span class="aq-err" title="${esc(c.err)}">${esc(c.err)}</span></div>`;
+  }
+  return "";
 }
 
 function slotRowsHtml(items) {
@@ -868,7 +907,7 @@ function render() {
         ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
-      ${(s.accounts.length > 0)
+      ${(s.accounts.length > 0 || s.live_logged_in)
         ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
             ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
             title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
@@ -893,6 +932,8 @@ function render() {
       <span class="tb-spacer"></span>
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
+
+    ${liveClaimSlotHtml()}
 
     <div class="section-head">
       <h2>${t("m.accounts")}</h2>

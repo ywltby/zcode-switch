@@ -34,7 +34,7 @@ struct PendingClaim {
     plan_name: String,
     credentials: Value,
     config: Option<Value>,
-    device_mid: String,
+    device_mid: Option<String>,
 }
 
 static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
@@ -227,12 +227,30 @@ async fn get_account_quota(id: String, revision: Option<String>) -> Result<quota
     }).await.map_err(|_| "quota_worker_failed".to_string())?
 }
 
+/// A stored snapshot keeps its own virtual device id; the running ZCode login uses
+/// the real one. Neither path creates or rewrites credentials.
+fn claim_target(paths: &Paths, id: &str) -> Result<Account, String> {
+    if id == store::LIVE_ID {
+        let mut acc = store::live_claim_snapshot(paths)?;
+        acc.name = zcrypto::account_identity(&acc.credentials, &paths.home)
+            .label()
+            .unwrap_or_else(|| i18n::tr("claim.live_name"));
+        return Ok(acc);
+    }
+    store::ensure_virtual_device_mid(paths, id)?;
+    load_account(paths, id)
+}
+
 #[tauri::command]
 async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
     let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+    let acc = claim_target(&paths, &id)?;
+    claim::claim_plans(
+        &paths.home,
+        &acc.credentials,
+        acc.config.as_ref(),
+        acc.virtual_device_mid.clone(),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -246,17 +264,23 @@ struct ClaimRefreshResult {
 #[tauri::command]
 async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
     let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
+    let acc = claim_target(&paths, &id)?;
+    let mid = acc.virtual_device_mid.clone();
     let (activated, activation_error) =
         match claim::telemetry_user_id(&paths.home, &acc.credentials) {
-            Some(uid) => match claim::report_activation_events(&uid, &mid) {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e)),
-            },
+            Some(uid) => {
+                let reported = match mid.as_deref() {
+                    Some(value) => claim::report_activation_events(&uid, value),
+                    None => Err(i18n::tr("err.claim.device_missing")),
+                };
+                match reported {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                }
+            }
             None => (false, None),
         };
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    let plans = claim::claim_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)?;
     Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
@@ -268,19 +292,28 @@ async fn claim_start(
     auto: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
-    let plan = plans
-        .iter()
-        .find(|p| p.plan_id == plan_id)
-        .ok_or_else(|| i18n::tr("err.claim.gone"))?;
-    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+    let acc = claim_target(&paths, &id)?;
+    let mid = acc.virtual_device_mid.clone();
+    if let Some(mid) = mid.as_deref() {
+        activate_once(&paths.home, &acc.credentials, mid);
+    }
+    // The campaign list can change between rendering the banner and the click, so the
+    // local lookup only supplies a display name; the server decides if it is claimable.
+    let display = claim::claim_plans(
+        &paths.home,
+        &acc.credentials,
+        acc.config.as_ref(),
+        mid.clone(),
+    )
+    .ok()
+    .and_then(|plans| plans.into_iter().find(|p| p.plan_id == plan_id))
+    .map(|plan| if plan.name.is_empty() { plan.plan_id } else { plan.name })
+    .unwrap_or_else(|| plan_id.clone());
 
     *pending_guard() = Some(PendingClaim {
         account_id: acc.id.clone(),
         account_name: acc.name.clone(),
-        plan_id: plan.plan_id.clone(),
+        plan_id,
         plan_name: display.clone(),
         credentials: acc.credentials,
         config: acc.config,
@@ -288,6 +321,24 @@ async fn claim_start(
     });
     open_captcha_window(&app, auto.unwrap_or(false))?;
     Ok(json!({ "account": acc.name, "plan": display }))
+}
+
+/// The client reports activation events on every launch, which is what makes an
+/// account eligible for campaigns. Mirror that once per login and device.
+fn activate_once(home: &std::path::Path, credentials: &Value, device_mid: &str) {
+    static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let Some(user_id) = claim::telemetry_user_id(home, credentials) else {
+        return;
+    };
+    let key = format!("{user_id}:{device_mid}");
+    {
+        let mut done = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        if done.iter().any(|k| k == &key) {
+            return;
+        }
+        done.push(key);
+    }
+    let _ = claim::report_activation_events(&user_id, device_mid);
 }
 
 #[tauri::command]
@@ -310,7 +361,7 @@ async fn claim_captcha_submit(
         &pending.plan_id,
         &param,
         region.as_deref(),
-        Some(pending.device_mid),
+        pending.device_mid.clone(),
     );
     close_captcha_window(&app);
     let payload = match res {

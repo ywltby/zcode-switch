@@ -201,6 +201,7 @@ fn merge_partial_and_all_failed_do_not_mean_no_plan() {
 #[test]
 fn balance_same_product_different_periods_attach_to_their_entitlement() {
     let result = normalize_balance(&json!({"code":0,"data":{
+        "server_time":1790000000,
         "plans":[
             {"plan_id":"start","subscription_id":"oct","status":"active","starts_at":1790800000,"ends_at":1793500000},
             {"plan_id":"start","subscription_id":"nov","status":"active","starts_at":1793500000,"ends_at":1796100000}

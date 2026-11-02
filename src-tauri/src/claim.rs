@@ -11,8 +11,11 @@ use std::time::Duration;
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
+/// Campaign plans (the client's "可领取" banner) are delivered here, not by billing/preview.
+pub const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch";
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
+const MARKETING_SEQ: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ClaimGrant {
@@ -206,7 +209,9 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
     Ok(())
 }
 
-pub fn preview_plans(
+/// Claimable plans from every source the official client uses: the billing preview
+/// and the marketing campaign that drives the in-app "可领取" banner.
+pub fn claim_plans(
     home: &Path,
     creds: &Value,
     config: Option<&Value>,
@@ -214,12 +219,112 @@ pub fn preview_plans(
 ) -> Result<Vec<ClaimPlan>, String> {
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
-    let url = format!(
+    let mut plans: Vec<ClaimPlan> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    match preview_once(&preview_url(), &token, device_mid.clone()) {
+        Ok(list) => merge_plans(list, &mut plans),
+        Err(e) => errors.push(e),
+    }
+    match marketing_plans(&token, device_mid) {
+        Ok(list) => merge_plans(list, &mut plans),
+        Err(e) => errors.push(e),
+    }
+    plans.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    if plans.is_empty() && !errors.is_empty() {
+        return Err(errors.join(" · "));
+    }
+    Ok(plans)
+}
+
+fn merge_plans(incoming: Vec<ClaimPlan>, plans: &mut Vec<ClaimPlan>) {
+    for plan in incoming {
+        if !plans.iter().any(|p| p.plan_id == plan.plan_id) {
+            plans.push(plan);
+        }
+    }
+}
+
+fn preview_url() -> String {
+    format!(
         "{BILLING_PREVIEW_URL}?app_version={}&platform={}",
         quota::zcode_app_version(),
         quota::client_platform()
-    );
-    preview_once(&url, &token, device_mid)
+    )
+}
+
+fn marketing_plans(token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
+    let url = format!("{MARKETING_TOUCH_URL}?seq={MARKETING_SEQ}");
+    let mut req = agent().get(&url);
+    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = req
+        .call()
+        .map_err(|e| http_err(&crate::i18n::tr("err.claim.touch_req"), e))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(failure_message(code, &v));
+    }
+    Ok(parse_marketing_plans(&v))
+}
+
+/// Campaign deliveries carry `claim_zcode_plan` buttons plus the plan body that the
+/// banner renders. Both live under `banner` / `popup`, so both slots are scanned.
+fn parse_marketing_plans(body: &Value) -> Vec<ClaimPlan> {
+    let mut out: Vec<ClaimPlan> = Vec::new();
+    let Some(deliveries) = body.pointer("/data/deliveries").and_then(Value::as_array) else {
+        return out;
+    };
+    for delivery in deliveries {
+        for slot in ["banner", "popup"] {
+            let Some(node) = delivery.get(slot).filter(|n| n.is_object()) else {
+                continue;
+            };
+            let buttons = node.get("buttons").and_then(Value::as_array);
+            for button in buttons.into_iter().flatten() {
+                let action = button.get("action");
+                if action.and_then(|a| a.get("type")).and_then(Value::as_str)
+                    != Some("claim_zcode_plan")
+                {
+                    continue;
+                }
+                let Some(plan_id) = action
+                    .and_then(|a| a.pointer("/args/plan_id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                if out.iter().any(|p| p.plan_id == plan_id) {
+                    continue;
+                }
+                let detail = [
+                    node.pointer("/background/args/zcode_plan"),
+                    node.pointer("/success_popup/hero/args/zcode_plan"),
+                    node.pointer("/hero/args/zcode_plan"),
+                ]
+                .into_iter()
+                .flatten()
+                .find(|plan| plan.get("plan_id").and_then(Value::as_str) == Some(plan_id));
+                out.push(match detail.and_then(parse_plan) {
+                    Some(plan) => plan,
+                    None => ClaimPlan {
+                        plan_id: plan_id.to_string(),
+                        name: plan_id.to_string(),
+                        description: String::new(),
+                        priority: 0,
+                        grants: Vec::new(),
+                        grant_items: Vec::new(),
+                    },
+                });
+            }
+        }
+    }
+    out
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {
