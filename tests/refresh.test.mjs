@@ -2,8 +2,52 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { PERIOD, account, createClaimHarness, createHarness, tick } from "./ui-harness.mjs";
 import { createRequestQueue } from "../src/request-queue.js";
+import { createClaimFlow } from "../src/claim-flow.js";
 
 const ids = (n) => Array.from({ length: n }, (_, i) => account(`a${i}`));
+
+test("accepted eligibility is published while the rest of the scan is still pending", async () => {
+  const replies = new Map();
+  const published = [];
+  const flow = createClaimFlow({
+    invoke: (_command, { id, revision }) => new Promise((resolve) => replies.set(id, (plans) => resolve({ accountId: id, revision, plans }))),
+    onResult: (result) => { published.push(result); },
+  });
+  flow.applyAccounts(ids(4));
+  const scan = flow.refreshMany(ids(4).map(a => a.id));
+  replies.get("a0")([{ plan_id: "p" }]);
+  await tick();
+  assert.deepEqual(published.map(r => [r.id, r.revision, r.plans[0]?.plan_id]), [["a0", "r1", "p"]]);
+  assert.ok(replies.has("a3"), "a completed query immediately releases its scan slot");
+  for (const id of ["a1", "a2", "a3"]) replies.get(id)([]);
+  await scan;
+  assert.equal(published.length, 4, "empty successful results also withdraw queued eligibility");
+});
+
+test("eligibility notifications exclude failures and old account generations", async () => {
+  let resolve;
+  const published = [];
+  const flow = createClaimFlow({
+    invoke: (_command, args) => new Promise(r => { resolve = plans => r({ accountId: args.id, revision: args.revision, plans }); }),
+    onResult: result => published.push(result),
+  });
+  flow.applyAccounts([account("a")]);
+  const stale = flow.refresh("a");
+  flow.applyAccounts([]);
+  flow.applyAccounts([account("a")]);
+  resolve([{ plan_id: "old" }]);
+  await stale;
+  assert.equal(published.length, 0);
+  const fresh = flow.refresh("a");
+  const reused = flow.refresh("a");
+  resolve([{ plan_id: "new" }]);
+  await Promise.all([fresh, reused]);
+  assert.equal(published.length, 1, "reused requests publish once");
+  const failed = createClaimFlow({invoke: async () => { throw new Error("offline"); }, onResult: result => published.push(result)});
+  failed.applyAccounts([account("a")]);
+  await failed.refresh("a");
+  assert.equal(published.length, 1, "failures cannot enqueue cached plans");
+});
 
 test("twenty due accounts drain through at most three slots", async () => {
   const h = createHarness({ accounts: ids(20) });
@@ -128,6 +172,21 @@ test("an old task cannot postpone the sweep of a changed revision", async () => 
   h.release("a");
   await stale;
   assert.equal(h.scheduler.dueAt("a"), rescheduled, "the stale finally must not overwrite the new due time");
+});
+
+test("an idle credential change refreshes on the next sweep without waiting for the old cadence", async () => {
+  const h = createHarness({ accounts: [account("a"), account("b")] });
+  await h.scheduler.request("a");
+  await h.scheduler.request("b");
+  h.advance(1000);
+  h.bumpRevision("a", "r2");
+  assert.equal(h.state("a").data, undefined, "old identity quota is cleared");
+  assert.equal(h.scheduler.dueAt("a"), 1000, "the new identity is immediately due");
+  assert.equal(h.scheduler.dueAt("b"), PERIOD, "other accounts keep their cadence");
+  assert.equal(h.scheduler.sweep(), 1);
+  await tick();
+  assert.equal(h.state("a").data.revision, "r2");
+  assert.equal(h.callsTo("a").length, 2);
 });
 
 test("sweep does not duplicate an in-flight manual refresh", async () => {

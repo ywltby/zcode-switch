@@ -376,3 +376,20 @@ fn attempts_file_never_contains_credentials_or_captcha_parameters() {
     assert_eq!(attempt["planId"], "p1");
     assert_eq!(attempt["phase"], "submitting");
 }
+
+#[test]
+fn persisted_entitlement_times_do_not_include_raw_claim_secrets() {
+    let path = temp_file();
+    let mut registry = ClaimRegistry::load(path.clone());
+    verifying(&mut registry, "c1", "zai:one", "p1");
+    registry.begin_submit("c1").unwrap();
+    let plan = json!({"entitlements":[{"show_name":"GLM-5.3-Flash","effective_at":1793113200,
+        "token":"synthetic-private-token","captcha":"synthetic-private-captcha"}]});
+    let times = crate::quota::entitlement_start_times(&plan);
+    assert!(registry.finish("c1", ClaimPhase::Succeeded, Some(json!({"entitlementStarts":times}))));
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("synthetic-private-token"));
+    assert!(!raw.contains("synthetic-private-captcha"));
+    let parsed: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["attempts"][0]["result"]["entitlementStarts"][0]["effective_at"], json!(1793113200000_i64));
+}

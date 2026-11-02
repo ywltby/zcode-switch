@@ -447,25 +447,10 @@ async fn claim_start(
         claim::claim_plans(&home, &credentials, config.as_ref(), mid)
     })
     .await;
-    let plans = match prepared {
-        Ok(Ok(plans)) => plans,
-        Ok(Err(error)) => {
-            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
-            return Err(error);
-        }
-        Err(_) => {
-            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
-            return Err("quota_worker_failed".to_string());
-        }
-    };
-    let plan = match plans.iter().find(|p| p.plan_id == wanted) {
-        Some(plan) => plan,
-        None => {
-            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
-            return Err(i18n::tr("err.claim.gone"));
-        }
-    };
-    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+    // A campaign read only supplies the display name: the server decides whether this
+    // identity may claim the plan right now, so an empty or failed read must not block
+    // a claim the user already clicked. The session stays owned by this claim either way.
+    let display = claim::claim_display_name(prepared.unwrap_or_else(|_| Err(String::new())), &wanted);
     let verifying = {
         let mut registry = claim_registry_guard();
         match registry.as_mut() {
@@ -563,13 +548,13 @@ async fn claim_captcha_submit(
             let ms = |k: &str| -> Option<i64> {
                 value
                     .pointer(&format!("/data/plan/{k}"))
-                    .and_then(|x| x.as_i64())
-                    .map(|s| s * 1000)
+                    .and_then(quota::timestamp_millis)
             };
             let server_time = value
                 .pointer("/data/server_time")
-                .and_then(|x| x.as_i64())
-                .map(|s| s * 1000);
+                .and_then(quota::timestamp_millis);
+            let entitlement_starts = value.pointer("/data/plan")
+                .map(quota::entitlement_start_times).unwrap_or_default();
             let payload = json!({
                 "ok": true,
                 "claimId": claim_id,
@@ -579,6 +564,7 @@ async fn claim_captcha_submit(
                 "planId": summary.plan_id,
                 "planName": summary.plan_name,
                 "startsAt": ms("starts_at"),
+                "entitlementStarts": entitlement_starts,
                 "endsAt": ms("ends_at"),
                 "serverTime": server_time,
             });
@@ -1036,7 +1022,7 @@ fn persist_oauth_account(
         credentials,
         config: Some(config),
         virtual_device_mid: Some(mid.to_string()),
-        virtual_arms_uid: Some(store::new_arms_uid()),
+        virtual_arms_uid: None,
     };
     if !flow_still_ours() {
         return Err("__superseded__".into());
@@ -1148,7 +1134,7 @@ fn open_captcha_window(app: &AppHandle, claim_id: &str, auto: bool) -> Result<()
     let win = tauri::WebviewWindowBuilder::new(
         app,
         label,
-        tauri::WebviewUrl::App(format!("captcha.html?claimId={claim_id}").into()),
+        tauri::WebviewUrl::App(format!("captcha.html?claimId={claim_id}&auto={}", u8::from(auto)).into()),
     )
     .title(i18n::tr("title.captcha"))
     .theme(Some(tauri::Theme::Dark))

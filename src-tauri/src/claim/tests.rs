@@ -193,3 +193,39 @@ fn campaign_payload_without_claim_action_yields_nothing() {
         assert!(parse_marketing_plans(&body).is_empty());
     }
 }
+
+fn plan_stub(plan_id: &str, name: &str) -> ClaimPlan {
+    ClaimPlan {
+        plan_id: plan_id.to_string(),
+        name: name.to_string(),
+        description: String::new(),
+        priority: 0,
+        grants: Vec::new(),
+        grant_items: Vec::new(),
+    }
+}
+
+/// A rate-limited or already-empty campaign read must fall back to the clicked plan id
+/// instead of refusing the claim: only the server decides claimability at click time.
+#[test]
+fn a_failed_or_empty_campaign_read_still_yields_a_display_name() {
+    let wanted = "zcode-v3-start-plan-1102";
+    assert_eq!(
+        claim_display_name(Err("preview 请求失败 HTTP 429".into()), wanted),
+        wanted
+    );
+    assert_eq!(claim_display_name(Ok(Vec::new()), wanted), wanted);
+    assert_eq!(
+        claim_display_name(Ok(vec![plan_stub("other-plan", "OTHER")]), wanted),
+        wanted
+    );
+    assert_eq!(
+        claim_display_name(Ok(vec![plan_stub(wanted, "ZCODE GLOBAL BUILD")]), wanted),
+        "ZCODE GLOBAL BUILD"
+    );
+    assert_eq!(
+        claim_display_name(Ok(vec![plan_stub(wanted, "")]), wanted),
+        wanted,
+        "an unnamed plan falls back to its id"
+    );
+}

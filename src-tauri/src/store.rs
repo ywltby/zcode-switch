@@ -610,7 +610,6 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         virtual_arms_uid: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
-    adopt_virtual_arms_uid(paths, &mut acc)?;
     Ok(acc)
 }
 
@@ -653,7 +652,6 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         virtual_arms_uid: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
-    adopt_virtual_arms_uid(paths, &mut acc)?;
     Ok(Some(name))
 }
 
@@ -813,6 +811,17 @@ pub(crate) fn run_switch_probe(paths: &Paths, id: &str) -> Option<crate::probe::
 }
 
 pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
+    switch_to_with_process_check(paths, id, force, restart, hot, zcode_running)
+}
+
+fn switch_to_with_process_check(
+    paths: &Paths,
+    id: &str,
+    force: bool,
+    restart: bool,
+    hot: bool,
+    is_running: impl FnOnce() -> bool,
+) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
     let live = read_live(paths)?;
@@ -834,12 +843,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
                 eprintln!("sync-back 失败(不阻断 already 返回): {e}");
             }
         }
-        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-        write_live_device_mid(paths, &mid)?;
-        let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
-        if !zcode_running() {
-            let _ = write_live_arms_uid(paths, &uid);
-        }
+        ensure_virtual_device_mid_locked(paths, &target.id)?;
         return Ok(SwitchResult {
             switched: false,
             already_active: true,
@@ -853,7 +857,13 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         });
     }
 
-    let running = zcode_running();
+    // The active account can refresh independently; do not restore an expired
+    // non-active snapshot or stop ZCode before telling the user to sign in.
+    if account_jwt_expired(&target.credentials, &paths.home) {
+        return Err(tr("err.switch.jwt_expired"));
+    }
+
+    let running = is_running();
     if hot && running {
         if let Err(e) = sync_live_back_to_source(paths, &accounts) {
             eprintln!("sync-back 失败(不阻断切换): {e}");
@@ -864,9 +874,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         hot_swap_verified(paths, &target, &creds)?;
         backfill_relay_pass_hash(paths, &target.id, &creds);
         reset_live_plan_cache(paths);
-        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-        write_live_device_mid(paths, &mid)?;
-        ensure_virtual_arms_uid_locked(paths, &target.id)?;
+        ensure_virtual_device_mid_locked(paths, &target.id)?;
         let probe = None;
         return Ok(SwitchResult {
             switched: true,
@@ -919,10 +927,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     if !new_gen {
         rematerialize_wiped_builtins(paths, &target);
     }
-    let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-    write_live_device_mid(paths, &mid)?;
-    let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
-    let _ = write_live_arms_uid(paths, &uid);
+    ensure_virtual_device_mid_locked(paths, &target.id)?;
 
     let mut launched = false;
     if restart {
@@ -1276,21 +1281,6 @@ pub(crate) fn claim_revision_matches(paths: &Paths, id: &str, revision: &str) ->
         .unwrap_or(false)
 }
 
-pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
-    let mut v: Value = fs::read_to_string(paths.live_telemetry())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !v.is_object() {
-        v = json!({});
-    }
-    if v.get("deviceMid").and_then(|m| m.as_str()) == Some(mid) {
-        return Ok(());
-    }
-    v["deviceMid"] = json!(mid);
-    atomic_write(&paths.live_telemetry(), &(serde_json::to_string(&v).unwrap_or_default() + "\n"))
-}
-
 fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
     if acc.virtual_device_mid.as_deref().map_or(false, |m| !m.trim().is_empty()) {
         return Ok(());
@@ -1314,203 +1304,6 @@ fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), Stri
     save_account(paths, acc)
 }
 
-const ARMS_DEFAULT_STORE_FILE: &str = "ZGVmYXVsdA.json";
-
-pub fn new_arms_uid() -> String {
-    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let uuid = Uuid::new_v4();
-    let suffix: String = uuid.as_bytes()
-        .iter()
-        .take(16)
-        .map(|b| ALPHABET[(*b as usize) % 36] as char)
-        .collect();
-    format!("uid_{suffix}")
-}
-
-fn arms_store_dirs_from(
-    win_appdata: Option<PathBuf>,
-    mac_appsupport: Option<PathBuf>,
-    unix_base: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut push_if_new = |dir: PathBuf| {
-        let lowered = dir.to_string_lossy().to_lowercase();
-        if !out.iter().any(|d| d.to_string_lossy().to_lowercase() == lowered) {
-            out.push(dir);
-        }
-    };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let groups: [(Option<PathBuf>, &[&str]); 3] = [
-        (win_appdata, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
-        (mac_appsupport, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
-        (unix_base, &["zcode", "ZCode"]),
-    ];
-    for (base, names) in groups {
-        let Some(base) = base else { continue };
-        for name in names {
-            candidates.push(base.join(name).join("rum-electron-store"));
-        }
-        if let Ok(rd) = fs::read_dir(&base) {
-            let extras: Vec<PathBuf> = rd
-                .flatten()
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().to_lowercase();
-                    n.starts_with("zcode") && e.path().join("rum-electron-store").is_dir()
-                })
-                .map(|e| e.path().join("rum-electron-store"))
-                .collect();
-            candidates.extend(extras);
-        }
-    }
-    let existing: Vec<PathBuf> = candidates.iter().filter(|c| c.is_dir()).cloned().collect();
-    if existing.is_empty() {
-        candidates.truncate(1);
-        candidates
-    } else {
-        for c in existing {
-            push_if_new(c);
-        }
-        out
-    }
-}
-
-fn arms_store_dirs_for(paths: &Paths) -> Vec<PathBuf> {
-    if in_sandbox() {
-        return vec![paths.home.join("arms-store-sandbox")];
-    }
-    #[cfg(windows)]
-    let (appdata, mac_base, unix_base) =
-        (std::env::var("APPDATA").ok().map(PathBuf::from), None, None);
-    #[cfg(target_os = "macos")]
-    let (appdata, mac_base, unix_base) = (
-        None,
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join("Library").join("Application Support")),
-        None,
-    );
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (appdata, mac_base, unix_base) = (
-        None,
-        None,
-        std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))),
-    );
-    arms_store_dirs_from(appdata, mac_base, unix_base)
-}
-
-fn ensure_virtual_arms_uid_locked(paths: &Paths, id: &str) -> Result<String, String> {
-    {
-        let acc = load_account(paths, id)?;
-        if let Some(u) = acc.virtual_arms_uid.clone() {
-            if !u.trim().is_empty() {
-                return Ok(u);
-            }
-        }
-    }
-    let mut acc = load_account(paths, id)?;
-    if let Some(u) = acc.virtual_arms_uid.clone() {
-        if !u.trim().is_empty() {
-            return Ok(u);
-        }
-    }
-    let u = new_arms_uid();
-    acc.virtual_arms_uid = Some(u.clone());
-    acc.updated_at = now_ts();
-    save_account(paths, &acc)?;
-    Ok(u)
-}
-
-fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
-    let read_uid = |f: &Path| -> Option<String> {
-        fs::read_to_string(f)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get("_arms_uid").and_then(|u| u.as_str()).map(String::from))
-            .filter(|u| !u.trim().is_empty())
-    };
-    let mut files: Vec<PathBuf> = Vec::new();
-    for d in dirs {
-        if let Ok(rd) = fs::read_dir(d) {
-            let mut jsons: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
-                .collect();
-            jsons.sort_by_key(|p| !p.file_name().map(|n| n == ARMS_DEFAULT_STORE_FILE).unwrap_or(false));
-            files.extend(jsons);
-        }
-    }
-    files.iter().find_map(|f| read_uid(f))
-}
-
-pub fn write_live_arms_uid_to(dirs: &[PathBuf], uid: &str) -> Result<(), String> {
-    for d in dirs {
-        let mut jsons: Vec<PathBuf> = fs::read_dir(d)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if jsons.is_empty() {
-            fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
-            jsons.push(d.join(ARMS_DEFAULT_STORE_FILE));
-        }
-        let mut first_err: Option<String> = None;
-        for f in jsons {
-            let mut v: Value = fs::read_to_string(&f)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| json!({}));
-            if !v.is_object() {
-                v = json!({});
-            }
-            if v.get("_arms_uid").and_then(|u| u.as_str()) == Some(uid)
-                && v.get("_arms_session").is_none()
-            {
-                continue;
-            }
-            let obj = v.as_object_mut().unwrap();
-            obj.insert("_arms_uid".into(), json!(uid));
-            obj.remove("_arms_session");
-            if let Err(e) = atomic_write(&f, &(serde_json::to_string(&v).unwrap_or_default() + "\n")) {
-                first_err.get_or_insert(e);
-            }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-fn write_live_arms_uid(paths: &Paths, uid: &str) -> Result<(), String> {
-    write_live_arms_uid_to(&arms_store_dirs_for(paths), uid)
-}
-
-fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
-    if acc.virtual_arms_uid.as_deref().is_some_and(|u| !u.trim().is_empty()) {
-        return Ok(());
-    }
-    let live_uid = read_live_arms_uid_from(&arms_store_dirs_for(paths));
-    let taken = |u: &str| {
-        list_accounts(paths)
-            .map(|accs| accs.iter().any(|a| a.virtual_arms_uid.as_deref() == Some(u)))
-            .unwrap_or(false)
-    };
-    let uid = match live_uid {
-        Some(u) if !taken(&u) => u,
-        _ => new_arms_uid(),
-    };
-    acc.virtual_arms_uid = Some(uid);
-    acc.updated_at = now_ts();
-    save_account(paths, acc)
-}
-
 pub fn export_bundle_value(accounts: &[Account]) -> Value {
     json!({
         "format": "zcode-accounts-bundle",
@@ -1521,11 +1314,12 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
             "createdAt": a.created_at,
             "credentials": a.credentials,
             "config": a.config,
+            "claimDeviceMid": a.virtual_device_mid,
         })).collect::<Vec<_>>(),
     })
 }
 
-type ImportCandidate = (Option<String>, Value, Option<Value>);
+type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);
 
 fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
     if v.get("format").and_then(|f| f.as_str()) == Some("zcode-accounts-bundle") {
@@ -1540,6 +1334,8 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
                 item.get("config").cloned(),
+                item.get("claimDeviceMid").and_then(Value::as_str)
+                    .filter(|mid| !mid.trim().is_empty()).map(String::from),
             ));
         }
         return Ok(out);
@@ -1561,7 +1357,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 continue;
             }
         };
-        for (name_opt, creds, config_opt) in cands {
+        for (name_opt, creds, config_opt, claim_mid) in cands {
             if !is_logged_in(&creds) {
                 report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
@@ -1585,7 +1381,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 hash,
                 credentials: creds,
                 config: config_opt,
-                virtual_device_mid: None,
+                virtual_device_mid: claim_mid,
                 virtual_arms_uid: None,
             };
             new_accounts.push(acc);

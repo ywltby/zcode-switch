@@ -5,7 +5,9 @@ import { init, t, lang, stripErr } from "./i18n.js";
 import { createCaptchaFlow } from "./captcha-flow.js";
 
 const SDK_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
-const claimId = new URLSearchParams(location.search).get("claimId") || "";
+const query = new URLSearchParams(location.search);
+const claimId = query.get("claimId") || "";
+const auto = query.get("auto") === "1";
 
 const $text = document.getElementById("cap-text");
 const $detail = document.getElementById("cap-detail");
@@ -76,6 +78,7 @@ function onStatus(phase) {
 flow = createCaptchaFlow({
   invoke,
   claimId,
+  auto,
   loadSdk,
   applyConfig: (config) => {
     // Must be set before the SDK evaluates its configuration.

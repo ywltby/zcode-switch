@@ -5,6 +5,7 @@ import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 import { createQuotaScheduler } from "./refresh-scheduler.js";
 import { createClaimFlow, parseScopeError } from "./claim-flow.js";
+import { createClaimQueue } from "./claim-queue.js";
 import { createRequestQueue } from "./request-queue.js";
 import {
   cancelAttempt,
@@ -16,7 +17,7 @@ import {
   syncClaimAccounts,
   waitForAttempt,
 } from "./claim-attempts.js";
-import { claimOutcomeOf, resolveClaimTimeout, waitForBackendResult } from "./claim-run.js";
+import { claimOutcomeOf, reconcilePendingClaims, resolveClaimTimeout, waitForBackendResult } from "./claim-run.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -35,6 +36,8 @@ let claimAllRunning = false;
 let claimAttempts = createClaimAttempts();
 let claimUnknown = new Map();
 let claimRecovery = { ok: true };
+let claimRecoveryReady = false;
+let reconcilingClaims = false;
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let refreshTicker = null;
@@ -44,10 +47,8 @@ const AUTO_CLAIM_FIRST_DELAY_MS = 2 * 60 * 1000;
 const AUTO_CLAIM_WAIT_MS = 45_000;
 const AUTO_CLAIM_PER_ACCOUNT_CAP = 5;
 const AUTO_CLAIM_ACCT_GAP_MS = 5_000;
-const AUTO_ABORT_WAIT_MS = 90_000;
 let autoClaimRunning = false;
-let autoClaimCooldown = {};
-let autoAbortRequested = false;
+let autoScanRunning = false;
 let claimActive = false;
 let lastAutoRound = null;
 let autoToggleBusy = false;
@@ -99,6 +100,7 @@ function applyState(next) {
   claimable = claimFlow.entries();
   claimAttempts = syncClaimAccounts(claimAttempts, state?.accounts || []);
   maybeLoadLiveClaim();
+  claimQueue.applyAccounts(state?.accounts || []);
 }
 
 function invalidateQuotaFor(id) {
@@ -140,10 +142,24 @@ async function loadAcctQuota(id) {
 
 const requestQueue = createRequestQueue(3);
 
+const claimQueue = createClaimQueue({
+  run: runQueuedClaim,
+  canStart: () => claimRecoveryReady && claimRecovery.ok !== false && !claimActive && !claimAllRunning && !claimPending(),
+  allowAccount: (id) => !unknownClaimFor(id),
+  gapMs: AUTO_CLAIM_ACCT_GAP_MS,
+  retryDelayMs: AUTO_CLAIM_INTERVAL_MS,
+  perAccountLimit: AUTO_CLAIM_PER_ACCOUNT_CAP,
+  onChange: () => { if (!uiLocked()) render(); },
+});
+
 const quotaScheduler = createQuotaScheduler({
   invoke,
   queue: requestQueue,
-  classifyData: (data) => (data?.completion === "unavailable" ? quotaErrors(data) || t("q.refreshFailed") : null),
+  classifyData: (data) => {
+    const emptyPartial = data?.completion === "partial" && !data.plans?.length && !data.items?.length;
+    return data?.completion === "unavailable" || emptyPartial
+      ? quotaErrors(data) || t("q.refreshFailed") : null;
+  },
   errorText: (error) => quotaErrorMessage(String(error)),
   onChange: () => {
     acctQuota = quotaScheduler.entries();
@@ -157,6 +173,7 @@ const claimFlow = createClaimFlow({
   errorText: (error) => stripErr(error),
   refreshState: () => refresh(),
   isLive: (id) => id === LIVE_CLAIM_ID,
+  onResult: (result) => claimQueue.offer(result),
   onChange: () => {
     claimable = claimFlow.entries();
     if (!uiLocked()) render();
@@ -191,7 +208,12 @@ function claimResultToast(payload, attempt) {
   }
   const bits = [];
   const now = payload.serverTime || Date.now();
-  if (payload.startsAt && payload.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(payload.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
+  for (const entitlement of Array.isArray(payload.entitlementStarts) ? payload.entitlementStarts : []) {
+    const time = entitlement?.effective_at;
+    if (!Number.isFinite(time) || time <= now || Number.isNaN(new Date(time).getTime())) continue;
+    const label = t("m.claimStartsAt", { time: new Date(time).toLocaleString(localeTag(), { hour12: false }) });
+    bits.push(entitlement?.name ? `${entitlement.name} · ${label}` : label);
+  }
   if (payload.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(payload.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
   toast(t("m.claimOk", { name, plan: payload.planName }), "ok", bits.join(t("common.listSep")));
 }
@@ -205,6 +227,10 @@ function handleClaimResult(payload) {
   claimResultToast(payload, attempt);
   if (settled.refresh) {
     const id = attempt.accountId;
+    const outcome = claimOutcomeOf(payload);
+    claimQueue.record({ id, revision: attempt.revision, planId: attempt.planId }, {
+      ...outcome, cooldownUntil: autoClaimCooldownFor(payload),
+    });
     if (id !== LIVE_CLAIM_ID) {
       loadAcctQuota(id);
       scheduleNext(id);
@@ -212,6 +238,7 @@ function handleClaimResult(payload) {
     claimFlow.afterClaim(id);
   }
   finishWaiter(claimAttempts, claimId, payload);
+  claimQueue.kick();
   if (!uiLocked()) render();
   return true;
 }
@@ -245,6 +272,8 @@ async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, ret
     claimAttempts.order = claimAttempts.order.filter((value) => value !== claimId);
     if (scope?.notStarted && !retried) {
       await refresh();
+      // A queued snapshot cannot silently become a claim for a new login.
+      if (mode === "auto") return { status: "skipped" };
       return performClaim(id, plan, { mode, timeoutMs, retried: true });
     }
     // The backend may still hold an unknown claim; never let local state drift.
@@ -268,7 +297,6 @@ async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, ret
       toast(t("m.claimConfirming"), "warn", t("m.claimConfirmingDetail"));
     },
     onTimeout: () => toast(t("m.claimTimeout"), "warn"),
-    isAborted: () => autoAbortRequested,
     autoWaitMs: AUTO_CLAIM_WAIT_MS,
   });
 }
@@ -316,7 +344,11 @@ async function recoverClaimSessions() {
     }
     claimUnknown = next;
   } catch {
-    claimRecovery = { ok: true };
+    claimRecovery = { ok: false };
+    toast(t("m.claimRecoveryPaused"), "err", t("m.claimRecoveryPausedDetail"));
+  } finally {
+    claimRecoveryReady = true;
+    claimQueue.kick();
   }
 }
 
@@ -325,6 +357,18 @@ function claimPending() {
     if (!attempt.handled) return true;
   }
   return false;
+}
+
+async function reconcileClaims() {
+  if (reconcilingClaims) return;
+  reconcilingClaims = true;
+  try {
+    await reconcilePendingClaims({ attempts: [...claimAttempts.attempts.values()], invoke, handleResult: handleClaimResult });
+    claimQueue.kick();
+    if (!uiLocked()) render();
+  } finally {
+    reconcilingClaims = false;
+  }
 }
 
 async function checkUnknownResult(id) {
@@ -337,10 +381,6 @@ async function acknowledgeUnknown(claimId) {
   await invoke("claim_acknowledge_unknown", { claimId }).catch(() => {});
   claimUnknown.delete(claimId);
   if (!uiLocked()) render();
-}
-
-async function awaitClaimPreviewFresh(id) {
-  await claimFlow.afterClaim(id);
 }
 
 const accountName = (id) => (state?.accounts || []).find((a) => a.id === id)?.name || id;
@@ -365,14 +405,15 @@ async function maybeLoadLiveClaim() {
 
 function autoPillTitle(s) {
   const bits = [t("btn.autoClaimTitle")];
-  if (autoClaimRunning) bits.push(t(s.auto_claim ? "m.autoClaimRound" : "m.autoClaimStopping"));
+  if (autoScanRunning) bits.push(t("m.autoClaimRound"));
+  if (claimQueue.activeId()) bits.push(t("m.claimQueueActive", { name: accountName(claimQueue.activeId()) }));
+  if (claimQueue.pendingCount()) bits.push(t("m.claimQueueWaiting", { n: claimQueue.pendingCount() }));
   if (lastAutoRound) {
     const d = new Date(lastAutoRound.at);
     const time = d.toDateString() === new Date().toDateString()
       ? d.toLocaleTimeString(localeTag(), { hour12: false })
       : `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${d.toLocaleTimeString(localeTag(), { hour12: false })}`;
-    bits.push(t("m.autoClaimLast", { time, claimed: lastAutoRound.claimed, skipped: lastAutoRound.skipped }));
-    if (lastAutoRound.cooldownAll) bits.push(t("m.autoClaimCooldownAll"));
+    bits.push(t("m.autoClaimLast", { time, found: lastAutoRound.found, failed: lastAutoRound.failed }));
   }
   return esc(bits.join(" · "));
 }
@@ -533,13 +574,18 @@ const actions = {
   },
 
   async refreshClaimOne(id) {
-    if (refreshClaim.running || claimAllRunning || autoClaimRunning || claimPending()) return;
-    if (!(state?.accounts || []).some((a) => a.id === id)) return;
+    if (claimFlow.busy(id)) return;
+    if (id !== LIVE_CLAIM_ID && !(state?.accounts || []).some((a) => a.id === id)) return;
     const outcome = await claimFlow.refresh(id).catch((e) => ({ status: "failed", error: stripErr(e) }));
     if (outcome.status === "ok" && outcome.activationError) {
-      toast(t("m.refreshClaimAcctErr", { name: accountName(id), err: stripErr(outcome.activationError) }), "warn");
+      toast(t("m.refreshClaimAcctErr", { name: claimDisplayName(id), err: stripErr(outcome.activationError) }), "warn");
+    } else if (outcome.status === "ok") {
+      const n = outcome.plans?.length || 0;
+      toast(t(n ? "m.refreshClaimAcctFound" : "m.refreshClaimAcctEmpty", { name: claimDisplayName(id), n }));
+    } else if (outcome.status === "scope_changed") {
+      toast(t("m.refreshClaimAcctChanged", { name: claimDisplayName(id) }), "warn");
     } else if (outcome.status === "failed") {
-      toast(t("m.refreshClaimAcctErr", { name: accountName(id), err: stripErr(outcome.error || "") }), "err");
+      toast(t("m.refreshClaimAcctErr", { name: claimDisplayName(id), err: stripErr(outcome.error || "") }), "err");
     }
     quotaScheduler.poke(id);
     if (!uiLocked()) render();
@@ -551,7 +597,7 @@ const actions = {
   },
 
   askRetryUnknown(claimId, id) {
-    if (!(state?.accounts || []).some((a) => a.id === id)) return;
+    if (id !== LIVE_CLAIM_ID && !(state?.accounts || []).some((a) => a.id === id)) return;
     openConfirmModal({
       kind: "warn",
       icon: "alert",
@@ -563,11 +609,18 @@ const actions = {
   },
 
   async doRetryUnknown(claimId, id) {
-    await acknowledgeUnknown(claimId);
-    await refresh();
-    const plan = claimable[id]?.plans?.[0];
-    if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
-    await actions.claim(id);
+    if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) return;
+    claimActive = true;
+    try {
+      await acknowledgeUnknown(claimId);
+      await refresh();
+      const plan = claimable[id]?.plans?.[0];
+      if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
+      await performClaim(id, plan, { mode: "manual", timeoutMs: 90_000 });
+    } finally {
+      claimActive = false;
+      claimQueue.kick();
+    }
   },
 
   async addAccount() {
@@ -588,12 +641,12 @@ const actions = {
   },
 
   async claim(id) {
-    if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) {
+    if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) {
       toast(t("m.claimBusy"), "warn");
       return;
     }
     if (unknownClaimFor(id)) {
-      toast(t("m.claimUnconfirmed", { name: accountName(id) }), "warn", t("m.claimCheckFirstDetail"));
+      toast(t("m.claimUnconfirmed", { name: claimDisplayName(id) }), "warn", t("m.claimCheckFirstDetail"));
       return;
     }
     const plans = claimable[id]?.plans || [];
@@ -605,6 +658,7 @@ const actions = {
       await performClaim(id, plan, { mode: "manual", timeoutMs: 90_000 });
     } finally {
       claimActive = false;
+      claimQueue.kick();
     }
   },
 
@@ -614,7 +668,7 @@ const actions = {
       .map((a) => a.id)
       .filter((id) => !unknownClaimFor(id) && (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) return;
+    if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) return;
     if (pending.length) {
       toast(t("m.claimBatchSkipped", { n: pending.length }), "warn", t("m.claimBatchSkippedDetail"));
     }
@@ -631,6 +685,7 @@ const actions = {
     } finally {
       claimAllRunning = false;
       claimActive = false;
+      claimQueue.kick();
     }
   },
 
@@ -639,28 +694,14 @@ const actions = {
     if (liveClaimTarget()) ids.push(LIVE_CLAIM_ID);
     if (!ids.length) return;
     const now = Date.now();
-    if (refreshClaim.running || claimAllRunning || (claimActive && !autoClaimRunning)) return;
+    if (refreshClaim.running) return;
     if (now < refreshClaim.cooldownUntil) {
       toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
       return;
     }
     refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0 };
     startRefreshTicker();
-    if (autoClaimRunning) {
-      autoAbortRequested = true;
-      const deadline = Date.now() + AUTO_ABORT_WAIT_MS;
-      while (autoClaimRunning && Date.now() < deadline) {
-        await new Promise((res) => setTimeout(res, 300));
-      }
-      if (autoClaimRunning) {
-        refreshClaim.running = false;
-        refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
-        toast(t("m.claimBusy"), "warn");
-        setTimeout(stopRefreshTickerIfIdle, 1100);
-        return;
-      }
-    }
-    let okCount = 0;
+    let claimableCount = 0;
     let failedCount = 0;
     let skippedCount = 0;
     try {
@@ -669,7 +710,7 @@ const actions = {
           refreshClaim.done = done;
           const name = claimDisplayName(id);
           if (outcome.status === "ok") {
-            okCount++;
+            if (outcome.plans?.length) claimableCount++;
             if (outcome.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(outcome.activationError) }), "warn");
           } else if (outcome.status === "skipped") {
             skippedCount++;
@@ -689,16 +730,12 @@ const actions = {
     }
     void failedCount;
     void skippedCount;
-    toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
+    toast(t("m.refreshClaimDone", { n: ids.length, k: claimableCount }), "ok");
   },
 
   async toggleAutoClaim() {
     if (autoToggleBusy) return;
     const next = !state.auto_claim;
-    if (next && (autoClaimRunning || claimActive || claimAllRunning || refreshClaim.running)) {
-      toast(t("m.claimBusy"), "warn");
-      return;
-    }
     autoToggleBusy = true;
     try {
       await invoke("set_behavior", { autoClaim: next });
@@ -706,7 +743,7 @@ const actions = {
       render();
       if (state.auto_claim) {
         toast(t("m.autoClaimOn"), "ok", t("m.autoClaimOnDetail"));
-        if (Date.now() - (lastAutoRound?.at ?? 0) > REFRESH_CLAIM_COOLDOWN_MS) autoClaimTick();
+        autoClaimTick();
       } else {
         lastAutoRound = null;
       }
@@ -738,63 +775,37 @@ function autoClaimCooldownFor(r) {
 }
 
 async function autoClaimTick() {
-  if (!state?.auto_claim || autoClaimRunning) return;
-  if (claimRecovery.ok === false) return;
-  if (claimActive || claimAllRunning || refreshClaim.running || claimPending()) return;
-  const ids = (state.accounts || [])
-    .map((a) => a.id)
-    .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now());
-  if (!ids.length) {
-    if ((state.accounts || []).some((a) => (claimable[a.id]?.plans || []).length > 0)) {
-      lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, cooldownAll: true };
-    }
-    return;
-  }
-  autoClaimRunning = true; claimActive = true; autoAbortRequested = false;
-  let roundClaimed = 0, roundSkipped = 0;
+  if (!state?.auto_claim || autoScanRunning) return;
+  const ids = (state.accounts || []).map((a) => a.id);
+  if (!ids.length) return;
+  autoScanRunning = true;
+  const round = { at: Date.now(), found: 0, failed: 0 };
   if (!uiLocked()) render();
   try {
-    for (const id of ids) {
-      if (!state?.auto_claim || autoAbortRequested) break;
-      if (!(state.accounts || []).some((a) => a.id === id)) continue;
-      let gotAny = false;
-      const refreshed = await claimFlow.refresh(id);
-      if (refreshed.status !== "ok") {
-        autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
-        roundSkipped++;
-        continue;
-      }
-      if (!uiLocked()) render();
-      let attempts = 0;
-      let progressed = true;
-      while (progressed && attempts < AUTO_CLAIM_PER_ACCOUNT_CAP) {
-        if (autoAbortRequested) break;
-        attempts++;
-        progressed = false;
-        const plan = claimable[id]?.plans?.[0];
-        if (!plan) break;
-        const outcome = await performClaim(id, plan, { mode: "auto", timeoutMs: AUTO_CLAIM_WAIT_MS });
-        if (outcome.status === "ok") {
-          gotAny = true; roundClaimed++;
-          await awaitClaimPreviewFresh(id);
-          if (!uiLocked()) render();
-          progressed = true;
-          await new Promise((res) => setTimeout(res, 1200));
-          continue;
-        }
-        const payload = outcome.payload || { status: outcome.status };
-        autoClaimCooldown[id] = payload.unknown || outcome.status === "unknown"
-          ? Date.now() + 60 * 60 * 1000
-          : autoClaimCooldownFor(payload);
-        break;
-      }
-      if (!gotAny && (claimable[id]?.plans || []).length) roundSkipped++;
-      await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS));
-    }
+    await claimFlow.refreshMany(ids, {
+      onItem: ({ outcome }) => {
+        if (outcome.status === "ok" && outcome.plans?.length) round.found++;
+        else if (outcome.status !== "ok" && outcome.status !== "skipped") round.failed++;
+      },
+    });
   } finally {
-    autoClaimRunning = false; claimActive = false;
-    if (state?.auto_claim) lastAutoRound = { at: Date.now(), claimed: roundClaimed, skipped: roundSkipped };
+    autoScanRunning = false;
+    lastAutoRound = { ...round, at: Date.now() };
     if (!uiLocked()) render();
+  }
+}
+
+async function runQueuedClaim(job) {
+  if (!job.isCurrent() || unknownClaimFor(job.id)) return { status: "skipped" };
+  autoClaimRunning = true;
+  claimActive = true;
+  try {
+    const outcome = await performClaim(job.id, job.plan, { mode: "auto", timeoutMs: AUTO_CLAIM_WAIT_MS });
+    return { ...outcome, cooldownUntil: outcome.status === "unknown"
+      ? Date.now() + 60 * 60 * 1000 : autoClaimCooldownFor(outcome.payload || {}) };
+  } finally {
+    autoClaimRunning = false;
+    claimActive = false;
   }
 }
 
@@ -802,8 +813,11 @@ function quotaBarHtml(pct) {
   const used = pct == null ? null : Math.min(100, Math.max(0, pct));
   const remaining = used == null ? null : 100 - used;
   const danger = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
-  const txt = remaining == null ? "--" : remaining.toFixed(0) + "%";
-  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct">${txt}</span></div>`;
+  const txt = remaining == null ? "--"
+    : remaining > 0 && remaining < 1 ? "<1%"
+    : remaining > 99 && remaining < 100 ? ">99%"
+    : remaining.toFixed(0) + "%";
+  return `<div class="qbar${danger}" style="--quota-remaining:${remaining ?? 100}%"><div class="qbar-fill"></div><span class="qbar-pct">${txt}</span></div>`;
 }
 
 function itemKind(it) {
@@ -876,9 +890,11 @@ function tierChipHtml(tier, code) {
 function tierBadgeFor(id) {
   const q = acctQuota[id];
   if (!q?.data) return "";
-  const plans = q.data.plans || [];
+  const allPlans = q.data.plans || [];
+  const plans = allPlans.filter(p => !planExpired(p));
   const pairs = plans.map((p) => [p.tier, p.tier_code]);
-  const list = (pairs.length ? pairs : q.data.plan_tier ? [[q.data.plan_tier, null]] : []).slice(0, 2);
+  const list = (allPlans.length ? pairs : q.data.plan_tier && !planExpired({ expire: q.data.plan_expire })
+    ? [[q.data.plan_tier, null]] : []).slice(0, 2);
   if (!list.length) return q.data.completion === "complete" && q.data.is_empty ? `<span class="tier-b free">Free</span>` : "";
   return list.map(([tier, code]) => tierChipHtml(tier, code)).join("");
 }
@@ -915,22 +931,24 @@ function claimStripHtml(id) {
   const attempt = claimAttemptFor(id);
   const unknown = unknownClaimFor(id);
   const live = id === LIVE_CLAIM_ID;
+  const queued = claimQueue.status(id);
   const rows = [];
-  if (attempt?.confirming) {
-    rows.push(`<div class="claim-unknown"><span class="aq-status">${esc(t("m.claimConfirming"))}</span></div>`);
+  if (attempt?.confirming || (attempt?.done && !attempt.handled)) {
+    const status = attempt.confirming ? t("m.claimConfirming") : t("m.claimUnconfirmed", { name: claimDisplayName(id) });
+    rows.push(`<div class="claim-unknown"><span class="aq-status">${esc(status)}</span></div>`);
   }
   if (unknown) {
     rows.push(`<div class="claim-unknown">
       <span class="aq-err">${esc(t("m.claimUnconfirmed", { name: claimDisplayName(id) }))}</span>
       <button class="btn-ghost" click="actions.checkUnknown('${id}')">${esc(t("m.claimCheck"))}</button>
-      <button class="btn-ghost" click="actions.askRetryUnknown('${unknown.claimId}','${id}')">${esc(t("m.claimRetry"))}</button>
+      <button class="btn-ghost" click="actions.askRetryUnknown('${unknown.claimId}','${id}')" ${claimActive || claimPending() || claimQueue.activeId() ? "disabled" : ""}>${esc(t("m.claimRetry"))}</button>
     </div>`);
   }
   if (c?.err) {
     rows.push(`<div class="claim-unknown">
       <span class="aq-err" title="${esc(c.err)}">${esc(c.err)}</span>
       <button class="btn-ghost" click="actions.refreshClaimOne('${id}')"
-        ${refreshClaim.running || claimAllRunning || autoClaimRunning || claimPending() ? "disabled" : ""}>${esc(t("m.refreshClaimRetry"))}</button>
+        ${claimFlow.busy(id) ? "disabled" : ""}>${esc(t("m.refreshClaimRetry"))}</button>
     </div>`);
   }
   if (!plan) return rows.join("");
@@ -942,7 +960,7 @@ function claimStripHtml(id) {
     ${live ? `<span class="claim-badge">${esc(t("m.claimLiveBadge"))}</span>` : ""}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning || claimPending() || unknown ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || claimActive || claimPending() || unknown || queued ? "disabled" : ""}>${ic("gift", 13)} ${t(queued === "running" ? "m.claimInProgress" : queued === "queued" ? "m.claimQueued" : "btn.claim")}</button>
   </div>`);
   return rows.join("");
 }
@@ -961,13 +979,24 @@ function liveClaimSlotHtml() {
 
 function slotRowsHtml(items) {
   const list = items || [];
-  const isWin = (it) => itemKind(it) !== "raw";
+  const isWin = (it) => Boolean(it.window) || itemKind(it) !== "raw";
   const wins = list.filter(isWin);
   const pools = list.filter(it => !isWin(it)).sort((a, b) => (b.total || 0) - (a.total || 0));
   return [
     ...wins.map((it) => winRowHtml(it, " mini")),
     ...pools.map(balRowHtml),
   ].join("");
+}
+
+function planExpired(plan) {
+  if (Number.isFinite(plan?.ends_at)) return plan.ends_at <= Date.now();
+  const s = plan?.expire;
+  if (typeof s !== "string" || !s) return false;
+  let value = s;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) value = `${s}T23:59:59.999`;
+  else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) value = `${s.replace(" ", "T")}:59.999`;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) && ms <= Date.now();
 }
 
 function expireInfo(s) {
@@ -980,17 +1009,48 @@ function expireInfo(s) {
   return { text: soon && hasTime ? s : s.slice(0, 10), soon, warn };
 }
 
+function planStartInfo(ms) {
+  if (!Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return null;
+  const pad = n => String(n).padStart(2, "0");
+  return {
+    text: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    pending: ms > Date.now(),
+  };
+}
+
+function planStartLabels(p) {
+  if (Array.isArray(p.entitlement_starts)) {
+    const entries = p.entitlement_starts.length ? p.entitlement_starts : [{}];
+    return entries.map(entry => {
+      const start = planStartInfo(entry?.effective_at);
+      const label = start ? t(start.pending ? "q.startsAt" : "q.startTime", { time: start.text })
+        : t("q.startUnknown");
+      return { label, detail: entry?.name ? `${entry.name} · ${label}` : label };
+    });
+  }
+  const start = planStartInfo(p.starts_at);
+  const label = start ? t(p.pending && !start.pending ? "q.pendingStartTime"
+    : start.pending ? "q.startsAt" : "q.startTime", { time: start.text })
+    : p.pending ? t("q.pendingNoTime") : null;
+  return label ? [{ label, detail: label }] : [];
+}
+
 function planGroupHtml(p) {
   const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
   const exp = expireInfo(p.expire);
+  const starts = planStartLabels(p);
   return `
   <div class="plan-grp">
     <div class="pg-head">
       ${p.tier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
       ${p.scope_label ? `<span class="pg-scope">${esc(p.scope_label)}</span>` : ""}
+      ${starts.length ? `<span class="pg-start" title="${esc(starts[0].detail)}" aria-label="${esc(starts[0].detail)}">${esc(starts[0].label)}</span>` : ""}
       ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
+    ${starts.length > 1 ? starts.map(start => `<div class="pg-start-more">${esc(start.detail)}</div>`).join("") : ""}
     ${slotRowsHtml(p.items)}
   </div>`;
 }
@@ -1002,17 +1062,19 @@ function acctQuotaSlot(id) {
   let inner = "";
   if (q?.busy) messages.push(`<span class="aq-loading">${t("q.loading")}</span>`);
   if (q?.data) {
-    const plans = q.data.plans || [];
-    inner = plans.length ? plans.map(planGroupHtml).join("") : slotRowsHtml(q.data.items);
+    const allPlans = q.data.plans || [];
+    const plans = allPlans.filter(p => !planExpired(p));
+    inner = allPlans.length ? plans.map(planGroupHtml).join("") : slotRowsHtml(q.data.items);
     if (q.data.completion === "complete" && q.data.is_empty) messages.push(`<span class="aq-status">${t("q.noPlan")}</span>`);
+    else if (q.data.completion === "complete" && allPlans.length && !plans.length) messages.push(`<span class="aq-status">${t("q.noValidPlan")}</span>`);
     if (q.data.completion === "partial") {
       messages.push(`<span class="aq-err">${esc(t("q.partial"))} · ${esc(quotaErrors(q.data))}</span>`);
     }
   }
   if (q?.err) messages.push(`<span class="aq-err" title="${esc(q.err)}">${esc(q.err)}</span>`);
-  if (q?.data?.refreshed_at) {
+  if (q?.err && q?.data?.refreshed_at) {
     const time = new Date(q.data.refreshed_at).toLocaleString(localeTag());
-    messages.push(`<span class="aq-status">${esc(t(q.err ? "q.staleAt" : "q.updatedAt", { time }))}</span>`);
+    messages.push(`<span class="aq-status">${esc(t("q.staleAt", { time }))}</span>`);
   }
   inner += messages.length ? `<div class="aq-status-list">${messages.join("")}</div>` : "";
   if (!strip && !inner) return `<div class="row-quota-slot"></div>`;
@@ -1037,10 +1099,27 @@ function restoreScroll(cap) {
   const row = list.querySelector(`.row[data-id="${CSS.escape(cap.id)}"]`);
   if (row) {
     const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
-    list.scrollTop = delta - cap.offset;
+    list.scrollTop += delta - cap.offset;
   } else {
     list.scrollTop = cap.scrollTop;
   }
+}
+
+function updateApp(html) {
+  const list = $app.querySelector(":scope > .list");
+  if (!list) {
+    $app.innerHTML = html;
+    return;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  for (const selector of [".topbar", ".toolbar", ".section-head"]) {
+    const oldPart = $app.querySelector(`:scope > ${selector}`);
+    const newPart = template.content.querySelector(selector);
+    if (oldPart && newPart && oldPart.outerHTML !== newPart.outerHTML) oldPart.replaceWith(newPart);
+  }
+  const nextList = template.content.querySelector(".list");
+  if (nextList && list.innerHTML !== nextList.innerHTML) list.innerHTML = nextList.innerHTML;
 }
 
 function render() {
@@ -1066,9 +1145,9 @@ function render() {
       <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <input class="rename-input" value="${esc(a.name)}" maxlength="40"
-            keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
-          <div class="row-meta">${channelBadge(a.identity?.provider)}<span class="row-meta-text">${t("btn.renameMeta")}</span></div>
+          <div class="row-name"><span class="row-name-ident"><input class="rename-input" value="${esc(a.name)}" maxlength="40"
+            keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">${channelBadge(a.identity?.provider)}</span></div>
+          <div class="row-meta"><span class="row-meta-text">${t("btn.renameMeta")}</span></div>
         </div>
         <div class="row-actions">
           <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
@@ -1080,20 +1159,22 @@ function render() {
     const q = acctQuota[a.id];
     let meta = "";
     if (!a.has_config) meta += `<span class="no-cfg">${t("q.noCfg")}</span>`;
-    const exp = expireInfo(q?.data?.plan_expire);
+    const exp = planExpired({ expire: q?.data?.plan_expire }) ? null : expireInfo(q?.data?.plan_expire);
     if (exp) {
         meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
     }
     if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
+    const claimQueryBusy = Boolean(claimable[a.id]?.busy);
     return `
     <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
       <div class="row-top">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
-          <div class="row-meta">${channelBadge(a.identity?.provider)}${meta ? `<span class="row-meta-text">${meta}</span>` : ""}</div>
+          <div class="row-name"><span class="row-name-ident"><span class="row-name-text" title="${esc(a.name)}">${esc(a.name)}</span>${channelBadge(a.identity?.provider)}</span>${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
+          <div class="row-meta">${meta ? `<span class="row-meta-text">${meta}</span>` : ""}</div>
         </div>
         <div class="row-actions">
+          <button class="icon-btn${claimQueryBusy ? " is-checking" : ""}" title="${esc(t(claimQueryBusy ? "btn.checkEligibilityBusy" : "btn.checkEligibilityTitle"))}" aria-label="${esc(t("btn.checkEligibility"))}" aria-busy="${claimQueryBusy}" click="actions.refreshClaimOne('${a.id}')" ${claimQueryBusy ? "disabled" : ""}>${ic(claimQueryBusy ? "refresh" : "giftSearch", 16)}</button>
           <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
@@ -1117,7 +1198,7 @@ function render() {
 
   const claimableCount = s.accounts.filter((a) => !unknownClaimFor(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
 
-  $app.innerHTML = `
+  updateApp(`
     <header class="topbar">
       <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}</div>
       <div class="top-status${unsaved ? " unsaved" : ""}">
@@ -1132,12 +1213,12 @@ function render() {
         ${ic("capture", 16)} ${t("btn.saveLogin")}
       </button>
       ${claimableCount > 0
-        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning || claimPending() ? "disabled" : ""}
+        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || claimActive || claimQueue.activeId() || claimPending() ? "disabled" : ""}
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
       ${(s.accounts.length > 0 || s.live_logged_in)
         ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
-            ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
+            ${refreshClaim.running || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
             title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
               ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
               : esc(t("btn.refreshClaimTitle"))}">
@@ -1146,7 +1227,7 @@ function render() {
               : esc(t("btn.refreshClaim"))}
           </button>`
         : ""}
-      <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
+      <button class="tog-inline${s.auto_claim ? " on" : ""}${autoScanRunning || autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
         title="${autoPillTitle(s)}"
         click="actions.toggleAutoClaim()">
@@ -1169,7 +1250,7 @@ function render() {
     </div>
 
     <main class="list">${listHtml}</main>
-  `;
+  `);
   restoreScroll(scrollCap);
 }
 
@@ -1196,7 +1277,9 @@ listen("claim://cancelled", (ev) => {
   if (!claimId) return;
   const result = cancelAttempt(claimAttempts, claimId);
   if (result.status !== "accepted") return;
+  if (result.refresh) claimQueue.record({ id: result.attempt.accountId, revision: result.attempt.revision, planId: result.attempt.planId }, { status: "cancelled" });
   finishWaiter(claimAttempts, claimId, result.payload);
+  claimQueue.kick();
   if (!uiLocked()) render();
 });
 
@@ -1206,9 +1289,11 @@ listen("captcha://setup-failed", (ev) => {
   const attempt = claimAttempts.attempts.get(claimId);
   if (!attempt || attempt.mode === "manual") return;
   invoke("claim_cancel", { claimId }).catch(() => {});
-  autoClaimCooldown[attempt.accountId] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+  if (claimAttempts.accounts[attempt.accountId]?.epoch === attempt.epoch) {
+    claimQueue.record({ id: attempt.accountId, revision: attempt.revision, planId: attempt.planId }, { status: "failed" });
+  }
   closeWaiter(claimAttempts, claimId);
-  toast(t("m.claimSetupFailed", { name: accountName(attempt.accountId) }), "warn", t("m.claimSetupFailedDetail"));
+  toast(t("m.claimSetupFailed", { name: claimDisplayName(attempt.accountId) }), "warn", t("m.claimSetupFailedDetail"));
 });
 
 listen("captcha://interactive", (ev) => {
@@ -1217,8 +1302,10 @@ listen("captcha://interactive", (ev) => {
   const attempt = claimAttempts.attempts.get(claimId);
   if (!attempt || attempt.mode !== "auto") return;
   invoke("claim_cancel", { claimId }).catch(() => {});
-  autoClaimCooldown[attempt.accountId] = Date.now() + 60 * 60 * 1000;
-  toast(t("m.autoClaimInteractive", { name: accountName(attempt.accountId) }), "warn", t("m.autoClaimInteractiveDetail"));
+  if (claimAttempts.accounts[attempt.accountId]?.epoch === attempt.epoch) {
+    claimQueue.record({ id: attempt.accountId, revision: attempt.revision, planId: attempt.planId }, { status: "failed", cooldownUntil: Date.now() + 60 * 60 * 1000 });
+  }
+  toast(t("m.autoClaimInteractive", { name: claimDisplayName(attempt.accountId) }), "warn", t("m.autoClaimInteractiveDetail"));
   closeWaiter(claimAttempts, claimId);
 });
 
@@ -1266,6 +1353,7 @@ function sweepTick() {
     recoverClaimSessions().then(() => { if (!uiLocked()) render(); });
     setInterval(() => {
       refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
+      reconcileClaims().catch(() => {});
     }, 5000);
     setInterval(sweepTick, SWEEP_TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);

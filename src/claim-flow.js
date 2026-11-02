@@ -35,6 +35,7 @@ export function createClaimFlow({
   queue = createRequestQueue(3),
   errorText = (error) => String(error),
   onChange = () => {},
+  onResult = () => {},
   refreshState = async () => {},
   isLive = () => false,
 }) {
@@ -101,6 +102,8 @@ export function createClaimFlow({
       const accepted = settled !== model;
       setModel(settled);
       if (!accepted) return { status: "skipped" };
+      // Publish without awaiting the consumer: claiming must not hold a scan slot.
+      onResult({ id: ticket.id, revision: ticket.revision, plans: response.plans || [], kind: ticket.kind });
       return {
         status: "ok",
         plans: response.plans || [],

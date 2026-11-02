@@ -28,7 +28,13 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.paths.home);
+        if let (Ok(temp), Ok(home)) = (fs::canonicalize(std::env::temp_dir()), fs::canonicalize(&self.paths.home)) {
+            if home.parent() == Some(temp.as_path())
+                && home.file_name().is_some_and(|name| name.to_string_lossy().starts_with("zcode-quota-test-"))
+            {
+                let _ = fs::remove_dir_all(home);
+            }
+        }
     }
 }
 
@@ -92,6 +98,58 @@ fn claim_revision_check_detects_updates_and_deletion() {
     delete_account(paths, "account-a").unwrap();
     assert!(!claim_revision_matches(paths, "account-a", &snapshot.revision));
     expect_scope_changed(claim_snapshot_locked(paths, "account-a", Some(&snapshot.revision)));
+}
+
+#[test]
+fn hot_switch_preserves_native_device_state_and_saved_claim_device() {
+    let fixture = Fixture::new();
+    let paths = &fixture.paths;
+    let telemetry_before = fs::read(paths.live_telemetry()).unwrap();
+    let target = read_quota_account(paths, "account-a").unwrap();
+
+    // Simulate the process check only; every file operation stays in the fixture.
+    let switched = switch_to_with_process_check(paths, "account-a", false, false, true, || true).unwrap();
+    assert!(switched.switched && switched.hot);
+    assert_eq!(fs::read(paths.live_telemetry()).unwrap(), telemetry_before);
+    assert_eq!(read_live(paths).unwrap().unwrap(), target.credentials);
+    assert_eq!(read_quota_account(paths, "account-a").unwrap().virtual_device_mid, target.virtual_device_mid);
+}
+
+#[test]
+fn expired_target_is_rejected_before_process_check_or_file_changes() {
+    let fixture = Fixture::new();
+    let paths = &fixture.paths;
+    let mut target = read_quota_account(paths, "account-a").unwrap();
+    target.credentials["zcodejwttoken"] = json!(crate::test_support::jwt(json!({"id":"zcode-a", "exp":1})));
+    save_account(paths, &target).unwrap();
+    let before = contents(&paths.home);
+
+    let result = switch_to_with_process_check(paths, "account-a", true, false, true, || {
+        panic!("an expired target must not reach process handling")
+    });
+    assert!(result.is_err());
+    assert_eq!(contents(&paths.home), before);
+}
+
+#[test]
+fn adding_an_existing_account_updates_its_expired_login_but_preserves_claim_device() {
+    let fixture = Fixture::new();
+    let paths = &fixture.paths;
+    let mut old = account("renew", "bigmodel");
+    old.credentials["zcodejwttoken"] = json!(crate::test_support::jwt(json!({"id":"zcode-renew", "exp":1})));
+    save_account(paths, &old).unwrap();
+    let fresh_jwt = crate::test_support::jwt(json!({"id":"zcode-renew", "exp":4102444800_i64}));
+    let raw = json!({"data":{"token":fresh_jwt, "user":{"user_id":"zcode-renew"}}});
+    *crate::pending_oauth_guard() = Some(crate::PendingOAuth {
+        provider: "bigmodel".into(), state: "synthetic-state".into(), flow: "synthetic-flow".into(),
+    });
+
+    let result = crate::persist_oauth_account(paths, "bigmodel", &raw, "synthetic-flow", "new-oauth-mid", true).unwrap();
+    assert_eq!(result["duplicate"], true);
+    let updated = read_quota_account(paths, "account-renew").unwrap();
+    assert_eq!(updated.credentials["zcodejwttoken"], fresh_jwt);
+    assert_eq!(updated.virtual_device_mid, old.virtual_device_mid);
+    assert_eq!(list_accounts(paths).unwrap().len(), 2);
 }
 
 #[test]

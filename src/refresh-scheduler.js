@@ -74,13 +74,14 @@ export function createQuotaScheduler({
     const seen = new Set(live.map((a) => a.id));
     for (const id of [...due.keys()]) if (!seen.has(id)) { due.delete(id); stamps.delete(id); }
     for (const id of [...inFlight.keys()]) if (!seen.has(id)) cancel(id);
+    const previousEntries = model.entries;
     setModel(syncQuotaAccounts(model, live));
     for (const account of live) {
       if (!due.has(account.id)) {
         setDue(account.id, now());
         continue;
       }
-      const entry = model.entries[account.id];
+      const entry = previousEntries[account.id];
       const pending = inFlight.get(account.id);
       if (pending && pending.ticket.revision !== account.quota_revision) {
         cancel(account.id);

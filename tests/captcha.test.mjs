@@ -23,7 +23,7 @@ function config(overrides = {}) {
   return { enabled: true, region: "cn", prefix: "synthetic", scene_id: "scene-1", ...overrides };
 }
 
-function harness({ status = { status: "verifying" }, configResult = config(), sdk, init, timers = fakeTimers() } = {}) {
+function harness({ status = { status: "verifying" }, configResult = config(), sdk, init, auto = false, timers = fakeTimers() } = {}) {
   const calls = [];
   const order = [];
   const phases = [];
@@ -47,6 +47,7 @@ function harness({ status = { status: "verifying" }, configResult = config(), sd
   const flow = createCaptchaFlow({
     invoke,
     claimId: "claim-1",
+    auto,
     loadSdk: () => {
       order.push("sdk");
       return sdkGate ? sdkGate() : Promise.resolve();
@@ -156,6 +157,42 @@ test("an interactive challenge is separated from a setup failure", async () => {
   assert.equal(h.flow.phase(), "interactive");
   assert.deepEqual(h.interactive, ["traceless"]);
   assert.equal(h.flow.canRetry(), false, "interactive must not offer a setup retry");
+});
+
+test("automatic verification blocks success callbacks as soon as interaction is required", async () => {
+  let callbacks;
+  const h = harness({ auto: true, init: (options) => { callbacks = options; } });
+  await h.flow.start();
+  callbacks.fail("interactive");
+  await callbacks.success("late-param");
+  assert.deepEqual(h.interactive, ["interactive"]);
+  assert.equal(h.submits.length, 0);
+  assert.equal(h.flow.phase(), "interactive");
+});
+
+test("manual interactive verification can still submit", async () => {
+  let callbacks;
+  const h = harness({ init: (options) => { callbacks = options; } });
+  await h.flow.start();
+  callbacks.fail("interactive");
+  await callbacks.success("manual-param");
+  assert.equal(h.submits.length, 1);
+  assert.equal(h.flow.phase(), "succeeded");
+});
+
+test("a synchronous verification success cannot later become interactive", async () => {
+  const h = harness({
+    auto: true,
+    init: (options) => options.onInstance({
+      startTracelessVerification() { void options.success("immediate-param"); },
+    }),
+  });
+  await h.flow.start();
+  await tick();
+  h.timers.fireAll();
+  assert.equal(h.submits.length, 1);
+  assert.deepEqual(h.interactive, []);
+  assert.equal(h.flow.phase(), "succeeded");
 });
 
 test("a config failure is reported as a setup failure", async () => {

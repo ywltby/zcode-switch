@@ -9,6 +9,7 @@ export const TRACELESS_TIMEOUT_MS = 8_000;
 export function createCaptchaFlow({
   invoke,
   claimId,
+  auto = false,
   loadSdk,
   initCaptcha,
   applyConfig = () => {},
@@ -98,9 +99,12 @@ export function createCaptchaFlow({
     };
 
     const interactive = (why) => {
-      if (gen !== generation) return;
+      if (gen !== generation || submitted) return;
       clearInit();
       clearTimer(tracelessTimer);
+      // Stop auto callbacks before the asynchronous parent-window cancellation.
+      // Manual challenges must remain able to submit after user interaction.
+      if (auto) generation += 1;
       setPhase("interactive");
       onInteractive(why);
     };
@@ -136,8 +140,8 @@ export function createCaptchaFlow({
           if (gen !== generation) return;
           clearInit();
           if (instance && typeof instance.startTracelessVerification === "function") {
-            instance.startTracelessVerification();
             tracelessTimer = setTimer(() => interactive("traceless"), TRACELESS_TIMEOUT_MS);
+            instance.startTracelessVerification();
           } else {
             interactive();
           }

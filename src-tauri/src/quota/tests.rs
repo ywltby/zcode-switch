@@ -218,6 +218,209 @@ fn balance_same_product_different_periods_attach_to_their_entitlement() {
 }
 
 #[test]
+fn balance_preserves_each_plan_start_time_for_display() {
+    let result = normalize_balance(&json!({"code":0,"data":{
+        "server_time":1800000000,
+        "plans":[
+            {"plan_id":"start","subscription_id":"current","status":"active","starts_at":1799990000,"ends_at":1900000000},
+            {"plan_id":"start","subscription_id":"next","status":"active","starts_at":1800086400,"ends_at":1900000000}
+        ],
+        "balances":[]
+    }}));
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["plans"][0]["starts_at"], json!(1799990000000_i64));
+    assert_eq!(json["plans"][1]["starts_at"], json!(1800086400000_i64));
+}
+
+#[test]
+fn start_plan_uses_each_entitlement_effective_time_instead_of_claim_time() {
+    let result = normalize_balance(&json!({"code":0,"data":{
+        "server_time":1793111645,
+        "plans":[{"plan_id":"start","status":"active","starts_at":1793099353,"ends_at":1793149200,
+            "entitlements":[
+                {"entitlement_id":"first","show_name":"GLM-5.3-Flash","effective_at":1793113200},
+                {"entitlement_id":"second","show_name":"Other model","effective_at":1793116800000_i64},
+                {"entitlement_id":"third","show_name":"Unknown time"}
+            ]},
+            {"plan_id":"start","subscription_id":"empty","status":"active","starts_at":1793099353,"ends_at":1793149200}
+        ],"balances":[]
+    }}));
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["plans"][0]["starts_at"], json!(1793099353000_i64), "plan time is retained as metadata");
+    assert_eq!(json["plans"][0]["entitlement_starts"], json!([
+        {"name":"GLM-5.3-Flash","effective_at":1793113200000_i64},
+        {"name":"Other model","effective_at":1793116800000_i64},
+        {"name":"Unknown time","effective_at":null}
+    ]));
+    assert_eq!(json["plans"][1]["entitlement_starts"], json!([]), "do not infer a missing activation time");
+}
+
+#[test]
+fn merged_plan_uses_the_latest_entitlement_schedule_even_if_older_quota_is_more_complete() {
+    let ctx = resolve_account_context(&account("a", "zai"), SECRET, "3.16.3").unwrap();
+    let make = |effective: i64, balances: Value, at: i64| {
+        let mut value = normalize_balance(&json!({"code":0,"data":{"server_time":1793111645,
+            "plans":[{"plan_id":"start","subscription_id":"same","status":"active",
+                "starts_at":1793099353,"ends_at":1793149200,
+                "entitlements":[{"show_name":"GLM","effective_at":effective}]}],"balances":balances}}));
+        value.refreshed_at = at;
+        ScopedPart { account:ctx.scope.clone(), plan:PlanScope::Start, value }
+    };
+    let older = make(1793113200, json!([{"plan_id":"start","subscription_id":"same",
+        "name":"credits","total_units":100,"used_units":20,"remaining_units":80}]), 100);
+    let newer = make(1793116800, json!([]), 200);
+    let result = serde_json::to_value(merge_scoped(&ctx, vec![older, newer], vec![])).unwrap();
+    assert_eq!(result["plans"][0]["entitlement_starts"][0]["effective_at"], json!(1793116800000_i64));
+    assert_eq!(result["plans"][0]["items"].as_array().unwrap().len(), 1);
+
+    let older = make(1793113200, json!([]), 100);
+    let mut missing = normalize_balance(&json!({"code":0,"data":{"server_time":1793111645,
+        "plans":[{"plan_id":"start","subscription_id":"same","status":"active",
+            "starts_at":1793099353,"ends_at":1793149200}],"balances":[]}}));
+    missing.refreshed_at = 200;
+    let newer = ScopedPart {account:ctx.scope.clone(), plan:PlanScope::Start, value:missing};
+    let result = serde_json::to_value(merge_scoped(&ctx, vec![older, newer], vec![])).unwrap();
+    assert_eq!(result["plans"][0]["entitlement_starts"], json!([]), "do not reuse an obsolete start time");
+}
+
+#[test]
+fn start_time_supports_seconds_milliseconds_and_iso_without_guessing_invalid_values() {
+    for (value, expected) in [
+        (json!(1800086400_i64), json!(1800086400000_i64)),
+        (json!(1800086400000_i64), json!(1800086400000_i64)),
+        (json!("1800086400"), json!(1800086400000_i64)),
+        (json!("2030-01-02T01:00:00Z"), json!(1893546000000_i64)),
+        (json!("not-a-date"), serde_json::Value::Null),
+        (serde_json::Value::Null, serde_json::Value::Null),
+    ] {
+        let result = normalize_balance(&json!({"code":0,"data":{
+            "server_time":1800000000,
+            "plans":[{"plan_id":"start","status":"active","starts_at":value,"ends_at":2000000000}],
+            "balances":[]
+        }}));
+        assert_eq!(serde_json::to_value(&result).unwrap()["plans"][0]["starts_at"], expected);
+    }
+}
+
+#[test]
+fn start_time_survives_coding_plan_and_team_fallback() {
+    let ctx = resolve_account_context(&account("a", "zai"), SECRET, "3.16.3").unwrap();
+    for missing_team_key in [false, true] {
+        let result = query_context_via(&ctx, &|req: Request| {
+            if missing_team_key && req.url.ends_with("api_keys") && req.url.contains("team-") {
+                return Ok(json!({"code":0,"data":[]}));
+            }
+            let mut response = crate::test_support::quota_response(&req);
+            if req.url.ends_with("querySubscribeDetail") {
+                response["data"]["subscribeStartTime"] = json!(1800086400000_i64);
+            }
+            if req.url.ends_with("subscription/list") {
+                response["data"][0]["subscribeStartTime"] = json!(1800086400_i64);
+            }
+            Ok(response)
+        });
+        let json = serde_json::to_value(&result).unwrap();
+        let plans = json["plans"].as_array().unwrap();
+        let coding: Vec<_> = plans.iter().filter(|p| p["tier_code"] == "pro").collect();
+        assert_eq!(coding.len(), 3);
+        assert!(coding.iter().all(|p| p["starts_at"] == json!(1800086400000_i64)));
+    }
+}
+
+#[test]
+fn coding_plan_valid_range_preserves_both_local_times() {
+    use chrono::{NaiveDateTime, TimeZone};
+    let sub = json!({"productId":"coding-pro","productName":"Coding Pro",
+        "status":"VALID","inCurrentPeriod":true,
+        "valid":"2030-01-02 09:30:15-2030-01-05 12:00:00"});
+    let expected = |text: &str| chrono::Local.from_local_datetime(
+        &NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap()).single().unwrap().timestamp_millis();
+    let slot = subscription_slot(&sub);
+    assert_eq!(slot.starts_at, Some(expected("2030-01-02 09:30:15")));
+    assert_eq!(slot.ends_at, Some(expected("2030-01-05 12:00:00")));
+    let q = normalize_quota_limit(&json!({"code":0,"data":{"level":"Pro","limits":[]}}),
+        Some(&json!({"code":0,"data":[sub]})));
+    assert_eq!(q.plans[0].starts_at, Some(expected("2030-01-02 09:30:15")));
+    assert_eq!(q.plans[0].ends_at, Some(expected("2030-01-05 12:00:00")));
+    assert_eq!(subscription_slot(&json!({"valid":"2030-01-05"})).starts_at, None,
+        "an end date on its own is not a start time");
+}
+
+#[test]
+fn personal_subscriptions_keep_valid_noncurrent_plans_until_they_expire() {
+    let now = chrono::Local::now();
+    let range = |start: chrono::DateTime<chrono::Local>, end: chrono::DateTime<chrono::Local>| {
+        format!("{}-{}", start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"))
+    };
+    let valid_future = range(now + chrono::Duration::days(1), now + chrono::Duration::days(3));
+    let valid_waiting = range(now - chrono::Duration::hours(1), now + chrono::Duration::days(2));
+    let expired = range(now - chrono::Duration::days(3), now - chrono::Duration::days(1));
+    let expired_day = (now - chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
+    let raw = json!({"code":0,"data":[
+        {"productId":"coding-current","status":"VALID","inCurrentPeriod":true},
+        {"productId":"coding-next","status":"VALID","inCurrentPeriod":false,"valid":valid_future},
+        {"productId":"coding-waiting","status":"VALID","inCurrentPeriod":false,"valid":valid_waiting},
+        {"productId":"coding-unknown-end","status":"VALID","inCurrentPeriod":false},
+        {"productId":"coding-expired","status":"VALID","inCurrentPeriod":false,"valid":expired},
+        {"productId":"coding-expired-day","status":"VALID","inCurrentPeriod":false,"valid":expired_day},
+        {"productId":"coding-cancelled","status":"CANCELLED","inCurrentPeriod":false,"valid":valid_future}
+    ]});
+    let (kept, malformed) = personal_subscriptions(&raw).unwrap();
+    assert!(!malformed);
+    assert_eq!(kept.len(), 4);
+    assert_eq!(kept[1]["productId"], "coding-next");
+    assert_eq!(kept[2]["productId"], "coding-waiting");
+    assert_eq!(kept[3]["productId"], "coding-unknown-end");
+    assert_eq!(serde_json::to_value(subscription_slot(&kept[1])).unwrap()["pending"], true);
+    assert_eq!(serde_json::to_value(subscription_slot(&kept[2])).unwrap()["pending"], true);
+}
+
+#[test]
+fn full_query_keeps_the_future_coding_plan_without_copying_current_usage_into_it() {
+    let ctx = resolve_account_context(&account("a", "zai"), SECRET, "3.16.3").unwrap();
+    let now = chrono::Local::now();
+    let valid = format!("{}-{}", (now + chrono::Duration::days(1)).format("%Y-%m-%d %H:%M:%S"),
+        (now + chrono::Duration::days(3)).format("%Y-%m-%d %H:%M:%S"));
+    let result = query_context_via(&ctx, &|req: Request| {
+        let mut response = crate::test_support::quota_response(&req);
+        if req.url.ends_with("subscription/list") {
+            response["data"].as_array_mut().unwrap().push(json!({
+                "productId":"coding-next", "productName":"Coding Pro next",
+                "subscriptionId":"next-sub", "status":"VALID", "inCurrentPeriod":false, "valid":valid
+            }));
+        }
+        Ok(response)
+    });
+    assert_eq!(result.completion, "complete");
+    let pending = result.plans.iter().find(|p| p.entitlement_id.as_deref() == Some("next-sub")).unwrap();
+    assert!(pending.pending);
+    assert!(pending.starts_at.is_some() && pending.ends_at.is_some());
+    assert!(pending.items.is_empty(), "current project usage must not be duplicated into a future plan");
+}
+
+#[test]
+fn expired_plans_are_hidden_but_future_plans_survive_mixed_time_units() {
+    for (now, expired_end, current_end, future_end) in [
+        (json!(1800000000_i64), json!(1799999999000_i64), json!(1800100000000_i64), json!(1800200000000_i64)),
+        (json!(1800000000000_i64), json!(1799999999_i64), json!(1800100000_i64), json!(1800200000_i64)),
+    ] {
+        let result = normalize_balance(&json!({"code":0,"data":{
+            "server_time":now,
+            "plans":[
+                {"plan_id":"start","subscription_id":"expired","status":"active","starts_at":1790000000,"ends_at":expired_end},
+                {"plan_id":"start","subscription_id":"current","status":"active","starts_at":1790000000,"ends_at":current_end},
+                {"plan_id":"start","subscription_id":"future","status":"active","starts_at":1800050000,"ends_at":future_end}
+            ],
+            "balances":[]
+        }}));
+        assert_eq!(result.plans.len(), 2);
+        assert_eq!(result.plans[0].entitlement_id.as_deref(), Some("current"));
+        assert_eq!(result.plans[1].entitlement_id.as_deref(), Some("future"));
+        assert_eq!(serde_json::to_value(&result).unwrap()["plans"][1]["ends_at"], json!(1800200000000_i64));
+    }
+}
+
+#[test]
 fn full_query_keeps_two_team_projects_and_uses_scoped_project_tokens() {
     let a = account("a", "zai");
     let ctx = resolve_account_context(&a, SECRET, "3.16.3").unwrap();

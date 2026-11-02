@@ -73,6 +73,10 @@ MOCK = r"""
           emit({ ok: false, code: 1005, message: 'synthetic rejection' });
         } else if (args.id === 'account-5' && fixture.account5Starts++ === 0) {
           // First attempt: no event; the test closes the captcha window instead.
+        } else if (args.id === 'account-2') {
+          fixture.claimTime=Date.now()+3600000; fixture.effectiveTime=Date.now()+7200000;
+          emit({ok:true,startsAt:fixture.claimTime,serverTime:Date.now(),endsAt:null,
+            entitlementStarts:[{name:'Synthetic scheduled credits',effective_at:fixture.effectiveTime}]});
         } else {
           emit({ ok: true, startsAt: null, endsAt: null });
         }
@@ -133,8 +137,12 @@ def main():
         expect(row(7)).to_contain_text("重试本账号")
         elapsed = time.monotonic() - started
         assert elapsed < 5.0, f"batch refresh took {elapsed:.1f}s; the fixed per-account wait is still present"
+        page.wait_for_function("claimFixture.calls.filter(c => c.command === 'claim_refresh').length === 11", timeout=10000)
         assert page.evaluate("claimFixture.calls.filter(c => c.command === 'claim_refresh').length") == 11
         assert page.evaluate("claimFixture.calls.some(c => c.command === 'claim_captcha_submit')") is False
+
+        # One account has no plans and one failed: only nine are claimable.
+        expect(page.locator(".toast-zone")).to_contain_text("已刷新 11 个账号，9 个有可领套餐")
 
         # A single-account retry refreshes only that account and keeps the batch cooldown.
         expect(refresh_button).to_be_disabled()
@@ -153,19 +161,28 @@ def main():
         page.screenshot(path=str(output / "unconfirmed.png"), full_page=True)
 
         # Explicit retry requires confirmation, acknowledges the unknown, then opens one new claim.
+        old_retry_starts = page.evaluate("claimFixture.calls.filter(c => c.command === 'claim_start' && c.args.id === 'account-2').length")
         row(2).get_by_role("button", name="已核对，重新尝试").click()
         expect(page.get_by_role("alertdialog")).to_contain_text("仅这一次会新建领取会话")
         page.get_by_role("button", name="仅重试这次").click()
         expect(row(2)).not_to_contain_text("领取结果待确认", timeout=10000)
         assert "old-2" in page.evaluate("claimFixture.acknowledged")
-        new_ids = page.evaluate("claimFixture.claimIds")
-        assert len(new_ids) == 1 and new_ids[0] != "old-2", new_ids
+        retries = page.evaluate("claimFixture.calls.filter(c => c.command === 'claim_start' && c.args.id === 'account-2').map(c => c.args)")
+        assert len(retries) == old_retry_starts + 1 and retries[-1]['claimId'] != 'old-2', retries
+        assert retries[-1]['mode'] == 'manual', retries
+        toast = page.locator('.toast-zone .toast.ok').filter(has_text='Synthetic 2')
+        expect(toast).to_contain_text('Synthetic scheduled credits')
+        actual_time = page.evaluate("new Date(claimFixture.effectiveTime).toLocaleString('zh-CN', {hour12:false})")
+        claim_time = page.evaluate("new Date(claimFixture.claimTime).toLocaleString('zh-CN', {hour12:false})")
+        expect(toast).to_contain_text(actual_time)
+        expect(toast).not_to_contain_text(claim_time)
 
         # Closing the captcha window cancels the backend session; the row must not
         # wait for the frontend timeout when claim://cancelled arrives.
-        row(5).get_by_role("button", name="领取").click()
-        page.wait_for_function("claimFixture.claimIds.length === 2", timeout=10000)
-        cancelled_id = page.evaluate("claimFixture.claimIds[1]")
+        # Scanning already queued this account; wait for its turn rather than
+        # starting a second manual claim for the same queued plan.
+        page.wait_for_function("claimFixture.calls.some(c => c.command === 'claim_start' && c.args.id === 'account-5')", timeout=40000)
+        cancelled_id = page.evaluate("claimFixture.calls.find(c => c.command === 'claim_start' && c.args.id === 'account-5').args.claimId")
         page.evaluate(f"window.__emitToPage('claim://cancelled', {{ claimId: '{cancelled_id}' }})")
         expect(row(5).get_by_role("button", name="领取")).to_be_enabled(timeout=5000)
 

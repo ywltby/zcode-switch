@@ -259,6 +259,18 @@ fn merge_plans(incoming: Vec<ClaimPlan>, plans: &mut Vec<ClaimPlan>) {
     }
 }
 
+/// The campaign list can change between rendering the banner and the click, and a
+/// rate-limited read returns nothing at all. Either way the local list only supplies a
+/// display name: the server alone decides whether this identity may claim the plan now,
+/// so a missing entry must never be turned into a refusal.
+pub fn claim_display_name(plans: Result<Vec<ClaimPlan>, String>, plan_id: &str) -> String {
+    plans
+        .ok()
+        .and_then(|plans| plans.into_iter().find(|p| p.plan_id == plan_id))
+        .map(|plan| if plan.name.is_empty() { plan.plan_id } else { plan.name })
+        .unwrap_or_else(|| plan_id.to_string())
+}
+
 fn preview_url() -> String {
     format!(
         "{BILLING_PREVIEW_URL}?app_version={}&platform={}",

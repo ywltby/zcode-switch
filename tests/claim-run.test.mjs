@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as claimRun from "../src/claim-run.js";
 import {
   claimOutcomeOf,
   payloadFromStatus,
@@ -99,4 +100,54 @@ test("payload mapping distinguishes success, unconfirmed, and cancelled", () => 
   assert.equal(claimOutcomeOf(payloadFromStatus({ claimId: "c", status: "unknown" })).status, "unknown");
   assert.equal(claimOutcomeOf(payloadFromStatus({ claimId: "c", status: "cancelled" })).status, "cancelled");
   assert.equal(claimOutcomeOf(payloadFromStatus({ claimId: "c", status: "failed", result: { code: 1005 } })).status, "failed");
+});
+
+test("reconciliation consumes a lost terminal event after the UI wait ended", async () => {
+  const pending = { claimId: "late", done: true, handled: false };
+  const active = { claimId: "active", done: false, handled: false };
+  const finished = { claimId: "finished", done: true, handled: true };
+  const calls = [], handled = [];
+  await claimRun.reconcilePendingClaims({
+    attempts: [pending, active, finished],
+    invoke: async (command, args) => {
+      calls.push({ command, ...args });
+      return { claimId: args.claimId, accountId: "a", status: "succeeded", result: { ok: true } };
+    },
+    handleResult: payload => { pending.handled = true; handled.push(payload); },
+  });
+  assert.deepEqual(calls, [{ command: "claim_status", claimId: "late" }]);
+  assert.equal(handled.length, 1);
+  assert.equal(handled[0].ok, true);
+  assert.equal(pending.handled, true);
+});
+
+test("reconciliation keeps missing and still-submitting sessions blocked", async () => {
+  const attempts = ["missing", "network", "submitting"].map(claimId => ({ claimId, done: true, handled: false }));
+  const handled = [];
+  await claimRun.reconcilePendingClaims({
+    attempts,
+    invoke: async (_, { claimId }) => {
+      if (claimId === "network") throw new Error("offline");
+      return claimId === "missing" ? null : { claimId, status: "submitting" };
+    },
+    handleResult: payload => handled.push(payload),
+  });
+  assert.equal(handled.length, 0);
+  assert.ok(attempts.every(a => !a.handled));
+  assert.equal(attempts[2].confirming, true);
+  assert.equal(attempts[0].confirming, undefined);
+});
+
+test("reconciliation does not redeliver a result already received while polling", async () => {
+  const pending = { claimId: "late", confirming: true, handled: false };
+  const handled = [];
+  await claimRun.reconcilePendingClaims({
+    attempts: [pending],
+    invoke: async () => {
+      pending.handled = true;
+      return { claimId: "late", status: "cancelled" };
+    },
+    handleResult: payload => handled.push(payload),
+  });
+  assert.equal(handled.length, 0);
 });

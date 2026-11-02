@@ -259,11 +259,14 @@ input:focus-visible,
   font-weight: 600;
   color: var(--ink);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 7px;
+  gap: 4px 7px;
   white-space: nowrap;
   overflow: hidden;
 }
+.row-name-ident { display: inline-flex; align-items: center; gap: 7px; min-width: 0; max-width: 100%; }
+.row-name-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tag-use {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -303,7 +306,9 @@ input:focus-visible,
   padding: 1px 6px;
   border: 1px solid var(--hairline);
   border-radius: 4px;
+  font-family: var(--mono);
   font-size: 11.5px;
+  font-weight: 400;
   line-height: 1.6;
   letter-spacing: 0;
   white-space: nowrap;
@@ -341,6 +346,10 @@ input:focus-visible,
 }
 .icon-btn:hover { color: var(--ink); border-color: var(--hairline); background: var(--panel-2); }
 .icon-btn.danger:hover { color: var(--red); border-color: var(--red-dim); background: rgba(224, 82, 82, .08); }
+@keyframes eligibility-query-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: no-preference) {
+  .icon-btn.is-checking .ic { animation: eligibility-query-spin 1s linear infinite; }
+}
 
 .btn-switch {
   border: 1px solid var(--amber-deep);
@@ -359,6 +368,14 @@ input:focus-visible,
   border-color: var(--amber);
 }
 
+@media (max-width: 560px) {
+  .row-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; }
+  .row-top > .row-main { display: contents; }
+  .row-top > .row-main > .row-name { grid-column: 1 / -1; grid-row: 1; }
+  .row-top > .row-main > .row-meta { grid-column: 1; grid-row: 2; margin-top: 0; min-width: 0; }
+  .row-top > .row-actions { grid-column: 2; grid-row: 2; }
+}
+
 .row .rename-input {
   font-family: var(--body);
   font-size: 17px;
@@ -368,6 +385,7 @@ input:focus-visible,
   border: 1px solid var(--amber-deep);
   border-radius: 4px;
   padding: 2px 6px;
+  min-width: 0;
   width: 100%;
   max-width: 180px;
 }
@@ -635,13 +653,15 @@ input:focus-visible,
 .qbar { height: 19px; border-radius: 4px; background: #2b2e36; overflow: hidden; margin-top: 4px; position: relative; }
 .qbar-pct {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  padding: 0 5px;
-  border-radius: 3px;
-  background: #151a20;
-  color: #f7f9fc;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(to right,
+    #111214 0%, #111214 var(--quota-remaining),
+    #b8bec7 var(--quota-remaining), #b8bec7 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
   font-family: var(--mono);
   font-size: 12px;
   font-weight: 700;
@@ -651,7 +671,7 @@ input:focus-visible,
   white-space: nowrap;
   pointer-events: none;
 }
-.qbar-fill { height: 100%; background: var(--mint); border-radius: 3px; transition: width .3s ease; }
+.qbar-fill { width: var(--quota-remaining); height: 100%; background: var(--mint); border-radius: 3px; transition: width .3s ease; }
 .qbar.warn .qbar-fill { background: var(--amber); }
 .qbar.danger .qbar-fill { background: var(--red); }
 .q-line { font-size: 14px; color: var(--ink-mute); margin-top: 5px; }
@@ -698,7 +718,7 @@ input:focus-visible,
   gap: 4px;
 }
 .q-win.mini {
-  grid-template-columns: 52px 1fr 128px;
+  grid-template-columns: 72px minmax(0, 1fr) 128px;
   gap: 6px;
   margin-bottom: 0;
 }
@@ -806,7 +826,11 @@ input:focus-visible,
   text-overflow: ellipsis;
   min-width: 0;
 }
-.pg-exp { margin-left: auto; flex: none; font-family: var(--mono); font-size: 11.5px; color: var(--ink-mute); white-space: nowrap; }
+.pg-exp, .pg-start { font-family: var(--body); font-size: 11.5px; line-height: 1.4; white-space: nowrap; }
+.pg-exp { margin-left: auto; flex: none; color: var(--ink-mute); }
+.pg-start { margin-left: auto; flex: none; color: var(--amber); }
+.pg-start + .pg-exp { margin-left: 0; }
+.pg-start-more { margin-bottom: 3px; color: var(--amber); font-size: 11.5px; line-height: 1.4; overflow-wrap: anywhere; }
 
 .pw-mask {
   position: fixed;
@@ -1110,4 +1134,4 @@ input:focus-visible,
 .pv-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .aq-status-list { display: flex; flex-direction: column; gap: 4px; width: 100%; }
 .aq-status { font-size: 11px; opacity: .7; }
-.pg-scope { font-size: 11px; opacity: .65; overflow-wrap: anywhere; }
+.pg-scope { font-size: 11px; opacity: .65; min-width: 0; max-width: 7em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

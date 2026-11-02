@@ -277,6 +277,12 @@ pub struct QuotaItem {
     pub reset: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct EntitlementStart {
+    pub name: String,
+    pub effective_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct PlanSlot {
     #[serde(skip_serializing)]
@@ -293,6 +299,17 @@ pub struct PlanSlot {
     pub tier_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    // Unix milliseconds, so the UI can compare it with the current time and
+    // render in the user's local time zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<i64>,
+    pub pending: bool,
+    // Some (including an empty list) identifies Start Plan: its plan-level
+    // starts_at is not the activation time of its individual entitlements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entitlement_starts: Option<Vec<EntitlementStart>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expire: Option<String>,
     pub total: Option<f64>,
@@ -373,6 +390,11 @@ fn merge_scoped(
             if let Some(index) = duplicate {
                 let (_, old, time) = &mut groups[index];
                 let newer = part.value.refreshed_at >= *time;
+                let entitlement_starts = if newer {
+                    slot.entitlement_starts.clone().or_else(|| old.entitlement_starts.clone())
+                } else {
+                    old.entitlement_starts.clone().or_else(|| slot.entitlement_starts.clone())
+                };
                 let prefer = (slot_completeness(&slot), part.value.refreshed_at)
                     >= (slot_completeness(old), *time);
                 let mut windows = old.items.clone();
@@ -382,6 +404,7 @@ fn merge_scoped(
                     *time = part.value.refreshed_at;
                 }
                 old.items = windows;
+                old.entitlement_starts = entitlement_starts;
             } else {
                 groups.push((part.plan.clone(), slot, part.value.refreshed_at));
             }
@@ -436,7 +459,8 @@ fn item_completeness(item: &QuotaItem) -> usize {
 }
 
 fn slot_completeness(slot: &PlanSlot) -> usize {
-    slot.items.iter().map(item_completeness).sum::<usize>() + usize::from(slot.expire.is_some())
+    slot.items.iter().map(item_completeness).sum::<usize>()
+        + usize::from(slot.expire.is_some()) + usize::from(slot.starts_at.is_some())
 }
 
 // A complete window wins over an incomplete one; equally complete observations use
@@ -502,6 +526,73 @@ fn period_key(value: &Value) -> Option<String> {
     (start.is_some() || end.is_some()).then(|| serde_json::json!([start, end]).to_string())
 }
 
+pub(crate) fn timestamp_millis(raw: &Value) -> Option<i64> {
+    let number = raw.as_f64().or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
+    if let Some(n) = number.filter(|n| n.is_finite()) {
+        let ms = if n >= 1_000_000_000_000.0 { n }
+            else if n >= 1_000_000_000.0 { n * 1000.0 }
+            else { return None };
+        if ms > i64::MAX as f64 { return None; }
+        let ms = ms as i64;
+        return chrono::DateTime::from_timestamp_millis(ms).map(|_| ms);
+    }
+    raw.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|t| t.timestamp_millis())
+}
+
+pub(crate) fn entitlement_start_times(plan: &Value) -> Vec<EntitlementStart> {
+    let mut out = Vec::new();
+    for item in plan.get("entitlements").and_then(Value::as_array).into_iter().flatten() {
+        if !item.is_object() { continue; }
+        let start = EntitlementStart {
+            name: item.get("show_name").or_else(|| item.get("showName"))
+                .and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            effective_at: item.get("effective_at").or_else(|| item.get("effectiveAt"))
+                .and_then(timestamp_millis),
+        };
+        if !out.contains(&start) { out.push(start); }
+    }
+    out
+}
+
+fn extract_start_time(value: &Value) -> Option<i64> {
+    ["starts_at", "period_start", "startTime", "subscribeStartTime"]
+        .iter().find_map(|key| value.get(key).and_then(timestamp_millis))
+        .or_else(|| valid_range(value).map(|(start, _)| start))
+}
+
+fn extract_end_time(value: &Value) -> Option<i64> {
+    ["ends_at", "subscribeEndTime", "expireTime", "endTime", "expires_at", "period_end"]
+        .iter().find_map(|key| value.get(key).and_then(timestamp_millis))
+        .or_else(|| valid_range(value).map(|(_, end)| end))
+        .or_else(|| valid_end_date(value))
+}
+
+fn valid_end_date(value: &Value) -> Option<i64> {
+    use chrono::{NaiveDate, TimeZone};
+    let date = NaiveDate::parse_from_str(value.get("valid")?.as_str()?.trim(), "%Y-%m-%d").ok()?;
+    let end = date.and_hms_milli_opt(23, 59, 59, 999)?;
+    chrono::Local.from_local_datetime(&end).single().map(|t| t.timestamp_millis())
+}
+
+fn valid_range(value: &Value) -> Option<(i64, i64)> {
+    use chrono::{NaiveDateTime, TimeZone};
+    let text = value.get("valid")?.as_str()?.trim();
+    for (length, format) in [(19, "%Y-%m-%d %H:%M:%S"), (16, "%Y-%m-%d %H:%M")] {
+        let (Some(left), Some(rest)) = (text.get(..length), text.get(length..)) else { continue };
+        let Some(right) = rest.trim_start().strip_prefix('-').map(str::trim) else { continue };
+        let Ok(start) = NaiveDateTime::parse_from_str(left, format) else { continue };
+        for end_format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+            if let Ok(end) = NaiveDateTime::parse_from_str(right, end_format) {
+                let start = chrono::Local.from_local_datetime(&start).single()?.timestamp_millis();
+                let end = chrono::Local.from_local_datetime(&end).single()?.timestamp_millis();
+                return Some((start, end));
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn business_ok(v: &Value) -> bool {
     crate::quota_http::successful_data(v, false).is_ok()
 }
@@ -513,6 +604,11 @@ pub(crate) fn is_active_coding_plan_entry(s: &Value) -> bool {
             .is_some_and(|v| v.to_lowercase().contains("coding"))
     }) && s.get("status").and_then(Value::as_str) == Some("VALID")
         && s.get("inCurrentPeriod").and_then(Value::as_bool) == Some(true)
+}
+
+fn is_pending_coding_plan(s: &Value) -> bool {
+    s.get("status").and_then(Value::as_str) == Some("VALID")
+        && s.get("inCurrentPeriod").and_then(Value::as_bool) == Some(false)
 }
 
 pub(crate) fn unavailable(id: &str, revision: &str, code: QuotaError) -> QuotaOverview {
@@ -684,6 +780,8 @@ fn query_project(
         subscription_slot(&serde_json::json!({
             "productId":detail.get("productId"),"productName":detail.get("productName"),
             "subscriptionId":detail.get("subscriptionId"),"valid":detail.get("subscribeEndTime"),
+            "subscribeStartTime":detail.get("subscribeStartTime"),
+            "subscribeEndTime":detail.get("subscribeEndTime"),
         }))
     });
     let result = (|| {
@@ -693,6 +791,8 @@ fn query_project(
                 vec![serde_json::json!({
                     "productId":detail.get("productId"), "productName":detail.get("productName"),
                     "subscriptionId":detail.get("subscriptionId"), "valid":detail.get("subscribeEndTime"),
+                    "subscribeStartTime":detail.get("subscribeStartTime"),
+                    "subscribeEndTime":detail.get("subscribeEndTime"),
                     "status":"VALID", "inCurrentPeriod":true,
                 })],
                 false,
@@ -780,6 +880,9 @@ fn subscription_slot(value: &Value) -> PlanSlot {
             .into(),
         tier_code: tier.as_deref().map(tier_code_from_display),
         tier,
+        starts_at: extract_start_time(value),
+        ends_at: extract_end_time(value),
+        pending: is_pending_coding_plan(value),
         expire: extract_expire(value),
         ..Default::default()
     }
@@ -814,7 +917,9 @@ fn personal_subscriptions(raw: &Value) -> Result<(Vec<Value>, bool), QuotaError>
             malformed = true;
             continue;
         }
-        if is_active_coding_plan_entry(value) {
+        let unexpired_pending = is_pending_coding_plan(value)
+            && !extract_end_time(value).is_some_and(|end| end <= chrono::Utc::now().timestamp_millis());
+        if is_active_coding_plan_entry(value) || unexpired_pending {
             active.push(value.clone());
         }
     }
@@ -1142,6 +1247,9 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
     let level = data.get("level").and_then(|l| l.as_str()).map(String::from);
     let mut plan_tier = level.as_deref().map(tier_from_level);
     let mut plan_expire: Option<String> = None;
+    let mut plan_start: Option<i64> = None;
+    let mut plan_end: Option<i64> = None;
+    let mut plan_pending = false;
     let mut product_name: Option<String> = None;
     if let Some(sub) = sub_resp {
         if business_ok(sub) {
@@ -1158,6 +1266,9 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
                         }
                     }
                     plan_expire = extract_expire(s);
+                    plan_start = extract_start_time(s);
+                    plan_end = extract_end_time(s);
+                    plan_pending = is_pending_coding_plan(s);
                 }
             }
         }
@@ -1178,6 +1289,9 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             tier: plan_tier.clone(),
             tier_code: plan_tier.as_deref().map(tier_code_from_display),
             name: product_name,
+            starts_at: plan_start,
+            ends_at: plan_end,
+            pending: plan_pending,
             expire: plan_expire.clone(),
             total,
             used,
@@ -1299,11 +1413,8 @@ fn tier_rank(code: Option<&str>) -> u8 {
 
 fn normalize_balance(balance_data: &Value) -> QuotaOverview {
     let mut balance = unwrap(balance_data);
-    let now = balance
-        .get("server_time")
-        .and_then(to_number)
-        .filter(|n| n.is_finite() && *n >= 0.0)
-        .unwrap_or_else(|| chrono::Utc::now().timestamp() as f64);
+    let now = balance.get("server_time").and_then(timestamp_millis)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     let all_plans = balance
         .get("plans")
         .and_then(Value::as_array)
@@ -1313,10 +1424,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
         plan.get("status")
             .and_then(Value::as_str)
             .is_some_and(|s| s.trim().eq_ignore_ascii_case("expired"))
-            || plan
-                .get("ends_at")
-                .and_then(to_number)
-                .is_some_and(|end| end > 0.0 && end <= now)
+            || extract_end_time(plan).is_some_and(|end| end <= now)
     };
     // Filter buckets using their user-plan instance. A product ID is only a fallback
     // when it cannot select a different instance of the same product.
@@ -1360,6 +1468,9 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 pid,
                 tier: Some(tier),
                 tier_code: Some(tier_code),
+                starts_at: extract_start_time(plan),
+                ends_at: extract_end_time(plan),
+                entitlement_starts: Some(entitlement_start_times(plan)),
                 expire: extract_expire(plan),
                 ..Default::default()
             }

@@ -8,13 +8,13 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 
 ## Features
 
-- **Save / switch accounts**: one-click login switching; the current login is auto-preserved before any switch — accounts are never lost
+- **Save / switch accounts**: the current login is preserved before switching; explicitly expired saved logins are rejected. ZCode keeps its native device and monitoring state, and each account keeps its existing device ID for queries and claims
 - **Add accounts**: OAuth login for new accounts inside the tool (BigModel / z.ai entries), never touching the current login
-- **Quota display**: inline plan quota and reset time per account row, multi-plan grouping
-- **Claim promotions**: one-click claim for eligible promotions, sourced from both the billing preview and the marketing campaigns the official client renders — the unsaved "current login" can be checked and claimed too; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
+- **Quota display**: inline quota and reset times, multi-plan grouping, per-entitlement activation times for Start Plans, pending future plans, and hidden expired plans
+- **Claim promotions**: plans come from both the billing preview and the marketing campaigns the official client renders — the unsaved "current login" can be checked and claimed too; check one account from its row or refresh all from the toolbar, both attempt activity activation reporting and immediately queue eligible plans for serial background claims while scanning continues. The "Auto claim" toggle (off by default) only controls scheduled scans every 10 minutes, and turning it off keeps queued work
 - **Concurrent refresh**: quota and claim eligibility share at most three application-level task slots; one request per account and revision; batch eligibility refresh no longer waits five seconds per account
 - **Claim recovery**: manual, batch, and automatic claims share one backend session; in-flight submission, unconfirmed results, and definite failures are shown separately, late results still land, and a restart never replays an unconfirmed submission
-- **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
+- **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption; new backups preserve each account's query and claim device ID, while older backups remain importable
 - **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
 - **Tray / autostart / CLI automation**
 

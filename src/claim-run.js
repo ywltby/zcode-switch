@@ -27,6 +27,23 @@ export function claimOutcomeOf(payload) {
   return { status: "ok", payload };
 }
 
+// A timed-out UI waiter must not strand the serial queue when the backend's
+// completion event is lost. Only a stored terminal result can release it.
+export async function reconcilePendingClaims({ attempts, invoke, handleResult }) {
+  for (const attempt of attempts) {
+    if (attempt.handled || (!attempt.done && !attempt.confirming)) continue;
+    let status;
+    try {
+      status = await invoke("claim_status", { claimId: attempt.claimId });
+    } catch {
+      continue;
+    }
+    if (!status || attempt.handled) continue;
+    if (TERMINAL_STATUSES.includes(status.status)) handleResult(payloadFromStatus(status));
+    else if (status.status === "submitting") attempt.confirming = true;
+  }
+}
+
 export async function waitForBackendResult({
   invoke,
   claimId,
