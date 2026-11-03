@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   frontend:
@@ -30,11 +31,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # ubuntu-24.04 的系统 Python 受 PEP 668 保护，不能直接 pip install，改用独立 Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install Playwright (Chromium)
         run: |
-          python3 -m pip install --upgrade pip
-          pip install playwright
-          python3 -m playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
       # 只使用合成账号与本地 mock：Vite 只服务本仓库源码，外部请求由各测试阻止。
       - name: Run UI acceptance suites
         run: |
@@ -47,7 +52,7 @@ jobs:
           status=0
           for suite in quota-ui claim-ui claim-queue-ui claim-single-ui captcha-ui scroll-ui claim-eligibility-ui live-claim-ui identity-isolation-ui live-scope-ui legacy-history-ui claim-hold-ui; do
             echo "== $suite =="
-            python3 "tests/$suite.py" || status=1
+            python "tests/$suite.py" || status=1
           done
           kill "$VITE_PID"
           exit $status

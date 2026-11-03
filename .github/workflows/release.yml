@@ -49,6 +49,19 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      # 本版说明取自 docs/releases/<tag>.md（去掉首行标题，Release 名称里已有版本号）；
+      # 没有对应文件时只保留下方的通用说明
+      - name: Read release notes
+        id: notes
+        shell: bash
+        run: |
+          f="docs/releases/${GITHUB_REF_NAME}.md"
+          {
+            echo 'body<<ZSW_NOTES_EOF'
+            if [ -f "$f" ]; then tail -n +2 "$f"; echo; echo '---'; echo; fi
+            echo 'ZSW_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build Tauri & upload release assets
         uses: tauri-apps/tauri-action@v0
         env:
@@ -57,6 +70,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Z·SWITCH ${{ github.ref_name }}'
           releaseBody: |
+            ${{ steps.notes.outputs.body }}
             见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。
 
             ## 下载

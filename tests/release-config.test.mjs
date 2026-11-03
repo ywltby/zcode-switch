@@ -29,3 +29,8 @@ test("foreign release identity is gone and the project notes are back", () => {
   assert.ok(yml.includes("checksums-"), "保留校验和说明");
   assert.ok(yml.includes("## 未签名提示"), "保留未签名提示段落");
 });
+
+test("release body pulls the per-version notes from docs/releases", () => {
+  assert.ok(yml.includes('docs/releases/${GITHUB_REF_NAME}.md'), "按标签读取本版说明");
+  assert.ok(yml.includes("${{ steps.notes.outputs.body }}"), "说明注入到 releaseBody");
+});
