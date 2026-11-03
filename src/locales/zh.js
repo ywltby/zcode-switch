@@ -84,7 +84,6 @@ export const zh = {
   "m.claimEndsAt": "有效期至 {time}",
   "m.claimNextAt": "，{time} 后可再领",
   "claim.untilDate": "至 {date}",
-  "claim.historyStrip": "已领取过 {name}",
   "claim.notProvided": "未提供",
   "claim.timeRange": "生效 {start} → 至 {end}",
   "claim.pendingRange": "待生效 {start} → 至 {end}",

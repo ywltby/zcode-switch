@@ -84,7 +84,6 @@ export const en = {
   "m.claimEndsAt": "Valid until {time}",
   "m.claimNextAt": " — available again after {time}",
   "claim.untilDate": "until {date}",
-  "claim.historyStrip": "Claimed before: {name}",
   "claim.notProvided": "not provided",
   "claim.timeRange": "active {start} → until {end}",
   "claim.pendingRange": "pending {start} → until {end}",

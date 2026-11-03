@@ -1155,10 +1155,6 @@ input:focus-visible,
   background: rgba(94, 178, 122, .08);
   color: #5eb27a;
 }
-.claim-strip.history {
-  opacity: .55;
-  border-style: dashed;
-}
 
 .q-bonus-hint {
   margin-top: 3px;

@@ -2493,19 +2493,6 @@ function claimedStripHtml(id) {
       <span class="claim-grants${tr.pending ? " warn-line" : ""}">${esc(tr.text)}</span>
     </div>`;
   }).join("");
-  // 有「当前可领」的活动时不再展示旧活动的历史条，避免同一行两三个条混淆
-  if (!active.length && claimablePlansFor(id).length) return html;
-  if (!active.length && (cs.history || []).length) {
-    const last = cs.history[cs.history.length - 1];
-    const name = last?.planName || last?.planId || "";
-    if (name) {
-      html += `
-      <div class="claim-strip history">
-        ${ic("gift", 15)}
-        <span class="claim-name">${esc(t("claim.historyStrip", { name }))}</span>
-      </div>`;
-    }
-  }
   return html;
 }
 
