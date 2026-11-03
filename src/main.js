@@ -86,6 +86,10 @@ let accountRevisions = {};
 // Campaign impressions are rate limited upstream, so the automatic check is lazy.
 const LIVE_CLAIM_AUTO_MS = 30 * 60 * 1000;
 let liveClaimCheckedAt = 0;
+// 「查询中」横幅延迟展示：查询很快完成（启动自动预览的常态）就不闪横幅，超过阈值仍忙才补渲染。
+const LIVE_BUSY_BANNER_MS = 1200;
+let liveBusySince = 0;
+let liveBusyTimer = 0;
 
 // 活动中心：已探测到的活动（accountId -> ClaimPlan[]，含 campaign 元数据）
 let activities = {};
@@ -457,6 +461,7 @@ const claimFlow = createClaimFlow({
   onChange: () => {
     claimable = claimFlow.entries();
     syncLiveClaimRevision();
+    noteLiveBusy();
     if (!uiLocked()) render();
   },
 });
@@ -2352,13 +2357,28 @@ function claimStripHtml(id) {
   return rows.join("");
 }
 
+/// live 行 busy 状态跟踪：记录起始时刻，超过阈值仍未返回才补一次渲染亮出横幅。
+function noteLiveBusy() {
+  const busy = Boolean(claimable[LIVE_CLAIM_ID]?.busy);
+  if (busy && !liveBusySince) {
+    liveBusySince = Date.now();
+    clearTimeout(liveBusyTimer);
+    liveBusyTimer = setTimeout(() => {
+      if (claimable[LIVE_CLAIM_ID]?.busy && !uiLocked()) render();
+    }, LIVE_BUSY_BANNER_MS);
+  } else if (!busy && liveBusySince) {
+    liveBusySince = 0;
+    clearTimeout(liveBusyTimer);
+  }
+}
+
 function liveClaimSlotHtml() {
   if (!liveClaimTarget()) return "";
   const c = claimable[LIVE_CLAIM_ID];
   const strip = claimStripHtml(LIVE_CLAIM_ID);
   // 领取成功后服务端不再下发资格：当前登录同样需要「已领取/待生效」条。
   const claimed = claimedStripHtml(LIVE_CLAIM_ID);
-  if (!strip && c?.busy) {
+  if (!strip && c?.busy && liveBusySince && Date.now() - liveBusySince >= LIVE_BUSY_BANNER_MS) {
     return `<div class="claim-strip live"><span class="aq-loading">${t("q.loading")}</span></div>`;
   }
   if (strip || claimed) return `${strip}${claimed}${legacyNoteHtml(LIVE_CLAIM_ID)}`;
