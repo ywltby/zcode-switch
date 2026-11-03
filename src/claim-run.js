@@ -21,6 +21,11 @@ export function payloadFromStatus(status) {
 }
 
 export function claimOutcomeOf(payload) {
+  // 没有结果载荷（准备失败、传输中断、超时无结果）一律按失败处理：
+  // 当成成功会跳过标记、hold 与冷却，导致自动路径立即重复启动。
+  if (!payload || typeof payload !== "object" || Object.keys(payload).length === 0) {
+    return { status: "failed", payload: payload || null };
+  }
   if (payload?.unknown) return { status: "unknown", payload };
   if (payload?.cancelled) return { status: "cancelled", payload };
   if (payload?.ok === false) return { status: "failed", payload };
@@ -115,4 +120,42 @@ export async function resolveClaimTimeout({
   const payload = payloadFromStatus(status);
   handleResult(payload);
   return claimOutcomeOf(payload);
+}
+
+/// (账号|套餐) 级暂停：终态永不重试，1005 等到上游时间，挑战/3007/未知统一 60 分钟。
+export const CHALLENGE_HOLD_MS = 60 * 60 * 1000;
+
+export function claimHoldUntil(payload, now = Date.now()) {
+  const r = payload || {};
+  if (r.terminal && r.code === 1005) {
+    return Number.isFinite(r.nextAt) && r.nextAt > now ? r.nextAt : now + CHALLENGE_HOLD_MS;
+  }
+  if (r.terminal) return Infinity;
+  if (r.challenge || r.code === 3007 || r.unknown) return now + CHALLENGE_HOLD_MS;
+  return now + CHALLENGE_HOLD_MS;
+}
+
+/// 账号级自动冷却：1005 用上游时间，业务码失败 60 分钟，其余退回扫描间隔。
+export function autoCooldownUntil(payload, now = Date.now(), retryMs = 10 * 60 * 1000) {
+  const r = payload || {};
+  if (r.code === 1005 && r.nextAt) return r.nextAt;
+  if (Number.isFinite(r.code) && r.code >= 1000) return now + CHALLENGE_HOLD_MS;
+  if (r.code === "interactive") return now + CHALLENGE_HOLD_MS;
+  return now + retryMs;
+}
+
+/// 统一结算的副作用：成功清除该套餐的 hold；失败按结果写入 hold 与账号冷却。
+/// 队列、定时扫描和到点领取都只读这份状态。
+export function claimSettlement(payload, now = Date.now(), retryMs = 10 * 60 * 1000) {
+  const outcome = claimOutcomeOf(payload);
+  if (outcome.status === "ok") {
+    return { status: "ok", holdUntil: 0, cooldownUntil: 0 };
+  }
+  return {
+    status: outcome.status,
+    holdUntil: claimHoldUntil(payload, now),
+    cooldownUntil: outcome.status === "unknown"
+      ? now + CHALLENGE_HOLD_MS
+      : autoCooldownUntil(payload, now, retryMs),
+  };
 }

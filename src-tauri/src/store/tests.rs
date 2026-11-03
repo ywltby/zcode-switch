@@ -294,3 +294,242 @@ fn unknown_identity_never_sends_network_requests_and_old_snapshots_still_read() 
         crate::quota_auth::QuotaError::IdentityMissing
     );
 }
+
+/// 图形界面的「当前登录」必须走 live 快照：读 live 凭据与 telemetry 设备 id，
+/// 不查 accounts/live.json，也不创建或改写客户端设备文件。
+#[test]
+fn live_claim_snapshot_uses_live_credentials_and_telemetry_mid() {
+    let f = Fixture::new();
+    let telemetry_before = fs::read(f.paths.live_telemetry()).unwrap();
+    let snapshot = claim_snapshot_locked(&f.paths, LIVE_ID, None).unwrap();
+    assert_eq!(snapshot.account.id, LIVE_ID);
+    assert_eq!(snapshot.account.credentials, account("b", "bigmodel").credentials);
+    assert_eq!(
+        snapshot.account.virtual_device_mid.as_deref(),
+        Some("live-b-mid")
+    );
+    assert!(!snapshot.device_initialized, "live 设备 id 不由本工具初始化");
+    assert!(
+        !f.paths.accounts_dir().join("live.json").exists(),
+        "live 快照不得依赖 accounts/live.json"
+    );
+    assert_eq!(
+        fs::read(f.paths.live_telemetry()).unwrap(),
+        telemetry_before,
+        "live 快照不得改写 telemetry 设备文件"
+    );
+}
+
+/// 换登录后旧 revision 立刻失效：迟到的查询/领取结果不能结算到新登录。
+#[test]
+fn live_revision_matches_tracks_the_live_login() {
+    let f = Fixture::new();
+    let revision = claim_snapshot_locked(&f.paths, LIVE_ID, None)
+        .unwrap()
+        .revision;
+    assert!(claim_revision_matches(&f.paths, LIVE_ID, &revision));
+    expect_scope_changed(claim_snapshot_locked(&f.paths, LIVE_ID, Some("stale-revision")));
+
+    fs::write(
+        f.paths.live_file(),
+        serde_json::to_vec(&account("c", "zai").credentials).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !claim_revision_matches(&f.paths, LIVE_ID, &revision),
+        "换登录后旧 revision 必须失效"
+    );
+    expect_scope_changed(claim_snapshot_locked(
+        &f.paths,
+        LIVE_ID,
+        Some(&revision),
+    ));
+}
+
+/// 领取历史按真实登录身份隔离：同一个 live 行换登录后不得看到上一个登录的记录。
+#[test]
+fn claim_history_is_scoped_to_the_live_identity() {
+    let f = Fixture::new();
+    record_claim_history(&f.paths, LIVE_ID, "zai:user-one", "p1", "Plan One");
+    record_claim_history(&f.paths, LIVE_ID, "zai:user-two", "p2", "Plan Two");
+    record_claim_history(&f.paths, "account-a", "zai:account-a", "p3", "Plan Three");
+
+    let one = claim_history_for_identity(&f.paths, LIVE_ID, Some("zai:user-one"));
+    assert_eq!(one.len(), 1, "只返回同一身份的记录");
+    assert_eq!(one[0]["planId"], "p1");
+    assert_eq!(one[0]["identity"], "zai:user-one");
+
+    let two = claim_history_for_identity(&f.paths, LIVE_ID, Some("zai:user-two"));
+    assert_eq!(two.len(), 1);
+    assert_eq!(two[0]["planId"], "p2");
+
+    assert!(
+        claim_history_for_identity(&f.paths, LIVE_ID, Some("zai:user-three")).is_empty(),
+        "新登录不得看到旧登录历史"
+    );
+    // 普通账号与「不过滤」调用保持旧行为
+    assert_eq!(claim_history_for(&f.paths, "account-a").len(), 1);
+    assert_eq!(claim_history_for(&f.paths, LIVE_ID).len(), 2);
+}
+
+/// 没有 identity 字段的旧记录在按身份过滤时不得混入（重启后仍安全）。
+#[test]
+fn legacy_history_without_identity_is_not_matched_by_identity() {
+    let f = Fixture::new();
+    let file = claim_history_file(&f.paths);
+    fs::write(
+        &file,
+        r#"[{"accountId":"live","planId":"old","planName":"Old","claimedAt":1}]"#,
+    )
+    .unwrap();
+    assert!(
+        claim_history_for_identity(&f.paths, LIVE_ID, Some("zai:user-one")).is_empty(),
+        "旧的无身份记录不能算到当前登录头上"
+    );
+    assert_eq!(claim_history_for(&f.paths, LIVE_ID).len(), 1, "不过滤时仍可见");
+}
+
+/// 界面身份必须携带后端作用域：领取标记、活动目录与缓存都用它分区，
+/// 因此不能只靠 user_id / provider 自行拼接，也不能用固定 "live"。
+#[test]
+fn ui_identity_carries_the_backend_scope() {
+    let f = Fixture::new();
+    let state = get_state(&f.paths).unwrap();
+    let secret = zcrypto::default_secret(&f.paths.home);
+
+    let live = state.live_identity.clone().expect("live 身份应存在");
+    let live_expected = crate::claim_session::identity_scope(
+        &account("b", "bigmodel").credentials,
+        &secret,
+    );
+    assert_eq!(
+        live.scope.as_deref(),
+        Some(live_expected.as_str()),
+        "live 作用域必须与 claim 会话使用的 identity_scope 一致"
+    );
+    assert_eq!(live.provider, "bigmodel");
+
+    let stored = state
+        .accounts
+        .iter()
+        .find(|a| a.id == "account-a")
+        .unwrap_or_else(|| panic!("账号 account-a 应存在"));
+    let stored_expected =
+        crate::claim_session::identity_scope(&account("a", "zai").credentials, &secret);
+    assert_eq!(stored.identity.scope.as_deref(), Some(stored_expected.as_str()));
+
+    // 同一个人在不同渠道 / 不同主体不能合并成同一个作用域
+    assert_ne!(
+        live.scope, stored.identity.scope,
+        "渠道与主体不同必须得到不同作用域"
+    );
+}
+
+/// 无身份的旧历史不能冒充当前登录的记录：单独归类，只有用户显式清理才删除。
+#[test]
+fn unattributed_history_is_kept_apart_and_can_be_dropped() {
+    let f = Fixture::new();
+    let file = claim_history_file(&f.paths);
+    fs::write(
+        &file,
+        r#"[
+            {"accountId":"account-a","identity":"zai:user-one","planId":"p1","planName":"New","claimedAt":10},
+            {"accountId":"account-a","planId":"legacy-1","planName":"Old","claimedAt":5},
+            {"accountId":"account-b","planId":"other","planName":"Other","claimedAt":6}
+        ]"#,
+    )
+    .unwrap();
+
+    let legacy = claim_history_legacy_for(&f.paths, "account-a");
+    assert_eq!(legacy.len(), 1, "只有无 identity 的条目算作未归属");
+    assert_eq!(legacy[0]["planId"], "legacy-1");
+
+    // 当前身份的读取不受影响
+    let current = claim_history_for_identity(&f.paths, "account-a", Some("zai:user-one"));
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0]["planId"], "p1");
+
+    let dropped = drop_claim_history_legacy(&f.paths, "account-a").expect("清除应成功");
+    assert_eq!(dropped, 1);
+    assert!(claim_history_legacy_for(&f.paths, "account-a").is_empty());
+    assert_eq!(
+        claim_history_for_identity(&f.paths, "account-a", Some("zai:user-one")).len(),
+        1,
+        "清理旧记录不得影响当前身份的历史"
+    );
+    // 其它账号的条目保持原样
+    assert_eq!(claim_history_for(&f.paths, "account-b").len(), 1);
+
+    // 清除的读写失败必须返回错误（不能悄悄当成功）
+    let broken = Fixture::new();
+    let broken_file = claim_history_file(&broken.paths);
+    fs::create_dir_all(&broken_file).unwrap();
+    assert!(
+        drop_claim_history_legacy(&broken.paths, "account-a").is_err(),
+        "读不出来 / 写不进去都必须报错"
+    );
+
+    // 损坏的 JSON 也必须报错，而不是当作「没有旧记录」
+    let corrupt = Fixture::new();
+    fs::write(claim_history_file(&corrupt.paths), "{not json").unwrap();
+    assert!(claim_history_legacy_check(&corrupt.paths, "account-a").is_err());
+    assert!(drop_claim_history_legacy(&corrupt.paths, "account-a").is_err());
+}
+
+/// 旧历史归属：给无 identity 的条目补上当前身份作用域；失败必须报错（前端不能放开自动领取）。
+#[test]
+fn legacy_history_can_be_adopted_only_with_a_real_write() {
+    let f = Fixture::new();
+    let file = claim_history_file(&f.paths);
+    fs::write(
+        &file,
+        r#"[
+            {"accountId":"account-a","planId":"legacy-1","planName":"Old","claimedAt":5},
+            {"accountId":"account-a","identity":"zai:user-one","planId":"p1","planName":"New","claimedAt":10},
+            {"accountId":"account-b","planId":"other","planName":"Other","claimedAt":6}
+        ]"#,
+    )
+    .unwrap();
+
+    let adopted = adopt_claim_history_legacy(&f.paths, "account-a", "zai:user-two")
+        .expect("归属写入应成功");
+    assert_eq!(adopted.plan_ids, vec!["legacy-1".to_string()]);
+    assert_eq!(adopted.skipped, 0);
+    assert!(claim_history_legacy_for(&f.paths, "account-a").is_empty());
+    let current = claim_history_for_identity(&f.paths, "account-a", Some("zai:user-two"));
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0]["planId"], "legacy-1");
+    // 已有身份的条目不被改写；其它账号保持原样
+    assert_eq!(
+        claim_history_for_identity(&f.paths, "account-a", Some("zai:user-one")).len(),
+        1
+    );
+    assert_eq!(claim_history_for(&f.paths, "account-b").len(), 1);
+
+    // 无可归属条目时返回空结果（幂等），不报错
+    let again = adopt_claim_history_legacy(&f.paths, "account-a", "zai:user-two").unwrap();
+    assert!(again.plan_ids.is_empty());
+    assert_eq!(again.skipped, 0);
+
+    // 没有套餐 ID 的旧记录无法可靠归属：保持未归属并计入 skipped
+    let unkeyed = Fixture::new();
+    fs::write(
+        claim_history_file(&unkeyed.paths),
+        r#"[{"accountId":"account-a","planName":"No id","claimedAt":7}]"#,
+    )
+    .unwrap();
+    let outcome = adopt_claim_history_legacy(&unkeyed.paths, "account-a", "zai:user-x").unwrap();
+    assert!(outcome.plan_ids.is_empty());
+    assert_eq!(outcome.skipped, 1);
+    assert_eq!(
+        claim_history_legacy_for(&unkeyed.paths, "account-a").len(),
+        1,
+        "无可识别套餐 ID 的记录不得被静默丢弃"
+    );
+
+    // 写失败（历史文件被目录占位）必须报错，调用方据此保留旧状态
+    let broken = Fixture::new();
+    let broken_file = claim_history_file(&broken.paths);
+    fs::create_dir_all(&broken_file).unwrap();
+    assert!(adopt_claim_history_legacy(&broken.paths, "account-a", "zai:user-two").is_err());
+}

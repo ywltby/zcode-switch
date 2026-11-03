@@ -12,6 +12,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod tests;
+
+// Protect only snapshot capture / save and cache registration, never network I/O.
+static QUOTA_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn no_window(prog: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
@@ -166,9 +172,24 @@ impl Settings {
     }
 }
 
+/// 给界面身份补上后端作用域：领取标记/活动目录/缓存分区都用它，保证与 claim 会话
+/// 里的 identity_scope 完全一致（渠道 + 主体，而不是只有 user_id）。
+fn with_identity_scope(
+    mut identity: zcrypto::Identity,
+    creds: &Value,
+    home: &Path,
+) -> zcrypto::Identity {
+    identity.scope = Some(crate::claim_session::identity_scope(
+        creds,
+        &zcrypto::default_secret(home),
+    ));
+    identity
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct AccountSummary {
     pub id: String,
+    pub quota_revision: String,
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
@@ -272,12 +293,32 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
+    if !paths.live_file().exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(paths.live_file())
+        .map_err(|e| trf("err.read", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
+    let v: Value = serde_json::from_str(&raw)
+        .map_err(|e| trf("err.bad_json", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
+    if !v.is_object() {
+        return Err(tr("err.store.not_object"));
+    }
+    Ok(Some(v))
+}
+
 pub(crate) fn claim_history_file(paths: &Paths) -> PathBuf {
     paths.store_dir().join("claim-history.json")
 }
 
 /// 领取成功后追加一条历史（仅套餐元数据，不含凭证）。失败静默（best-effort）。
-pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &str, plan_name: &str) {
+pub(crate) fn record_claim_history(
+    paths: &Paths,
+    account_id: &str,
+    identity: &str,
+    plan_id: &str,
+    plan_name: &str,
+) {
     let file = claim_history_file(paths);
     let mut items: Vec<Value> = fs::read_to_string(&file)
         .ok()
@@ -286,6 +327,7 @@ pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &st
     let now_ms = Local::now().timestamp_millis();
     items.push(serde_json::json!({
         "accountId": account_id,
+        "identity": identity,
         "planId": plan_id,
         "planName": plan_name,
         "claimedAt": now_ms,
@@ -298,8 +340,132 @@ pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &st
     let _ = atomic_write(&file, &serde_json::to_string(&items).unwrap_or_default());
 }
 
-/// 读取某账号的领取历史（文件损坏/缺失视为空）。
+/// 读取某账号的领取历史（文件损坏/缺失视为空）。不按身份过滤——生产路径统一走
+/// `claim_history_for_identity`，这里只作为测试里的对照入口。
+#[cfg(test)]
 pub(crate) fn claim_history_for(paths: &Paths, account_id: &str) -> Vec<Value> {
+    claim_history_for_identity(paths, account_id, None)
+}
+
+/// 无身份的旧历史（迁移前写入的记录）：不能归给当前登录，也不能静默丢弃。
+/// 严格的旧历史读取：只有「文件不存在」等同于没有旧记录；读取、解析失败都返回错误，
+/// 调用方必须把「未知」当成需要阻止自动领取的状态，而不是「没有旧记录」。
+pub(crate) fn claim_history_legacy_check(
+    paths: &Paths,
+    account_id: &str,
+) -> Result<Vec<Value>, String> {
+    let file = claim_history_file(paths);
+    let raw = match fs::read_to_string(&file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(crate::i18n::trf("err.read", &[("path", &file.display().to_string()), ("e", &error.to_string())])),
+    };
+    let items: Vec<Value> = serde_json::from_str(&raw)
+        .map_err(|e| crate::i18n::trf("err.bad_json", &[("path", &file.display().to_string()), ("e", &e.to_string())]))?;
+    Ok(items
+        .into_iter()
+        .filter(|it| it.get("accountId").and_then(|v| v.as_str()) == Some(account_id))
+        .filter(|it| it.get("identity").and_then(|v| v.as_str()).is_none())
+        .collect())
+}
+
+/// 展示用途的旧历史（读取失败视为空；准入判断请用 `claim_history_legacy_check`）。
+pub(crate) fn claim_history_legacy_for(paths: &Paths, account_id: &str) -> Vec<Value> {
+    claim_history_legacy_check(paths, account_id).unwrap_or_default()
+}
+
+/// 归属结果：只有带 planId 的条目可被识别并继续压制；其余条目保持未归属。
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LegacyAdoptOutcome {
+    pub plan_ids: Vec<String>,
+    pub skipped: usize,
+}
+
+/// 用户显式确认「这些旧记录属于当前登录」：给带套餐 ID 的无 identity 条目补上当前身份作用域。
+/// 读/解析/写入失败返回 Err；无可识别套餐 ID 的条目保持原样（不静默丢弃）。
+pub(crate) fn adopt_claim_history_legacy(
+    paths: &Paths,
+    account_id: &str,
+    identity: &str,
+) -> Result<LegacyAdoptOutcome, String> {
+    let file = claim_history_file(paths);
+    let raw = match fs::read_to_string(&file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyAdoptOutcome { plan_ids: Vec::new(), skipped: 0 })
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut items: Vec<Value> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut plan_ids: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+    for item in items.iter_mut() {
+        let same_account = item.get("accountId").and_then(|v| v.as_str()) == Some(account_id);
+        let legacy = item.get("identity").and_then(|v| v.as_str()).is_none();
+        if !same_account || !legacy {
+            continue;
+        }
+        let plan_id = item
+            .get("planId")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        let Some(plan_id) = plan_id else {
+            // 没有套餐 ID 的记录无法可靠归属，保持未归属状态。
+            skipped += 1;
+            continue;
+        };
+        if let Some(object) = item.as_object_mut() {
+            object.insert("identity".into(), json!(identity));
+        }
+        if !plan_ids.contains(&plan_id) {
+            plan_ids.push(plan_id);
+        }
+    }
+    if !plan_ids.is_empty() {
+        atomic_write(&file, &serde_json::to_string(&items).unwrap_or_default())?;
+    }
+    Ok(LegacyAdoptOutcome { plan_ids, skipped })
+}
+
+/// 用户显式确认后删除该账号的无身份旧历史；返回删除条数。
+/// 读取、解析与写入失败都返回错误（界面必须保留旧状态并提示）。
+pub(crate) fn drop_claim_history_legacy(
+    paths: &Paths,
+    account_id: &str,
+) -> Result<usize, String> {
+    let file = claim_history_file(paths);
+    let raw = match fs::read_to_string(&file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    };
+    let items: Vec<Value> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let before = items.len();
+    let kept: Vec<Value> = items
+        .into_iter()
+        .filter(|it| {
+            let same_account = it.get("accountId").and_then(|v| v.as_str()) == Some(account_id);
+            let legacy = it.get("identity").and_then(|v| v.as_str()).is_none();
+            !(same_account && legacy)
+        })
+        .collect();
+    let removed = before - kept.len();
+    if removed > 0 {
+        atomic_write(&file, &serde_json::to_string(&kept).unwrap_or_default())?;
+    }
+    Ok(removed)
+}
+
+/// 领取历史按「账号 + 真实登录身份」隔离：同一个 live 行换登录后不得看到上一个
+/// 登录的历史。旧条目没有 identity 字段，在要求过滤时一律不匹配。
+pub(crate) fn claim_history_for_identity(
+    paths: &Paths,
+    account_id: &str,
+    identity: Option<&str>,
+) -> Vec<Value> {
     let items: Vec<Value> = fs::read_to_string(claim_history_file(paths))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -307,20 +473,11 @@ pub(crate) fn claim_history_for(paths: &Paths, account_id: &str) -> Vec<Value> {
     items
         .into_iter()
         .filter(|it| it.get("accountId").and_then(|v| v.as_str()) == Some(account_id))
+        .filter(|it| match identity {
+            Some(wanted) => it.get("identity").and_then(|v| v.as_str()) == Some(wanted),
+            None => true,
+        })
         .collect()
-}
-
-pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
-    if !paths.live_file().exists() {
-        return Ok(None);
-    }    let raw = fs::read_to_string(paths.live_file())
-        .map_err(|e| trf("err.read", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| trf("err.bad_json", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
-    if !v.is_object() {
-        return Err(tr("err.store.not_object"));
-    }
-    Ok(Some(v))
 }
 
 pub fn read_live_config(paths: &Paths) -> Option<Value> {
@@ -671,10 +828,14 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
 }
 
 pub fn save_account(paths: &Paths, acc: &Account) -> Result<(), String> {
+    let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     paths.ensure_dirs()?;
     let path = paths.accounts_dir().join(format!("{}.json", acc.id));
     let body = serde_json::to_string_pretty(acc).unwrap_or_default() + "\n";
-    atomic_write(&path, &body)
+    atomic_write(&path, &body)?;
+    crate::project_token::service().retain_revision(&acc.id,
+        &crate::quota_auth::quota_revision(acc, &zcrypto::default_secret(&paths.home)));
+    Ok(())
 }
 
 pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -937,27 +1098,26 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     }
 }
 
-fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Option<crate::probe::ProbeOutcome> {
+pub(crate) fn run_switch_probe(paths: &Paths, id: &str) -> Option<crate::probe::ProbeOutcome> {
+    let target = read_quota_account(paths, id).ok()?;
     if in_sandbox() || !is_logged_in(&target.credentials) {
         return None;
     }
-    let cfg = probe_config_base(paths, target);
-    crate::probe::switch_probe(
-        &target.credentials,
-        cfg.as_ref(),
-        &zcrypto::default_secret(&paths.home),
-        mid,
-        new_gen_provider_config(&paths.data_root),
-    )
-}
-
-fn probe_config_base(paths: &Paths, target: &Account) -> Option<Value> {
-    if target.config.is_none() { return None; }
-    if new_gen_provider_config(&paths.data_root) { target.config.clone() }
-    else { read_live_config(paths).or_else(|| target.config.clone()) }
+    crate::probe::switch_probe(paths, id)
 }
 
 pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
+    switch_to_with_process_check(paths, id, force, restart, hot, zcode_running)
+}
+
+fn switch_to_with_process_check(
+    paths: &Paths,
+    id: &str,
+    force: bool,
+    restart: bool,
+    hot: bool,
+    is_running: impl FnOnce() -> bool,
+) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
     let live = read_live(paths)?;
@@ -979,12 +1139,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
                 eprintln!("sync-back 失败(不阻断 already 返回): {e}");
             }
         }
-        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-        write_live_device_mid(paths, &mid)?;
-        let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
-        if !zcode_running() {
-            let _ = write_live_arms_uid(paths, &uid);
-        }
+        ensure_virtual_device_mid_locked(paths, &target.id)?;
         return Ok(SwitchResult {
             switched: false,
             already_active: true,
@@ -998,7 +1153,13 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         });
     }
 
-    let running = zcode_running();
+    // The active account can refresh independently; do not restore an expired
+    // non-active snapshot or stop ZCode before telling the user to sign in.
+    if account_jwt_expired(&target.credentials, &paths.home) {
+        return Err(tr("err.switch.jwt_expired"));
+    }
+
+    let running = is_running();
     if hot && running {
         if let Err(e) = sync_live_back_to_source(paths, &accounts) {
             eprintln!("sync-back 失败(不阻断切换): {e}");
@@ -1009,10 +1170,8 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         hot_swap_verified(paths, &target, &creds)?;
         backfill_relay_pass_hash(paths, &target.id, &creds);
         reset_live_plan_cache(paths);
-        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-        write_live_device_mid(paths, &mid)?;
-        ensure_virtual_arms_uid_locked(paths, &target.id)?;
-        let probe = run_switch_probe(paths, &target, Some(mid));
+        ensure_virtual_device_mid_locked(paths, &target.id)?;
+        let probe = None;
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -1064,10 +1223,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     if !new_gen {
         rematerialize_wiped_builtins(paths, &target);
     }
-    let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-    write_live_device_mid(paths, &mid)?;
-    let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
-    let _ = write_live_arms_uid(paths, &uid);
+    ensure_virtual_device_mid_locked(paths, &target.id)?;
 
     let mut launched = false;
     if restart {
@@ -1077,7 +1233,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         }
     }
 
-    let probe = run_switch_probe(paths, &target, Some(mid));
+    let probe = None;
 
     Ok(SwitchResult {
         switched: true,
@@ -1212,6 +1368,7 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
 }
 
 pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
+    let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(tr("err.store.bad_id"));
     }
@@ -1219,7 +1376,9 @@ pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
     if !path.exists() {
         return Err(tr("err.store.no_account"));
     }
-    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))
+    fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))?;
+    crate::project_token::service().invalidate(id);
+    Ok(())
 }
 
 pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -1245,21 +1404,109 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
     Ok(acc)
 }
 
-fn live_quota_config(paths: &Paths) -> Option<Value> {
-    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
+// Quota reads bypass helpers which repair hashes or initialize devices.
+fn read_quota_account(paths: &Paths, id: &str) -> Result<Account, String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(tr("err.store.bad_id"));
+    }
+    let raw = fs::read_to_string(paths.accounts_dir().join(format!("{id}.json")))
+        .map_err(|_| "scope_changed".to_string())?;
+    let account: Account = serde_json::from_str(&raw).map_err(|_| "invalid_response".to_string())?;
+    if account.id != id { return Err("identity_conflict".into()); }
+    Ok(account)
+}
+
+fn read_live_quota_snapshot(paths: &Paths) -> Result<Account, String> {
+    let creds = read_live(paths)?.ok_or_else(|| tr("err.live.no_file"))?;
+    let mid = fs::read_to_string(paths.live_telemetry()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from));
+    Ok(crate::quota_auth::login_snapshot(LIVE_ID, creds, mid))
+}
+
+/// Pseudo account id for the login ZCode is running right now. Nothing is written
+/// to disk: claim and quota reads only borrow the live credentials and device id.
+pub const LIVE_ID: &str = "live";
+
+/// 界面展示的 live 快照标识：与 get_state 的 live_hash 同源，供前端判断
+/// 「资格查询返回的是不是当前界面上的登录」。
+pub(crate) fn live_snapshot_hash(paths: &Paths) -> Option<String> {
+    read_live(paths).ok().flatten().as_ref().map(canonical_hash)
+}
+
+pub(crate) fn live_claim_snapshot(paths: &Paths) -> Result<Account, String> {
+    let creds = read_live(paths)?
+        .filter(is_logged_in)
+        .ok_or_else(|| tr("err.live.not_logged_in"))?;
+    let mid = fs::read_to_string(paths.live_telemetry()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(String::from))
+        .filter(|m: &String| !m.trim().is_empty());
+    Ok(crate::quota_auth::login_snapshot(LIVE_ID, creds, mid))
+}
+
+fn query_snapshot_via(
+    snapshot: Account, secret: &str, version: &str,
+    http: &dyn crate::quota_http::Transport,
+    service: &crate::project_token::TokenService,
+    current: impl Fn() -> Result<Account, String> + Sync,
+) -> Result<quota::QuotaOverview, String> {
+    use crate::quota_auth::{quota_revision, resolve_account_context, QuotaError};
+    let revision = quota_revision(&snapshot, secret);
+    let context = resolve_account_context(&snapshot, secret, version);
+    let is_current = || current().ok().is_some_and(|latest| quota_revision(&latest, secret) == revision);
+    {
+        let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !is_current() { return Err(QuotaError::ScopeChanged.to_string()); }
+        match &context {
+            Ok(ctx) => service.activate(&ctx.scope),
+            Err(_) => service.invalidate(&snapshot.id),
+        }
+    }
+    let result = match context {
+        Ok(ctx) => {
+            let check = || {
+                if !is_current() {
+                    service.invalidate_if_current(&ctx.scope);
+                    return Err(QuotaError::ScopeChanged);
+                }
+                service.assert_current(&ctx.scope)
+            };
+            let guarded = |request| {
+                check()?;
+                let result = http.send(request);
+                check()?;
+                result
+            };
+            let result = quota::query_with_service(&ctx, &guarded, service);
+            check().map_err(|e| e.to_string())?;
+            result
+        },
+        Err(code) => quota::unavailable(&snapshot.id, &revision, code),
+    };
+    if current().ok().is_none_or(|latest| quota_revision(&latest, secret) != revision) {
+        return Err(QuotaError::ScopeChanged.to_string());
+    }
+    Ok(result)
 }
 
 pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
-    let creds = read_live(paths)?.ok_or(tr("err.live.no_file"))?;
-    if !is_logged_in(&creds) {
-        return Err(tr("err.live.quota"));
-    }
-    quota::quota_for_live(&paths.home, &creds, live_quota_config(paths).as_ref())
+    query_snapshot_via(read_live_quota_snapshot(paths)?, &zcrypto::default_secret(&paths.home),
+        &quota::zcode_app_version(), &crate::quota_http::HttpTransport, crate::project_token::service(), || read_live_quota_snapshot(paths))
 }
 
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
-    let acc = load_account(paths, id)?;
-    quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
+    account_quota_revision(paths, id, None)
+}
+
+pub fn account_quota_revision(paths: &Paths, id: &str, expected: Option<&str>) -> Result<quota::QuotaOverview, String> {
+    let snapshot = read_quota_account(paths, id)?;
+    let secret = zcrypto::default_secret(&paths.home);
+    if expected.is_some_and(|revision| crate::quota_auth::quota_revision(&snapshot, &secret) != revision) {
+        return Err("scope_changed".into());
+    }
+    query_snapshot_via(snapshot, &secret, &quota::zcode_app_version(), &crate::quota_http::HttpTransport,
+        crate::project_token::service(), || read_quota_account(paths, id))
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
@@ -1299,7 +1546,7 @@ pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Stri
 /// 营销活动按设备标识去重：投递过的 id 不再看到同一档活动。换新 id 等效于
 /// 手动删除 ZCode 的 telemetry-state.json，但不动客户端自身的设备身份。
 pub fn reset_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, String> {
-    if id == "live" {
+    if id == LIVE_ID {
         return Err("identity_conflict".into());
     }
     let _guard = crate::store_guard();
@@ -1311,19 +1558,57 @@ pub fn reset_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, Strin
     Ok(mid)
 }
 
-pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
-    let mut v: Value = fs::read_to_string(paths.live_telemetry())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !v.is_object() {
-        v = json!({});
+pub(crate) struct ClaimSnapshot {
+    pub account: Account,
+    pub revision: String,
+    pub device_initialized: bool,
+}
+
+// Short-lock claim preparation: validate the caller's revision, then make sure the
+// account owns a virtual device id. Never performs network I/O or repairs hashes.
+pub(crate) fn claim_snapshot_locked(
+    paths: &Paths,
+    id: &str,
+    expected: Option<&str>,
+) -> Result<ClaimSnapshot, String> {
+    let secret = zcrypto::default_secret(&paths.home);
+    if id == LIVE_ID {
+        // The login ZCode runs right now is never stored under accounts/: borrow its
+        // live credentials and telemetry device id, and write nothing to disk.
+        let account = live_claim_snapshot(paths)?;
+        let revision = crate::quota_auth::quota_revision(&account, &secret);
+        if expected.is_some_and(|value| value != revision) {
+            return Err("scope_changed".into());
+        }
+        return Ok(ClaimSnapshot { account, revision, device_initialized: false });
     }
-    if v.get("deviceMid").and_then(|m| m.as_str()) == Some(mid) {
-        return Ok(());
+    let mut account = read_quota_account(paths, id)?;
+    let current = crate::quota_auth::quota_revision(&account, &secret);
+    if expected.is_some_and(|value| value != current) {
+        return Err("scope_changed".into());
     }
-    v["deviceMid"] = json!(mid);
-    atomic_write(&paths.live_telemetry(), &(serde_json::to_string(&v).unwrap_or_default() + "\n"))
+    let device_initialized = account
+        .virtual_device_mid
+        .as_deref()
+        .map_or(true, |m| m.trim().is_empty());
+    if device_initialized {
+        let mid = ensure_virtual_device_mid_locked(paths, id)?;
+        account.virtual_device_mid = Some(mid);
+    }
+    let revision = crate::quota_auth::quota_revision(&account, &secret);
+    Ok(ClaimSnapshot { account, revision, device_initialized })
+}
+
+pub(crate) fn claim_revision_matches(paths: &Paths, id: &str, revision: &str) -> bool {
+    let secret = zcrypto::default_secret(&paths.home);
+    let snapshot = if id == LIVE_ID {
+        live_claim_snapshot(paths)
+    } else {
+        read_quota_account(paths, id)
+    };
+    snapshot
+        .map(|account| crate::quota_auth::quota_revision(&account, &secret) == revision)
+        .unwrap_or(false)
 }
 
 fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
@@ -1436,28 +1721,7 @@ fn arms_store_dirs_for(paths: &Paths) -> Vec<PathBuf> {
     arms_store_dirs_from(appdata, mac_base, unix_base)
 }
 
-fn ensure_virtual_arms_uid_locked(paths: &Paths, id: &str) -> Result<String, String> {
-    {
-        let acc = load_account(paths, id)?;
-        if let Some(u) = acc.virtual_arms_uid.clone() {
-            if !u.trim().is_empty() {
-                return Ok(u);
-            }
-        }
-    }
-    let mut acc = load_account(paths, id)?;
-    if let Some(u) = acc.virtual_arms_uid.clone() {
-        if !u.trim().is_empty() {
-            return Ok(u);
-        }
-    }
-    let u = new_arms_uid();
-    acc.virtual_arms_uid = Some(u.clone());
-    acc.updated_at = now_ts();
-    save_account(paths, &acc)?;
-    Ok(u)
-}
-
+/// 只读取 ZCode 自身的监控 uid，绝不创建或改写监控存储文件。
 fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
     let read_uid = |f: &Path| -> Option<String> {
         fs::read_to_string(f)
@@ -1479,52 +1743,6 @@ fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
         }
     }
     files.iter().find_map(|f| read_uid(f))
-}
-
-pub fn write_live_arms_uid_to(dirs: &[PathBuf], uid: &str) -> Result<(), String> {
-    for d in dirs {
-        let mut jsons: Vec<PathBuf> = fs::read_dir(d)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if jsons.is_empty() {
-            fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
-            jsons.push(d.join(ARMS_DEFAULT_STORE_FILE));
-        }
-        let mut first_err: Option<String> = None;
-        for f in jsons {
-            let mut v: Value = fs::read_to_string(&f)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| json!({}));
-            if !v.is_object() {
-                v = json!({});
-            }
-            if v.get("_arms_uid").and_then(|u| u.as_str()) == Some(uid)
-                && v.get("_arms_session").is_none()
-            {
-                continue;
-            }
-            let obj = v.as_object_mut().unwrap();
-            obj.insert("_arms_uid".into(), json!(uid));
-            obj.remove("_arms_session");
-            if let Err(e) = atomic_write(&f, &(serde_json::to_string(&v).unwrap_or_default() + "\n")) {
-                first_err.get_or_insert(e);
-            }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-fn write_live_arms_uid(paths: &Paths, uid: &str) -> Result<(), String> {
-    write_live_arms_uid_to(&arms_store_dirs_for(paths), uid)
 }
 
 fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
@@ -1556,11 +1774,12 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
             "createdAt": a.created_at,
             "credentials": a.credentials,
             "config": a.config,
+            "claimDeviceMid": a.virtual_device_mid,
         })).collect::<Vec<_>>(),
     })
 }
 
-type ImportCandidate = (Option<String>, Value, Option<Value>);
+type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);
 
 fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
     if v.get("format").and_then(|f| f.as_str()) == Some("zcode-accounts-bundle") {
@@ -1575,6 +1794,8 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
                 item.get("config").cloned(),
+                item.get("claimDeviceMid").and_then(Value::as_str)
+                    .filter(|mid| !mid.trim().is_empty()).map(String::from),
             ));
         }
         return Ok(out);
@@ -1596,7 +1817,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 continue;
             }
         };
-        for (name_opt, creds, config_opt) in cands {
+        for (name_opt, creds, config_opt, claim_mid) in cands {
             if !is_logged_in(&creds) {
                 report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
@@ -1620,7 +1841,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 hash,
                 credentials: creds,
                 config: config_opt,
-                virtual_device_mid: None,
+                virtual_device_mid: claim_mid,
                 virtual_arms_uid: None,
             };
             new_accounts.push(acc);
@@ -1635,7 +1856,14 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
 }
 
 pub fn get_state(paths: &Paths) -> Result<AppState, String> {
-    let accounts = list_accounts(paths)?;
+    let accounts = {
+        let _guard = QUOTA_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let accounts = list_accounts(paths)?;
+        let secret = zcrypto::default_secret(&paths.home);
+        let revisions = accounts.iter().map(|a| (a.id.clone(),crate::quota_auth::quota_revision(a,&secret))).collect::<Vec<_>>();
+        crate::project_token::service().reconcile(&revisions);
+        accounts
+    };
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);
     let live_logged_in = live.as_ref().map(is_logged_in).unwrap_or(false);
@@ -1645,13 +1873,14 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
     let live_identity = live
         .as_ref()
         .filter(|_| live_logged_in)
-        .map(|v| zcrypto::account_identity(v, &paths.home));
+        .map(|v| with_identity_scope(zcrypto::account_identity(v, &paths.home), v, &paths.home));
     let (zcode_path, zcode_path_ok) = effective_zcode_path(paths);
     let settings = load_settings(paths);
     let summaries = accounts
         .iter()
         .map(|a| AccountSummary {
             id: a.id.clone(),
+            quota_revision: crate::quota_auth::quota_revision(a, &zcrypto::default_secret(&paths.home)),
             name: a.name.clone(),
             created_at: a.created_at.clone(),
             updated_at: a.updated_at.clone(),
@@ -1659,7 +1888,11 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
             has_config: a.config.is_some(),
             has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
             jwt_expired: account_jwt_expired(&a.credentials, &paths.home),
-            identity: zcrypto::account_identity(&a.credentials, &paths.home),
+            identity: with_identity_scope(
+                zcrypto::account_identity(&a.credentials, &paths.home),
+                &a.credentials,
+                &paths.home,
+            ),
         })
         .collect();
     Ok(AppState {

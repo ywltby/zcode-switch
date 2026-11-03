@@ -7,6 +7,7 @@ import {
   createClaimState,
   invalidateClaimEntry,
   releaseClaimRequest,
+  setClaimRevision,
   settleClaimRequest,
   syncClaimAccounts,
 } from "./claim-state.js";
@@ -38,6 +39,7 @@ export function createClaimFlow({
   onResult = () => {},
   refreshState = async () => {},
   isLive = () => false,
+  liveHash = () => "",
 }) {
   let model = createClaimState();
   let live = [];
@@ -69,7 +71,13 @@ export function createClaimFlow({
   }
 
   function applyAccounts(accounts, extraIds = []) {
-    const next = [...(accounts || []), ...(extraIds || []).map((id) => ({ id, quota_revision: LIVE_REVISION }))];
+    // Extra rows (e.g. the live login) may carry a real generation key: callers pass
+    // `{ id, revision }` so a replaced login changes the signature and invalidates
+    // tickets from the previous one. Plain strings keep the placeholder revision.
+    const extra = (extraIds || []).map((entry) => typeof entry === "string"
+      ? { id: entry, quota_revision: LIVE_REVISION }
+      : { id: entry.id, quota_revision: entry.revision || LIVE_REVISION });
+    const next = [...(accounts || []), ...extra];
     const signature = next.map((a) => `${a.id}\u0000${a.quota_revision}`).join("\u0001");
     if (signature === liveSignature) {
       live = next;
@@ -89,10 +97,15 @@ export function createClaimFlow({
     const command = ticket.kind === "refresh" ? "claim_refresh" : "claim_preview";
     try {
       const liveRow = isLive(ticket.id);
+      // 界面当前展示的 live 快照：结果若属于另一个登录，直接丢弃（不 settle、不采纳 revision）。
+      const expectedLiveHash = liveRow ? liveHash() : "";
       const response = await invoke(command, liveRow
         ? { id: ticket.id }
         : { id: ticket.id, revision: ticket.revision });
       if (response?.accountId !== ticket.id) return { status: "skipped" };
+      if (liveRow && response.liveHash && expectedLiveHash && response.liveHash !== expectedLiveHash) {
+        return { status: "skipped" };
+      }
       // The live row's revision is a placeholder; the backend owns the real one.
       if (!liveRow && response.revision && response.revision !== ticket.revision) return { status: "skipped" };
       const settled = settleClaimRequest(model, ticket, {
@@ -100,10 +113,21 @@ export function createClaimFlow({
         activationError: response.activationError,
       });
       const accepted = settled !== model;
-      setModel(settled);
+      // The live row binds to the backend's own revision: the first eligibility read is
+      // what makes a later claim reject a login that changed in between.
+      const adopted = accepted && liveRow && typeof response.revision === "string"
+        ? setClaimRevision(settled, ticket.id, response.revision)
+        : settled;
+      setModel(adopted);
       if (!accepted) return { status: "skipped" };
       // Publish without awaiting the consumer: claiming must not hold a scan slot.
-      onResult({ id: ticket.id, revision: ticket.revision, plans: response.plans || [], kind: ticket.kind });
+      onResult({
+        id: ticket.id,
+        revision: ticket.revision,
+        plans: response.plans || [],
+        kind: ticket.kind,
+        liveHash: response.liveHash || null,
+      });
       return {
         status: "ok",
         plans: response.plans || [],

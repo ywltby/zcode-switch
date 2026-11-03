@@ -54,3 +54,15 @@ export function invalidateClaimEntry(model, id) {
   if (!entry) return model;
   return { ...model, entries: { ...model.entries, [id]: { ...entryFor({ quota_revision: entry.revision }) } } };
 }
+
+/**
+ * Adopt the revision the backend reported for a row. The live login has no stored
+ * revision, so its first eligibility read is what binds later claims to a concrete
+ * backend account generation. Ignored while a request is in flight: accepting it then
+ * would invalidate the very ticket that produced it.
+ */
+export function setClaimRevision(model, id, revision) {
+  const entry = model.entries[id];
+  if (!entry || entry.busy || !revision || entry.revision === revision) return model;
+  return { ...model, entries: { ...model.entries, [id]: { ...entry, revision } } };
+}

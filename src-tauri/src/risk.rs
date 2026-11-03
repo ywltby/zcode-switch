@@ -91,13 +91,17 @@ pub(crate) fn record_strike(paths: &Paths, account_id: &str) {
 }
 
 /// 上游错误消息观测：仅命中风控特征才记 strike（避免网络抖动误伤）。
-pub(crate) fn observe_upstream_failure(paths: &Paths, account_id: &str, message: &str) {
+/// 判断一条上游错误是否属于风控信号（3012 / unusual activity）。
+pub(crate) fn is_risk_signal(message: &str) -> bool {
     let l = message.to_lowercase();
-    let hit = message.contains("3012")
+    message.contains("3012")
         || l.contains("unusual activity")
         || message.contains("风控")
-        || l.contains("risk control");
-    if hit {
+        || l.contains("risk control")
+}
+
+pub(crate) fn observe_upstream_failure(paths: &Paths, account_id: &str, message: &str) {
+    if is_risk_signal(message) {
         record_strike(paths, account_id);
     }
 }

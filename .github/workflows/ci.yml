@@ -20,6 +20,38 @@ jobs:
       - run: npm run check:i18n
       - run: npm run build
 
+  ui-regression:
+    name: browser regression (synthetic data)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install Playwright (Chromium)
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+      # 只使用合成账号与本地 mock：Vite 只服务本仓库源码，外部请求由各测试阻止。
+      - name: Run UI acceptance suites
+        run: |
+          npx vite --port 5173 --strictPort &
+          VITE_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5173 >/dev/null; then break; fi
+            sleep 1
+          done
+          status=0
+          for suite in quota-ui claim-ui claim-queue-ui claim-single-ui captcha-ui scroll-ui claim-eligibility-ui live-claim-ui identity-isolation-ui live-scope-ui legacy-history-ui claim-hold-ui; do
+            echo "== $suite =="
+            python3 "tests/$suite.py" || status=1
+          done
+          kill "$VITE_PID"
+          exit $status
+
   test-windows:
     name: cargo test (windows)
     runs-on: windows-latest
@@ -35,6 +67,20 @@ jobs:
       - name: cargo test
         run: cargo test --lib
         working-directory: src-tauri
+
+      # 领取协议 / 活动发现 / 缓存 TTL / 风控退避的 mock 集成测试（本地 127.0.0.1，断网可跑）
+      - name: cargo test (mock upstream)
+        run: cargo test --test mock_upstream -- --test-threads=1
+        working-directory: src-tauri
+
+      # 切换安全回归：用真实 CLI + 合成账号验证过期快照拒绝、原生设备/监控文件不被改写、
+      # 备份往返保留 claimDeviceMid
+      - name: build cli
+        run: cargo build
+        working-directory: src-tauri
+
+      - name: native switch safety (synthetic data)
+        run: python tests/native-switch-safety.py
 
   check-portability:
     name: cargo test (${{ matrix.os }})
@@ -65,6 +111,13 @@ jobs:
         run: |
           cd src-tauri
           cargo test --lib 2>&1 | tee check.log
+          exit ${PIPESTATUS[0]}
+
+      - name: cargo test (mock upstream)
+        shell: bash
+        run: |
+          cd src-tauri
+          cargo test --test mock_upstream -- --test-threads=1 2>&1 | tee -a check.log
           exit ${PIPESTATUS[0]}
 
       - name: Publish log on failure

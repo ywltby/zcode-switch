@@ -5,6 +5,7 @@ import {
   createClaimState,
   invalidateClaimEntry,
   releaseClaimRequest,
+  setClaimRevision,
   settleClaimRequest,
   syncClaimAccounts,
 } from "../src/claim-state.js";
@@ -79,4 +80,33 @@ test("explicit refresh invalidates plans that were started before a claim", () =
   assert.deepEqual(cleared.entries.a.plans, []);
   assert.equal(cleared.entries.a.busy, false);
   assert.deepEqual(cleared.entries.b, loaded.entries.b);
+});
+
+test("live rows adopt the backend revision for the next claim", () => {
+  const model = syncClaimAccounts(createClaimState(), [{ id: "live", quota_revision: "hash-1" }]);
+  const first = beginClaimRequest(model, "live", "preview");
+  const settled = settleClaimRequest(first.model, first.ticket, { plans: plans() });
+  // 后端返回的真实 revision 必须成为该行后续领取的绑定代次
+  const revised = setClaimRevision(settled, "live", "backend-rev-1");
+  assert.equal(revised.entries.live.revision, "backend-rev-1");
+  assert.equal(beginClaimRequest(revised, "live", "refresh").ticket.revision, "backend-rev-1");
+});
+
+test("revision adoption never revives a replaced login ticket", () => {
+  const model = syncClaimAccounts(createClaimState(), [{ id: "live", quota_revision: "hash-1" }]);
+  const first = beginClaimRequest(model, "live", "preview");
+  const settled = settleClaimRequest(first.model, first.ticket, { plans: plans() });
+  const revised = setClaimRevision(settled, "live", "backend-rev-1");
+  const pending = beginClaimRequest(revised, "live", "refresh");
+  // 换登录：行按新代次重建，旧 ticket 的结果不得落进来
+  const switched = syncClaimAccounts(pending.model, [{ id: "live", quota_revision: "hash-2" }]);
+  assert.strictEqual(settleClaimRequest(switched, pending.ticket, { plans: plans("late") }), switched);
+  assert.equal(switched.entries.live.revision, "hash-2");
+});
+
+test("revision adoption ignores empty values and removed rows", () => {
+  const model = syncClaimAccounts(createClaimState(), [{ id: "live", quota_revision: "hash-1" }]);
+  assert.strictEqual(setClaimRevision(model, "live", ""), model);
+  assert.strictEqual(setClaimRevision(model, "missing", "x"), model);
+  assert.strictEqual(setClaimRevision(model, "live", "hash-1"), model);
 });

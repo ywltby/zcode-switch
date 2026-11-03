@@ -4,6 +4,7 @@ use crate::quota_auth::{PlanScope, QuotaError};
 use crate::quota_http::Request;
 use crate::test_support::{account, SECRET};
 use serde_json::json;
+use std::fs;
 use std::sync::Mutex;
 
 #[test]
@@ -612,4 +613,66 @@ fn balance_status_whitespace_matches_validation() {
         {"user_plan_id":"active","plan_id":"start","status":" active ","ends_at":1910000000}
     ],"balances":[]}}));
     assert_eq!(result.plans.len(), 1);
+}
+
+#[test]
+fn version_comparison_is_numeric_not_lexicographic() {
+    assert!(version_ge("3.16.3", "3.15.1"));
+    assert!(version_ge("3.16.3", "3.16.3"));
+    assert!(!version_ge("3.9", "3.10"), "3.9 必须小于 3.10");
+    assert!(version_ge("3.16", "3.16.0"), "缺失段按 0 计");
+    assert!(!version_ge("2.99", "3.0"));
+}
+
+#[test]
+fn claim_version_never_drops_below_the_builtin_floor() {
+    assert_eq!(pick_app_version("3.1.0"), CLAIM_APP_VERSION);
+    assert_eq!(pick_app_version("3.16.3"), CLAIM_APP_VERSION);
+    assert_eq!(pick_app_version("3.17.2"), "3.17.2");
+    assert_eq!(normalize_version("3.17.2.5"), "3.17.2");
+}
+
+#[test]
+fn app_version_keeps_the_freshest_known_value() {
+    // 注入 home，不触碰进程环境变量与全局缓存：并行执行也不会污染其他用例。
+    let home = std::env::temp_dir().join(format!(
+        "zsw-version-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(home.join(".zcode-switch")).unwrap();
+    let cache = home.join(".zcode-switch").join("changelog-cache.json");
+
+    // 较新的 changelog 缓存生效
+    fs::write(&cache, r#"{"version":"9.9.9","fetched_at":9999999999}"#).unwrap();
+    assert_eq!(app_version_for(&home), "9.9.9");
+
+    // 旧缓存不得把版本降级到内置下限以下
+    fs::write(&cache, r#"{"version":"3.0.0","fetched_at":9999999999}"#).unwrap();
+    let fresh = app_version_for(&home);
+    assert!(
+        version_ge(&fresh, CLAIM_APP_VERSION),
+        "旧缓存/探测失败时必须回退到内置下限，实际 {fresh}"
+    );
+
+    // 无缓存时同样不低于内置下限
+    let _ = fs::remove_file(&cache);
+    assert!(version_ge(&app_version_for(&home), CLAIM_APP_VERSION));
+
+    // 两个 home 互不影响（无共享缓存）
+    let other = home.join("other");
+    fs::create_dir_all(other.join(".zcode-switch")).unwrap();
+    fs::write(
+        other.join(".zcode-switch").join("changelog-cache.json"),
+        r#"{"version":"9.9.10","fetched_at":9999999999}"#,
+    )
+    .unwrap();
+    assert_eq!(app_version_for(&other), "9.9.10");
+    assert!(version_ge(&app_version_for(&home), CLAIM_APP_VERSION));
+    assert!(!version_ge(&app_version_for(&home), "9.9.10"));
+
+    let _ = fs::remove_dir_all(&home);
 }

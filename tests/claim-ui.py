@@ -91,6 +91,7 @@ MOCK = r"""
       }
       if (command === 'claim_cancel') return { phase: 'cancelled', cancelled: true, submissionInFlight: false };
       if (command === 'claim_acknowledge_unknown') { fixture.acknowledged.push(args.claimId); return true; }
+      if (command === 'claim_legacy_count') return [];
       if (command === 'claim_sessions') {
         return { sessions: [fixture.session('old-2', 'account-2', 'unknown'), fixture.session('old-4', 'account-4', 'unknown'),
           fixture.session('sub-3', 'account-3', 'submitting')], recovery: { ok: true } };

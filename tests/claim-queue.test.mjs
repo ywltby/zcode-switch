@@ -166,3 +166,25 @@ test("deletion before the consumer starts never submits the reserved snapshot", 
   await tick();
   assert.equal(h.started.length, 0);
 });
+
+test("an empty eligibility read withdraws that account's queued jobs", async () => {
+  const h = harness();
+  h.block(true);
+  h.offer("a", [plan("p1"), plan("p2")]);
+  assert.equal(h.queue.pendingCount(), 2);
+  h.offer("a", []);
+  assert.equal(h.queue.pendingCount(), 0, "空结果必须撤销该账号尚未开始的排队任务");
+});
+
+test("jobs filtered out by admission are withdrawn while other accounts keep theirs", async () => {
+  const h = harness();
+  h.block(true);
+  h.offer("a", [plan("p1")]);
+  h.offer("b", [plan("p1")]);
+  assert.equal(h.queue.pendingCount(), 2);
+  // a 的刷新结果不再包含任何可领条目 → 只撤销 a 的排队任务
+  h.offer("a", []);
+  assert.equal(h.queue.pendingCount(), 1);
+  assert.equal(h.queue.status("a"), null);
+  assert.equal(h.queue.status("b"), "queued");
+});

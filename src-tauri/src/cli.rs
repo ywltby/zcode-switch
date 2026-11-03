@@ -55,7 +55,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         out
     };
     let paths = Paths::detect();
-    crate::net::set_proxy(load_settings(&paths).auth_proxy().map(str::to_string));
+    crate::set_traffic_proxy(load_settings(&paths).auth_proxy().map(str::to_string));
 
     if let Some(l) = lang_override {
         crate::i18n::set(l);
@@ -140,7 +140,8 @@ pub fn run(args: &[String]) -> (String, i32) {
                 settings.hot_switch()
             };
             match switch_to(&paths, &id, force, restart, hot) {
-                Ok(r) => {
+                Ok(mut r) => {
+                    r.probe = run_switch_probe(&paths, &id);
                     if let Some(p) = &r.probe {
                         let msg = crate::probe::probe_message(p);
                         if !msg.is_empty() {
@@ -169,120 +170,64 @@ pub fn run(args: &[String]) -> (String, i32) {
         }
         "claim-preview" => {
             let only = flag(rest, "--id");
+            let wants = |id: &str| only.as_deref().map_or(true, |want| want == id);
+            let mut targets: Vec<(String, String, Account)> = vec![];
+            if wants(LIVE_ID) {
+                match live_claim_snapshot(&paths) {
+                    Ok(mut acc) => {
+                        acc.name = crate::zcrypto::account_identity(&acc.credentials, &paths.home)
+                            .label()
+                            .unwrap_or_else(|| crate::i18n::tr("claim.live_name"));
+                        targets.push((LIVE_ID.to_string(), acc.name.clone(), acc));
+                    }
+                    Err(e) => {
+                        if only.as_deref() == Some(LIVE_ID) {
+                            return (err(&e), 1);
+                        }
+                    }
+                }
+            }
             let accounts = match list_accounts(&paths) {
                 Ok(a) => a,
                 Err(e) => return (err(&e), 1),
             };
+            for acc in accounts.iter().filter(|a| wants(&a.id)) {
+                targets.push((acc.id.clone(), acc.name.clone(), acc.clone()));
+            }
             let mut any = false;
             let mut items = vec![];
-            for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
-                let res = ensure_virtual_device_mid(&paths, &acc.id).and_then(|mid| {
-                    crate::claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
-                });
+            for (id, name, acc) in targets {
+                // live 凭据只读借用（自带真实设备 id，缺省时留空）；存储账号确保已有虚拟设备 id。
+                let res = if id == LIVE_ID {
+                    crate::claim::collect_claimable_plans(
+                        &paths.home,
+                        &acc.credentials,
+                        acc.config.as_ref(),
+                        acc.virtual_device_mid.clone().unwrap_or_default(),
+                    )
+                } else {
+                    ensure_virtual_device_mid(&paths, &id)
+                        .and_then(|mid| crate::claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid))
+                };
                 match res {
                     Ok(plans) => {
                         if !plans.is_empty() {
                             any = true;
                         }
                         items.push(json!({
-                            "id": acc.id,
-                            "name": acc.name,
+                            "id": id,
+                            "name": name,
                             "plans": plans,
                         }));
                     }
                     Err(e) => items.push(json!({
-                        "id": acc.id,
-                        "name": acc.name,
+                        "id": id,
+                        "name": name,
                         "error": e,
                     })),
                 }
             }
             ok(json!({ "anyClaimable": any, "accounts": items }))
-        }
-        // 诊断用：原样打印上游响应，排查「看不到活动 / 生效时间取自哪个字段」。
-        // --only preview|marketing|current 可只跑一个通道。
-        "claim-raw" => {
-            let Some(id) = flag(rest, "--id") else {
-                return (err("--id required"), 1);
-            };
-            let acc = match load_account(&paths, &id) {
-                Ok(a) => a,
-                Err(e) => return (err(&e), 1),
-            };
-            let mid = match ensure_virtual_device_mid(&paths, &id) {
-                Ok(m) => m,
-                Err(e) => return (err(&e), 1),
-            };
-            let only = flag(rest, "--only");
-            let want = |k: &str| only.as_deref().map_or(true, |o| o == k);
-            let pick = |r: Result<Value, String>| match r {
-                Ok(v) => v,
-                Err(e) => json!({ "error": e }),
-            };
-            let mut out = serde_json::Map::new();
-            if want("preview") {
-                out.insert(
-                    "preview".into(),
-                    pick(crate::claim::raw_preview(
-                        &paths.home,
-                        &acc.credentials,
-                        acc.config.as_ref(),
-                        Some(mid.clone()),
-                    )),
-                );
-            }
-            if want("marketing") {
-                out.insert(
-                    "marketing".into(),
-                    pick(crate::claim::raw_marketing(
-                        &paths.home,
-                        &acc.credentials,
-                        acc.config.as_ref(),
-                        Some(mid.clone()),
-                    )),
-                );
-            }
-            if want("current") {
-                out.insert(
-                    "current".into(),
-                    pick(crate::claim::raw_current(
-                        &paths.home,
-                        &acc.credentials,
-                        acc.config.as_ref(),
-                        Some(mid.clone()),
-                    )),
-                );
-            }
-            ok(Value::Object(out))
-        }
-        // 诊断用：查该账号「已生效」的套餐（billing/current）+ 本地领取历史。
-        // 用于区分「服务端没下发活动（无资格）」与「已经领过了（此处或别处）」。
-        "claim-current" => {
-            let Some(id) = flag(rest, "--id") else {
-                return (err("--id required"), 1);
-            };
-            let acc = match load_account(&paths, &id) {
-                Ok(a) => a,
-                Err(e) => return (err(&e), 1),
-            };
-            let mid = match ensure_virtual_device_mid(&paths, &id) {
-                Ok(m) => m,
-                Err(e) => return (err(&e), 1),
-            };
-            match crate::claim::fetch_active_plans(
-                &paths.home,
-                &acc.credentials,
-                acc.config.as_ref(),
-                Some(mid),
-            ) {
-                Ok(plans) => ok(json!({
-                    "id": acc.id,
-                    "name": acc.name,
-                    "plans": plans,
-                    "history": claim_history_for(&paths, &id),
-                })),
-                Err(e) => return (err(&e), 1),
-            }
         }
         "reset-device" => {
             let Some(id) = flag(rest, "--id") else {

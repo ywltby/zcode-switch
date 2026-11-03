@@ -3,14 +3,40 @@ pub mod cli;
 pub mod i18n;
 pub mod changelog;
 pub mod claim;
+mod claim_session;
 mod flowlog;
 mod net;
 mod oauth;
 mod probe;
+mod project_token;
 mod quota;
+mod quota_auth;
+mod quota_http;
 mod risk;
 mod store;
+#[cfg(test)]
+mod test_support;
 mod zcrypto;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_prepare_aborts_on_risk_signals_only() {
+        // 3012 / unusual activity：必须中止（不打开验证码、不提交）
+        assert!(claim_prepare_abort(
+            r#"preview HTTP 405: {"provider_code":3012,"message":"request has been blocked due to unusual activity"}"#
+        )
+        .is_some());
+        assert!(claim_prepare_abort("blocked due to unusual activity").is_some());
+        assert!(claim_prepare_abort("命中风控策略").is_some());
+        // 普通预览失败：降级继续（beta.11：本地列表不决定最终资格）
+        assert!(claim_prepare_abort("preview network_error").is_none());
+        assert!(claim_prepare_abort("project_key_missing").is_none());
+        assert!(claim_prepare_abort("").is_none());
+    }
+}
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +52,17 @@ const TRAY_ID: &str = "main";
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Process-wide egress proxy. This is the single slot every outbound agent reads
+/// (quota, claim/preview/marketing, activation reporting and probes); the GUI's
+/// `set_auth_proxy` and the CLI both write it.
+pub fn set_traffic_proxy(url: Option<String>) {
+    net::set_proxy(url);
+}
+
+pub fn traffic_proxy() -> Option<String> {
+    net::proxy()
+}
+
 /// 托盘 tooltip 上附加的「新活动」提示（None = 无提示）。
 /// Windows 便携版拿不到 Toast，悬停托盘图标看提示是最可靠的可见通道。
 static ACTIVITY_TIP: Mutex<Option<String>> = Mutex::new(None);
@@ -39,24 +76,87 @@ fn activity_tip_guard() -> std::sync::MutexGuard<'static, Option<String>> {
     }
 }
 
-#[derive(Clone)]
-struct PendingClaim {
-    account_id: String,
-    account_name: String,
-    plan_id: String,
-    plan_name: String,
-    credentials: Value,
-    config: Option<Value>,
-    device_mid: String,
-}
-
-static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
-
-fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
-    match PENDING_CLAIM.lock() {
-        Ok(g) => g,
+fn claim_registry_guard() -> std::sync::MutexGuard<'static, Option<claim_session::ClaimRegistry>> {
+    static CLAIM_REGISTRY: std::sync::Mutex<Option<claim_session::ClaimRegistry>> =
+        std::sync::Mutex::new(None);
+    match CLAIM_REGISTRY.lock() {
+        Ok(mut guard) => {
+            if guard.is_none() {
+                let paths = Paths::detect();
+                *guard = Some(claim_session::ClaimRegistry::load(
+                    claim_session::attempts_path(&paths.store_dir()),
+                ));
+            }
+            guard
+        }
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Claim snapshots cover a stored account (which owns a virtual device id) and the
+/// login ZCode runs right now (`live`, real live credentials + telemetry device id,
+/// nothing written to disk).
+fn claim_snapshot(paths: &Paths, id: &str, expected: Option<&str>) -> Result<store::ClaimSnapshot, String> {
+    let mut snapshot = store::claim_snapshot_locked(paths, id, expected)?;
+    if id == store::LIVE_ID {
+        snapshot.account.name = zcrypto::account_identity(&snapshot.account.credentials, &paths.home)
+            .label()
+            .unwrap_or_else(|| i18n::tr("claim.live_name"));
+    }
+    Ok(snapshot)
+}
+
+/// Re-reading must not revive a claim prepared for a different login.
+fn claim_revision_ok(paths: &Paths, id: &str, revision: &str) -> bool {
+    store::claim_revision_matches(paths, id, revision)
+}
+
+fn claim_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// 领取准备阶段的错误是否需要中止本次领取：只有风控信号（3012 / unusual activity）
+/// 必须停下并进入冷却；其他预览失败按 beta.11 约定降级（本地列表不决定最终资格）。
+fn claim_prepare_abort(error: &str) -> Option<String> {
+    risk::is_risk_signal(error).then(|| i18n::trf("err.risk.preview", &[("err", error)]))
+}
+
+/// Tauri 失败结果的唯一构造点：业务码、terminal、challenge、nextAt、unknown 与会话
+/// 归属字段必须一起出现，自动队列/到点领取和界面都从这里取。
+fn claim_failure_result(
+    summary: &claim_session::ClaimSummary,
+    error: &claim::ClaimError,
+    cooling_secs: i64,
+) -> Value {
+    let mut payload = claim::failure_payload(
+        &summary.account_id,
+        &summary.account_name,
+        &summary.plan_name,
+        error,
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("claimId".into(), json!(summary.claim_id));
+        object.insert("planId".into(), json!(summary.plan_id));
+        object.insert("revision".into(), json!(summary.revision));
+        object.insert("unknown".into(), json!(error.unknown));
+        if cooling_secs > 0 {
+            object.insert("coolingSecs".into(), json!(cooling_secs));
+        }
+    }
+    payload
+}
+
+fn finish_claim(claim_id: &str, phase: claim_session::ClaimPhase, result: Option<Value>) -> bool {
+    claim_registry_guard()
+        .as_mut()
+        .map(|registry| registry.finish(claim_id, phase, result))
+        .unwrap_or(false)
+}
+
+fn claim_summary_json(claim_id: &str) -> Option<Value> {
+    let registry = claim_registry_guard();
+    let summary = registry.as_ref()?.status(claim_id)?;
+    serde_json::to_value(summary).ok()
 }
 
 fn store_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -293,22 +393,59 @@ async fn get_account_quota(id: String, force: Option<bool>) -> Result<quota::Quo
     .await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimPreviewResult {
+    account_id: String,
+    revision: String,
+    plans: Vec<claim::ClaimPlan>,
+    /// live 行专用：本结果依据的后端登录快照（与 get_state 的 live_hash 同源）。
+    /// 前端据此拒绝「界面已不是这个登录」的迟到结果。
+    #[serde(rename = "liveHash", skip_serializing_if = "Option::is_none")]
+    live_hash: Option<String>,
+}
+
 #[tauri::command]
-async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
+async fn claim_preview(id: String, revision: Option<String>) -> Result<ClaimPreviewResult, String> {
     run_blocking(move || {
         let paths = Paths::detect();
-        // 冷却期零上游流量：preview 也是 billing 请求，必须一起挡住
         if risk::is_cooling(&paths, &id) {
             let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
             return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
         }
-        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-        let acc = load_account(&paths, &id)?;
-        claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
-            .map_err(|e| {
-                risk::observe_upstream_failure(&paths, &id, &e);
-                e
-            })
+        let snapshot = {
+            let _guard = store_guard();
+            claim_snapshot(&paths, &id, revision.as_deref())?
+        };
+        if snapshot.device_initialized && revision.is_some() {
+            // The device id changed the account revision before any HTTP request.
+            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        }
+        let plans = claim::collect_claimable_plans(
+            &paths.home,
+            &snapshot.account.credentials,
+            snapshot.account.config.as_ref(),
+            snapshot.account.virtual_device_mid.clone().unwrap_or_default(),
+        )
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
+        let unchanged = {
+            let _guard = store_guard();
+            claim_revision_ok(&paths, &id, &snapshot.revision)
+        };
+        if !unchanged {
+            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        }
+        Ok(ClaimPreviewResult {
+            account_id: id.clone(),
+            revision: snapshot.revision,
+            plans,
+            live_hash: (id == store::LIVE_ID)
+                .then(|| store::live_snapshot_hash(&paths))
+                .flatten(),
+        })
     })
     .await
 }
@@ -318,29 +455,74 @@ async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
 struct ClaimCurrentResult {
     plans: Vec<claim::ActivePlan>,
     history: Vec<Value>,
+    /// 无身份的旧历史：单独返回，由用户显式确认或清理，不并入当前登录。
+    #[serde(rename = "legacyHistory")]
+    legacy_history: Vec<Value>,
+    /// 本结果依据的后端快照代次与身份：前端据此判断「这条结果是不是当前界面上的账号」。
+    revision: String,
+    #[serde(rename = "liveHash", skip_serializing_if = "Option::is_none")]
+    live_hash: Option<String>,
+    #[serde(rename = "identityScope", skip_serializing_if = "Option::is_none")]
+    identity_scope: Option<String>,
 }
 
 #[tauri::command]
 async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
     run_blocking(move || {
         let paths = Paths::detect();
+        let secret = zcrypto::default_secret(&paths.home);
+        // 领取历史按「账号 + 真实登录身份」隔离：同一个账号槽保存成另一登录后，
+        // 不得继续看到上一个登录的领取记录（live 行同理）。
+        let identity_for = |account: &store::ClaimSnapshot| -> Option<String> {
+            Some(claim_session::identity_scope(&account.account.credentials, &secret))
+        };
+        let live_hash_for = |snapshot: &store::ClaimSnapshot| -> Option<String> {
+            // 必须由同一份快照派生：再次读 live 文件会与 revision/identity 来自不同时刻。
+            (snapshot.account.id == store::LIVE_ID)
+                .then(|| store::canonical_hash(&snapshot.account.credentials))
+        };
         // 冷却期零上游流量：current 只回本地历史，不发上游请求（避免冷却被反复刷新击穿）
         if risk::is_cooling(&paths, &id) {
+            let snapshot = {
+                let _guard = store_guard();
+                claim_snapshot(&paths, &id, None).ok()
+            };
+            let identity = snapshot.as_ref().and_then(identity_for);
             return Ok(ClaimCurrentResult {
                 plans: Vec::new(),
-                history: store::claim_history_for(&paths, &id),
+                history: store::claim_history_for_identity(&paths, &id, identity.as_deref()),
+                legacy_history: store::claim_history_legacy_for(&paths, &id),
+                revision: snapshot.as_ref().map(|s| s.revision.clone()).unwrap_or_default(),
+                live_hash: snapshot.as_ref().and_then(live_hash_for),
+                identity_scope: identity,
             });
         }
-        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-        let acc = load_account(&paths, &id)?;
-        let plans =
-            claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
-                .map_err(|e| {
-                    risk::observe_upstream_failure(&paths, &id, &e);
-                    e
-                })?;
-        let history = store::claim_history_for(&paths, &id);
-        Ok(ClaimCurrentResult { plans, history })
+        // Also covers the live row: claim_snapshot borrows live credentials + telemetry
+        // device id and never reads accounts/live.json.
+        let snapshot = {
+            let _guard = store_guard();
+            claim_snapshot(&paths, &id, None)?
+        };
+        let identity = identity_for(&snapshot);
+        let plans = claim::fetch_active_plans(
+            &paths.home,
+            &snapshot.account.credentials,
+            snapshot.account.config.as_ref(),
+            snapshot.account.virtual_device_mid.clone(),
+        )
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
+        let history = store::claim_history_for_identity(&paths, &id, identity.as_deref());
+        Ok(ClaimCurrentResult {
+            plans,
+            history,
+            legacy_history: store::claim_history_legacy_for(&paths, &id),
+            revision: snapshot.revision.clone(),
+            live_hash: live_hash_for(&snapshot),
+            identity_scope: identity,
+        })
     })
     .await
 }
@@ -348,36 +530,75 @@ async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaimRefreshResult {
+    account_id: String,
+    revision: String,
     plans: Vec<claim::ClaimPlan>,
     activated: bool,
     activation_error: Option<String>,
+    #[serde(rename = "liveHash", skip_serializing_if = "Option::is_none")]
+    live_hash: Option<String>,
 }
 
 #[tauri::command]
-async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
+async fn claim_refresh(id: String, revision: Option<String>, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
     run_blocking(move || {
         let paths = Paths::detect();
-        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-        let acc = load_account(&paths, &id)?;
         if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
             let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
             return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
         }
+        let snapshot = {
+            let _guard = store_guard();
+            claim_snapshot(&paths, &id, revision.as_deref())?
+        };
+        if snapshot.device_initialized && revision.is_some() {
+            return Err(claim::scope_payload(&id, &snapshot.revision, true));
+        }
+        let mid = snapshot.account.virtual_device_mid.clone().unwrap_or_default();
         let (activated, activation_error) =
-            match claim::telemetry_user_id(&paths.home, &acc.credentials) {
+            match claim::telemetry_user_id(&paths.home, &snapshot.account.credentials) {
                 Some(uid) => match claim::report_activation_events(&uid, &mid) {
                     Ok(()) => (true, None),
-                    Err(e) => (false, Some(e)),
+                    Err(e) => {
+                        // 激活上报的明确风控同样要进入冷却并中止本次领取；
+                        // 普通网络故障保持既有降级（只记录 activation_error）。
+                        risk::observe_upstream_failure(&paths, &id, &e);
+                        if let Some(message) = claim_prepare_abort(&e) {
+                            return Err(message);
+                        }
+                        (false, Some(e))
+                    }
                 },
                 None => (false, None),
             };
-        let plans =
-            claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
-                .map_err(|e| {
-                    risk::observe_upstream_failure(&paths, &id, &e);
-                    e
-                })?;
-        Ok(ClaimRefreshResult { plans, activated, activation_error })
+        let plans = claim::collect_claimable_plans(
+            &paths.home,
+            &snapshot.account.credentials,
+            snapshot.account.config.as_ref(),
+            mid,
+        )
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
+        let unchanged = {
+            let _guard = store_guard();
+            claim_revision_ok(&paths, &id, &snapshot.revision)
+        };
+        if !unchanged {
+            // The activation report was already sent, so this must not auto-retry.
+            return Err(claim::scope_payload(&id, &snapshot.revision, false));
+        }
+        Ok(ClaimRefreshResult {
+            account_id: id.clone(),
+            revision: snapshot.revision,
+            plans,
+            activated,
+            activation_error,
+            live_hash: (id == store::LIVE_ID)
+                .then(|| store::live_snapshot_hash(&paths))
+                .flatten(),
+        })
     })
     .await
 }
@@ -386,47 +607,207 @@ async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshRe
 async fn claim_start(
     app: AppHandle,
     id: String,
+    revision: Option<String>,
     plan_id: String,
-    auto: Option<bool>,
+    claim_id: Option<String>,
+    mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let app2 = app.clone();
+    let claim_id = claim_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mode = match mode.as_deref() {
+        Some("auto") => "auto",
+        Some("all") => "all",
+        _ => "manual",
+    };
+    let is_auto = mode == "auto";
+    let paths = Paths::detect();
+    let snapshot = {
+        let _guard = store_guard();
+        claim_snapshot(&paths, &id, revision.as_deref())?
+    };
+    if snapshot.device_initialized && revision.is_some() {
+        return Err(claim::scope_payload(&id, &snapshot.revision, true));
+    }
+    // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
+    if is_auto && risk::is_cooling(&paths, &id) {
+        return Err(i18n::tr("err.risk.cooling_auto"));
+    }
+    // 领取准备守卫：激活上报与验证码配置的明确风控都进入冷却并中止（不开窗、不提交）。
+    // 必须在注册会话之前完成，失败时不留下任何可继续执行的会话。
+    let activation_home = paths.home.clone();
+    let activation_creds = snapshot.account.credentials.clone();
+    let activation_mid = snapshot.account.virtual_device_mid.clone().unwrap_or_default();
+    let guard_paths = Paths { home: paths.home.clone(), data_root: paths.data_root.clone() };
+    let guard_id = id.clone();
     run_blocking(move || {
-        let paths = Paths::detect();
-        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-        let acc = load_account(&paths, &id)?;
-        // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
-        if auto.unwrap_or(false) && risk::is_cooling(&paths, &id) {
-            return Err(i18n::tr("err.risk.cooling_auto"));
+        claim_start_guards(
+            &guard_paths,
+            &guard_id,
+            || match activation_report_pending(&activation_home, &activation_creds, &activation_mid) {
+                Some(user_id) => claim::report_activation_events(&user_id, &activation_mid),
+                None => Ok(()),
+            },
+            || claim::fetch_captcha_config_checked().map(|_| ()),
+        )
+    })
+    .await?;
+    let secret = zcrypto::default_secret(&paths.home);
+    let scope = claim_session::identity_scope(&snapshot.account.credentials, &secret);
+    let now = claim_now_ms();
+    let mut session = claim_session::ClaimSession {
+        claim_id: claim_id.clone(),
+        account_id: id.clone(),
+        account_name: snapshot.account.name.clone(),
+        revision: snapshot.revision.clone(),
+        identity_scope: scope.clone(),
+        plan_id: plan_id.clone(),
+        plan_name: String::new(),
+        auto: is_auto,
+        created_at: now,
+        updated_at: now,
+        phase: claim_session::ClaimPhase::Preparing,
+        replaces: None,
+        material: claim_session::ClaimMaterial {
+            credentials: snapshot.account.credentials.clone(),
+            config: snapshot.account.config.clone(),
+            device_mid: snapshot.account.virtual_device_mid.clone().unwrap_or_default(),
+        },
+    };
+    {
+        let mut registry = claim_registry_guard();
+        let Some(registry) = registry.as_mut() else {
+            return Err(i18n::tr("err.claim.none_pending"));
+        };
+        if registry.blocks(&scope, &plan_id) {
+            // An unresolved submission only permits one acknowledged manual retry.
+            match registry.gate(mode, &scope, &plan_id) {
+                claim_session::StartGate::Allowed(replaced) => session.replaces = replaced,
+                claim_session::StartGate::Unconfirmed => return Err(i18n::tr("err.claim.unconfirmed")),
+            }
         }
-        let plans = claim::collect_claimable_plans(
-            &paths.home,
-            &acc.credentials,
-            acc.config.as_ref(),
-            mid.clone(),
+        match registry.try_start(session) {
+            Ok(_) => {}
+            Err(claim_session::StartError::Busy) => return Err(i18n::tr("err.claim.busy")),
+            Err(claim_session::StartError::Recovery) => {
+                return Err(i18n::tr("err.claim.recovery_blocked"))
+            }
+        }
+    }
+
+    let home = paths.home.clone();
+    let credentials = snapshot.account.credentials.clone();
+    let config = snapshot.account.config.clone();
+    let mid = snapshot.account.virtual_device_mid.clone();
+    let wanted = plan_id.clone();
+    let prepared = run_blocking(move || {
+        claim::collect_claimable_plans(
+            &home,
+            &credentials,
+            config.as_ref(),
+            mid.unwrap_or_default(),
         )
         .map_err(|e| {
             risk::observe_upstream_failure(&paths, &id, &e);
             e
-        })?;
-        let plan = plans
-            .iter()
-            .find(|p| p.plan_id == plan_id)
-            .ok_or_else(|| i18n::tr("err.claim.gone"))?;
-        let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
-
-        *pending_guard() = Some(PendingClaim {
-            account_id: acc.id.clone(),
-            account_name: acc.name.clone(),
-            plan_id: plan.plan_id.clone(),
-            plan_name: display.clone(),
-            credentials: acc.credentials,
-            config: acc.config,
-            device_mid: mid,
-        });
-        open_captcha_window(&app2, auto.unwrap_or(false))?;
-        Ok(json!({ "account": acc.name, "plan": display }))
+        })
     })
-    .await
+    .await;
+    // 风控命中（3012 / unusual activity）：记录冷却并中止本次准备——不开验证码窗口、
+    // 不发 claim POST。普通预览失败仍按 beta.11 的约定降级（本地列表不决定最终资格）。
+    if let Err(error) = &prepared {
+        if let Some(message) = claim_prepare_abort(error) {
+            finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
+            return Err(message);
+        }
+    }
+    // A campaign read only supplies the display name: the server decides whether this
+    // identity may claim the plan right now, so an empty or failed read must not block
+    // a claim the user already clicked. The session stays owned by this claim either way.
+    let display = claim::claim_display_name(prepared, &wanted);
+    let verifying = {
+        let mut registry = claim_registry_guard();
+        match registry.as_mut() {
+            Some(registry) => {
+                registry.update_plan_name(&claim_id, &display);
+                registry.mark_verifying(&claim_id)
+            }
+            None => false,
+        }
+    };
+    if !verifying {
+        // The session was cancelled while preparing: never open a window for it.
+        return Err(i18n::tr("err.claim.cancelled"));
+    }
+    if let Err(error) = open_captcha_window(&app, &claim_id, is_auto) {
+        finish_claim(&claim_id, claim_session::ClaimPhase::Failed, None);
+        return Err(error);
+    }
+    claim_summary_json(&claim_id).ok_or_else(|| i18n::tr("err.claim.none_pending"))
+}
+
+/// 返回本次需要上报的 user_id（每个 登录+设备 只上报一次）。
+fn activation_report_pending(
+    home: &std::path::Path,
+    credentials: &Value,
+    device_mid: &str,
+) -> Option<String> {
+    static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let user_id = claim::telemetry_user_id(home, credentials)?;
+    let key = format!("{user_id}:{device_mid}");
+    {
+        let mut done = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        if done.iter().any(|k| k == &key) {
+            return None;
+        }
+        done.push(key);
+    }
+    Some(user_id)
+}
+
+/// 归属前校验：用户确认时固定的身份作用域（live 另加快照哈希）必须与当前快照一致。
+/// 不一致时安全中止，旧记录保持未归属——绝不归给另一个身份。
+fn legacy_adopt_identity(
+    snapshot: &store::ClaimSnapshot,
+    requested_scope: Option<&str>,
+    requested_live_hash: Option<&str>,
+    secret: &str,
+) -> Result<String, String> {
+    if snapshot.account.id == store::LIVE_ID {
+        let current = store::canonical_hash(&snapshot.account.credentials);
+        if requested_live_hash != Some(current.as_str()) {
+            return Err(claim::scope_payload(&snapshot.account.id, &snapshot.revision, true));
+        }
+    }
+    let identity = claim_session::identity_scope(&snapshot.account.credentials, secret);
+    if requested_scope != Some(identity.as_str()) {
+        return Err(claim::scope_payload(&snapshot.account.id, &snapshot.revision, true));
+    }
+    Ok(identity)
+}
+
+/// claim_start 的准备守卫：激活上报与验证码配置。两者的明确风控都要进入同一冷却状态机
+/// 并中止本次领取；普通网络故障保持既有降级（激活忽略、配置回退）。
+/// 生产命令与测试使用同一实现，副作用通过闭包注入。
+fn claim_start_guards<A, C>(paths: &Paths, id: &str, activation: A, captcha: C) -> Result<(), String>
+where
+    A: FnOnce() -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
+{
+    if let Err(error) = activation() {
+        risk::observe_upstream_failure(paths, id, &error);
+        if let Some(message) = claim_prepare_abort(&error) {
+            return Err(message);
+        }
+    }
+    if let Err(error) = captcha() {
+        risk::observe_upstream_failure(paths, id, &error);
+        if let Some(message) = claim_prepare_abort(&error) {
+            return Err(message);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -437,97 +818,266 @@ async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
 #[tauri::command]
 async fn claim_captcha_submit(
     app: AppHandle,
+    claim_id: String,
     param: String,
     region: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let app2 = app.clone();
-    run_blocking(move || {
-        let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
-        let paths = Paths::detect();
-        let res = claim::submit_claim(
-            &paths.home,
-            &pending.credentials,
-            pending.config.as_ref(),
-            &pending.plan_id,
+    let summary = {
+        let registry = claim_registry_guard();
+        registry.as_ref().and_then(|r| r.status(&claim_id))
+    }
+    .ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
+    let material = {
+        let mut registry = claim_registry_guard();
+        let Some(registry) = registry.as_mut() else {
+            return Err(i18n::tr("err.claim.none_pending"));
+        };
+        match registry.begin_submit(&claim_id) {
+            Ok(material) => material,
+            Err(claim_session::SubmitError::PersistFailed) => {
+                registry.finish(&claim_id, claim_session::ClaimPhase::Failed, None);
+                return Err(i18n::tr("err.claim.marker_failed"));
+            }
+            Err(claim_session::SubmitError::NotReady) => {
+                return Err(i18n::tr("err.claim.already_submitted"))
+            }
+            Err(_) => return Err(i18n::tr("err.claim.none_pending")),
+        }
+    };
+
+    let paths = Paths::detect();
+    let home = paths.home.clone();
+    let plan_id = summary.plan_id.clone();
+    let submitted = match tauri::async_runtime::spawn_blocking(move || {
+        claim::submit_claim(
+            &home,
+            &material.credentials,
+            material.config.as_ref(),
+            &plan_id,
             &param,
             region.as_deref(),
-            Some(pending.device_mid.clone()),
-        );
-        // 3007（验证码被拒/参数过期）：**不再换码自动重试**。
-        // 参考实测结论（zcode2api 2.6.5 整改）：拒码本身就是上游风险信号，换码连打只会加剧，
-        // 且会白耗一次唯一重试额度。这里直接走终态失败，让用户重新发起领取（重新取验证码）。
-        if let Err(e) = &res {
-            if e.is_captcha_rejected() {
-                flowlog::log(
-                    "claim",
-                    "captcha-rejected-3007",
-                    &format!("code={} 不自动重试", e.code),
-                );
-            }
+            Some(material.device_mid),
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        // The worker died before a definitive answer: the POST may still have landed.
+        Err(e) => Err(claim::ClaimError {
+            code: -1,
+            message: i18n::trf("err.internal", &[("e", &e.to_string())]),
+            next_at: None,
+            unknown: true,
+        }),
+    };
+
+    // 3007（验证码被拒/参数过期）：**不再换码自动重试**。
+    // 参考实测结论（zcode2api 2.6.5 整改）：拒码本身就是上游风险信号，换码连打只会加剧，
+    // 且会白耗一次唯一重试额度。这里直接走终态失败，让用户重新发起领取（重新取验证码）。
+    if let Err(e) = &submitted {
+        if e.is_captcha_rejected() {
+            flowlog::log(
+                "claim",
+                "captcha-rejected-3007",
+                &format!("code={} 不自动重试", e.code),
+            );
         }
-        close_captcha_window(&app2);
-        let payload = match res {
-            Ok(v) => {
-                let ms = |k: &str| -> Option<i64> {
-                    v.pointer(&format!("/data/plan/{k}"))
-                        .and_then(|x| x.as_i64())
-                        .map(|s| s * 1000)
-                };
-                let server_time = v
-                    .pointer("/data/server_time")
-                    .and_then(|x| x.as_i64())
-                    .map(|s| s * 1000);
-                // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），starts_at 只是活动开始
-                let effective_at = v
-                    .pointer("/data/plan/entitlements")
-                    .and_then(|e| e.as_array())
-                    .and_then(|arr| {
-                        arr.iter()
-                            .filter_map(|it| it.get("effective_at").and_then(|x| x.as_i64()))
-                            .min()
-                    })
-                    .map(|s| s * 1000);
-                let outcome = claim::ClaimOutcome {
-                    account_id: pending.account_id.clone(),
-                    account_name: pending.account_name.clone(),
-                    plan_name: pending.plan_name.clone(),
-                    starts_at: ms("starts_at"),
-                    ends_at: ms("ends_at"),
-                    effective_at,
-                    server_time,
-                };
-                let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
-                // 领取成功落历史（best-effort），供「已领取生效中」展示
-                store::record_claim_history(
-                    &paths,
-                    &pending.account_id,
-                    &pending.plan_id,
-                    &pending.plan_name,
-                );
-                let _ = app2.emit("claim://result", &p);
-                p
+    }
+
+    let payload = match submitted {
+        Ok(value) => {
+            let ms = |k: &str| -> Option<i64> {
+                value
+                    .pointer(&format!("/data/plan/{k}"))
+                    .and_then(quota::timestamp_millis)
+            };
+            let server_time = value
+                .pointer("/data/server_time")
+                .and_then(quota::timestamp_millis);
+            let entitlement_starts = value
+                .pointer("/data/plan")
+                .map(quota::entitlement_start_times)
+                .unwrap_or_default();
+            let mut payload = json!({
+                "ok": true,
+                "claimId": claim_id,
+                "accountId": summary.account_id,
+                "accountName": summary.account_name,
+                "revision": summary.revision,
+                "planId": summary.plan_id,
+                "planName": summary.plan_name,
+                "startsAt": ms("starts_at"),
+                "entitlementStarts": entitlement_starts,
+                "endsAt": ms("ends_at"),
+                "serverTime": server_time,
+            });
+            // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），starts_at 只是活动开始
+            if let Some(effective_at) = entitlement_starts
+                .iter()
+                .filter_map(|s| s.effective_at)
+                .filter(|ms| *ms > 0)
+                .min()
+                .or_else(|| {
+                    entitlement_starts
+                        .iter()
+                        .filter_map(|s| s.effective_at)
+                        .min()
+                })
+            {
+                payload["effectiveAt"] = json!(effective_at);
             }
-            Err(e) => {
-                let p = claim::failure_payload(
-                    &pending.account_id,
-                    &pending.account_name,
-                    &pending.plan_name,
-                    &e,
-                );
-                let _ = app2.emit("claim://result", &p);
-                return Ok(p);
-            }
+            // 领取成功落历史（best-effort），供「已领取生效中」展示
+            store::record_claim_history(
+                &paths,
+                &summary.account_id,
+                &summary.identity_scope,
+                &summary.plan_id,
+                &summary.plan_name,
+            );
+            finish_claim(&claim_id, claim_session::ClaimPhase::Succeeded, Some(payload.clone()));
+            payload
+        }
+        Err(error) => {
+            // 提交阶段的风控信号（3012 / unusual activity）也必须进入冷却状态机：
+            // 否则下一轮自动/到点领取会立刻再打一次同一个风控出口。
+            risk::observe_upstream_failure(&paths, &summary.account_id, &error.message);
+            // 所有失败结果统一构造：业务码、terminal、challenge、nextAt 与 unknown
+            // 都必须原样到达界面与会话持久化，不能只在 unknown 分支保留。
+            let payload = claim_failure_result(
+                &summary,
+                &error,
+                risk::cooling_remaining_secs(&paths, &summary.account_id),
+            );
+            let phase = if error.unknown {
+                claim_session::ClaimPhase::Unknown
+            } else {
+                claim_session::ClaimPhase::Failed
+            };
+            finish_claim(&claim_id, phase, Some(payload.clone()));
+            payload
+        }
+    };
+    close_captcha_window(&app, &claim_id);
+    let _ = app.emit("claim://result", &payload);
+    Ok(payload)
+}
+
+/// 只读本地：批量查询各账号「无身份旧历史」条数（启动时用于保守压制自动领取）。
+/// 读取/解析失败必须返回错误：前端把「未知」当成需要阻止，而不是「没有旧记录」。
+#[tauri::command]
+async fn claim_legacy_count(ids: Vec<String>) -> Result<Vec<Value>, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let _guard = store_guard();
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            let count = store::claim_history_legacy_check(&paths, &id)?.len();
+            rows.push(json!({ "accountId": id, "count": count }));
+        }
+        Ok(rows)
+    })
+    .await
+}
+
+/// 用户显式把「无身份旧历史」归属到当前登录。前端固定确认时的账号代次与身份作用域，
+/// 后端在写入前验证仍是同一快照：账号在操作中被切换时中止，绝不归给另一个身份。
+#[tauri::command]
+async fn claim_adopt_legacy_history(
+    id: String,
+    revision: Option<String>,
+    identity_scope: Option<String>,
+    live_hash: Option<String>,
+) -> Result<store::LegacyAdoptOutcome, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let secret = zcrypto::default_secret(&paths.home);
+        let snapshot = {
+            let _guard = store_guard();
+            claim_snapshot(&paths, &id, revision.as_deref())?
         };
-        Ok(payload)
+        let identity = legacy_adopt_identity(
+            &snapshot,
+            identity_scope.as_deref(),
+            live_hash.as_deref(),
+            &secret,
+        )?;
+        let _guard = store_guard();
+        store::adopt_claim_history_legacy(&paths, &id, &identity)
+    })
+    .await
+}
+
+/// 用户显式清理某账号的「无身份旧历史」：只删除无法归属的条目，当前身份的历史保留。
+/// 读取、解析与写入失败都传播给界面（不得提示成功或放开自动领取）。
+#[tauri::command]
+async fn claim_drop_legacy_history(id: String) -> Result<usize, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let _guard = store_guard();
+        store::drop_claim_history_legacy(&paths, &id)
     })
     .await
 }
 
 #[tauri::command]
-async fn claim_cancel(app: AppHandle) -> Result<(), String> {
-    *pending_guard() = None;
-    close_captcha_window(&app);
-    Ok(())
+async fn claim_cancel(app: AppHandle, claim_id: String) -> Result<serde_json::Value, String> {
+    let outcome = {
+        let mut registry = claim_registry_guard();
+        match registry.as_mut() {
+            Some(registry) => registry.cancel(&claim_id),
+            None => claim_session::CancelOutcome {
+                phase: claim_session::ClaimPhase::Cancelled.as_str().to_string(),
+                cancelled: false,
+                submission_in_flight: false,
+            },
+        }
+    };
+    if outcome.cancelled {
+        close_captcha_window(&app, &claim_id);
+        let _ = app.emit("claim://cancelled", json!({ "claimId": claim_id }));
+    }
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+#[tauri::command]
+async fn claim_status(claim_id: String) -> Result<serde_json::Value, String> {
+    Ok(claim_summary_json(&claim_id).unwrap_or(Value::Null))
+}
+
+#[tauri::command]
+async fn claim_sessions() -> Result<serde_json::Value, String> {
+    let registry = claim_registry_guard();
+    let Some(registry) = registry.as_ref() else {
+        return Ok(json!({ "sessions": [], "recovery": { "ok": true } }));
+    };
+    Ok(json!({
+        "sessions": registry.sessions(),
+        "recovery": {
+            "ok": registry.recovery_error().is_none(),
+            "error": registry.recovery_error(),
+        }
+    }))
+}
+
+#[tauri::command]
+async fn claim_acknowledge_unknown(claim_id: String) -> Result<bool, String> {
+    let mut registry = claim_registry_guard();
+    match registry.as_mut() {
+        Some(registry) => Ok(registry.allow_manual_retry(&claim_id)),
+        None => Ok(false),
+    }
+}
+
+/// 当前待领取的那一笔（用于「只取消自己发起的领取」）。向后兼容旧前端入口。
+#[tauri::command]
+fn claim_pending() -> Option<serde_json::Value> {
+    let registry = claim_registry_guard();
+    registry
+        .as_ref()?
+        .sessions()
+        .into_iter()
+        .find(|s| ["preparing", "verifying", "submitting"].contains(&s.status.as_str()))
+        .map(|s| json!({ "accountId": s.account_id, "planId": s.plan_id }))
 }
 
 #[derive(serde::Serialize)]
@@ -567,12 +1117,24 @@ async fn activity_probe(ids: Vec<String>) -> Result<ActivityProbeResult, String>
                 skipped.push(id);
                 continue;
             };
-            let plans = claim::probe_marketing_only(
+            let plans = match claim::probe_marketing_checked(
                 &paths.home,
                 &acc.credentials,
                 acc.config.as_ref(),
                 Some(mid),
-            );
+            ) {
+                Ok(plans) => plans,
+                Err(error) => {
+                    // 活动探测同样会撞风控：记录冷却，避免下一轮继续打同一出口。
+                    risk::observe_upstream_failure(&paths, &id, &error);
+                    let _ = append_rolling_log(
+                        "probe.log",
+                        2000,
+                        &format!("probe risk id={id}: {error}"),
+                    );
+                    Vec::new()
+                }
+            };
             items.push(ActivityProbeItem { account_id: id, name: acc.name, plans });
         }
         Ok(ActivityProbeResult { items, skipped })
@@ -596,14 +1158,6 @@ fn append_rolling_log(name: &str, cap: usize, message: &str) -> Result<(), Strin
         lines.drain(0..excess);
     }
     std::fs::write(&file, lines.join("\n") + "\n").map_err(|e| e.to_string())
-}
-
-/// 当前待领取的那一笔（用于「只取消自己发起的领取」）。
-#[tauri::command]
-fn claim_pending() -> Option<serde_json::Value> {
-    pending_guard()
-        .as_ref()
-        .map(|p| json!({ "accountId": p.account_id, "planId": p.plan_id }))
 }
 
 /// 设置「新活动」提示：托盘 tooltip 附加文案（None 清除）。
@@ -755,8 +1309,9 @@ async fn log_client_error(message: String) -> Result<(), String> {
     .await
 }
 
-fn close_captcha_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("captcha") {
+fn close_captcha_window(app: &AppHandle, claim_id: &str) {
+    let label = format!("captcha-{claim_id}");
+    if let Some(w) = app.get_webview_window(&label) {
         let _ = w.close();
     }
 }
@@ -1368,9 +1923,14 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
     });
 }
 
-fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
+fn captcha_label(claim_id: &str) -> String {
+    format!("captcha-{claim_id}")
+}
+
+fn open_captcha_window(app: &AppHandle, claim_id: &str, auto: bool) -> Result<(), String> {
     let (w, h) = (380.0, 320.0);
-    if let Some(win) = app.get_webview_window("captcha") {
+    let label = captcha_label(claim_id);
+    if let Some(win) = app.get_webview_window(&label) {
         let _ = win.eval("location.reload()");
         center_over_main(app, &win, w, h);
         if auto {
@@ -1383,8 +1943,8 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     }
     let win = tauri::WebviewWindowBuilder::new(
         app,
-        "captcha",
-        tauri::WebviewUrl::App("captcha.html".into()),
+        label,
+        tauri::WebviewUrl::App(format!("captcha.html?claimId={claim_id}&auto={}", u8::from(auto)).into()),
     )
     .title(i18n::tr("title.captcha"))
     .theme(Some(tauri::Theme::Dark))
@@ -1732,10 +2292,16 @@ pub fn run() {
             claim_preview,
             claim_refresh,
             claim_current,
+            claim_legacy_count,
+            claim_adopt_legacy_history,
+            claim_drop_legacy_history,
             claim_start,
             claim_captcha_config,
             claim_captcha_submit,
             claim_cancel,
+            claim_status,
+            claim_sessions,
+            claim_acknowledge_unknown,
             claim_pending,
             activity_probe,
             set_activity_tip,
@@ -1773,8 +2339,20 @@ pub fn run() {
                         let _ = window.hide();
                     }
                 }
-                if window.label() == "captcha" {
-                    *pending_guard() = None;
+                if let Some(claim_id) = window.label().strip_prefix("captcha-") {
+                    let claim_id = claim_id.to_string();
+                    let cancelled = {
+                        let mut registry = claim_registry_guard();
+                        registry
+                            .as_mut()
+                            .map(|registry| registry.cancel(&claim_id).cancelled)
+                            .unwrap_or(false)
+                    };
+                    if cancelled {
+                        let _ = window
+                            .app_handle()
+                            .emit("claim://cancelled", json!({ "claimId": claim_id }));
+                    }
                 }
             }
         })
@@ -1818,3 +2396,186 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[test]
+fn claim_failure_result_carries_every_field_the_ui_needs() {
+    let summary = claim_session::ClaimSummary {
+        claim_id: "c1".into(),
+        account_id: "account-a".into(),
+        account_name: "Synthetic A".into(),
+        revision: "rev-1".into(),
+        plan_id: "p1".into(),
+        plan_name: "Plan One".into(),
+        status: "failed".into(),
+        auto: false,
+        created_at: 1,
+        updated_at: 2,
+        manual_retry: false,
+        identity_scope: "zai:user".into(),
+        result: None,
+    };
+    let terminal = claim::ClaimError {
+        code: 1005,
+        message: "quota".into(),
+        next_at: Some(1_700_000_100_000),
+        unknown: false,
+    };
+    let payload = claim_failure_result(&summary, &terminal, 900);
+    assert_eq!(payload["claimId"], "c1");
+    assert_eq!(payload["planId"], "p1");
+    assert_eq!(payload["revision"], "rev-1");
+    assert_eq!(payload["code"], 1005);
+    assert_eq!(payload["terminal"], true);
+    assert_eq!(payload["challenge"], false);
+    assert_eq!(payload["nextAt"], 1_700_000_100_000_i64);
+    assert_eq!(payload["unknown"], false);
+    assert_eq!(payload["coolingSecs"], 900);
+
+    let challenge = claim::ClaimError {
+        code: claim::CLAIM_ERR_CHALLENGE,
+        message: "challenge".into(),
+        next_at: None,
+        unknown: false,
+    };
+    let payload = claim_failure_result(&summary, &challenge, 0);
+    assert_eq!(payload["challenge"], true);
+    assert_eq!(payload["terminal"], false);
+    assert!(
+        payload.get("coolingSecs").is_none(),
+        "没有冷却时不要塞 0 值字段"
+    );
+
+    let lost = claim::ClaimError {
+        code: -1,
+        message: "lost".into(),
+        next_at: None,
+        unknown: true,
+    };
+    let payload = claim_failure_result(&summary, &lost, 0);
+    assert_eq!(payload["unknown"], true);
+    assert_eq!(payload["terminal"], false);
+}
+
+    #[test]
+    fn claim_start_guards_abort_only_on_explicit_risk() {
+        let home = std::env::temp_dir().join(format!(
+            "zsw-guards-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".zcode-switch")).unwrap();
+        let paths = store::Paths { home: home.clone(), data_root: home.clone() };
+
+        // 激活上报的明确风控：中止 + 记录冷却
+        let err = claim_start_guards(
+            &paths,
+            "account-a",
+            || Err("activation HTTP 200 (code 3012): unusual activity".into()),
+            || Ok(()),
+        )
+        .expect_err("激活风控必须中止");
+        assert!(err.contains("风控") || err.contains("3012"));
+        assert!(risk::is_cooling(&paths, "account-a"), "必须写入同一冷却状态");
+
+        // 验证码配置的明确风控：同样中止 + 冷却
+        let captcha_err = claim_start_guards(
+            &paths,
+            "account-b",
+            || Ok(()),
+            || Err("config HTTP 405 (code 3012): unusual activity".into()),
+        )
+        .expect_err("验证码配置风控必须中止");
+        assert!(captcha_err.contains("风控") || captcha_err.contains("3012"));
+        assert!(risk::is_cooling(&paths, "account-b"));
+
+        // 普通网络故障保持降级：不中止、不冷却
+        let normal = claim_start_guards(
+            &paths,
+            "account-c",
+            || Err("activation network timeout".into()),
+            || Err("config network timeout".into()),
+        );
+        assert!(normal.is_ok(), "普通网络错误不得中止领取");
+        assert!(!risk::is_cooling(&paths, "account-c"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_adoption_requires_the_confirmed_snapshot() {
+        let home = std::env::temp_dir().join(format!(
+            "zsw-adopt-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".zcode-switch")).unwrap();
+        let secret = zcrypto::default_secret(&home);
+        let credentials = crate::test_support::account("a", "zai").credentials;
+        let identity = claim_session::identity_scope(&credentials, &secret);
+        let snapshot = store::ClaimSnapshot {
+            account: store::Account {
+                id: "account-a".into(),
+                name: "A".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                hash: String::new(),
+                credentials: credentials.clone(),
+                config: None,
+                virtual_device_mid: None,
+                virtual_arms_uid: None,
+            },
+            revision: "rev-1".into(),
+            device_initialized: false,
+        };
+        // 与确认时一致 → 允许归属
+        assert_eq!(
+            legacy_adopt_identity(&snapshot, Some(&identity), None, &secret).unwrap(),
+            identity
+        );
+        // 身份作用域不一致（账号在操作中被换成另一登录）→ 中止
+        assert!(legacy_adopt_identity(&snapshot, Some("zai:other"), None, &secret).is_err());
+        assert!(
+            legacy_adopt_identity(&snapshot, None, None, &secret).is_err(),
+            "缺少确认作用域必须中止"
+        );
+
+        // live 行：快照哈希必须匹配
+        let live_creds = crate::test_support::account("b", "bigmodel").credentials;
+        let live_hash = store::canonical_hash(&live_creds);
+        let live_identity = claim_session::identity_scope(&live_creds, &secret);
+        let live_snapshot = store::ClaimSnapshot {
+            account: store::Account {
+                id: store::LIVE_ID.into(),
+                name: "live".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                hash: String::new(),
+                credentials: live_creds.clone(),
+                config: None,
+                virtual_device_mid: None,
+                virtual_arms_uid: None,
+            },
+            revision: "rev-live".into(),
+            device_initialized: false,
+        };
+        assert!(legacy_adopt_identity(
+            &live_snapshot,
+            Some(&live_identity),
+            Some(&live_hash),
+            &secret
+        )
+        .is_ok());
+        assert!(legacy_adopt_identity(
+            &live_snapshot,
+            Some(&live_identity),
+            Some("stale-hash"),
+            &secret
+        )
+        .is_err());
+        assert!(
+            legacy_adopt_identity(&live_snapshot, Some(&live_identity), None, &secret).is_err(),
+            "live 缺少快照哈希必须中止"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }

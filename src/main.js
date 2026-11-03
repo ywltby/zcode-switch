@@ -5,6 +5,42 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, openActivityModal, activityToast, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { createQuotaScheduler } from "./refresh-scheduler.js";
+import { createClaimFlow, parseScopeError } from "./claim-flow.js";
+import { createClaimQueue } from "./claim-queue.js";
+import { createRequestQueue } from "./request-queue.js";
+import {
+  cancelAttempt,
+  closeWaiter,
+  createClaimAttempts,
+  finishWaiter,
+  registerAttempt,
+  settleAttempt,
+  syncClaimAccounts,
+  waitForAttempt,
+} from "./claim-attempts.js";
+import {
+  autoCooldownUntil,
+  claimHoldUntil,
+  claimOutcomeOf,
+  claimSettlement,
+  reconcilePendingClaims,
+  resolveClaimTimeout,
+  waitForBackendResult,
+} from "./claim-run.js";
+import { autoEligible, claimIdentityKey, planIdOf } from "./claim-eligibility.js";
+import { batchAdmission } from "./claim-batch.js";
+import {
+  confirmLegacyCatalog,
+  confirmLegacyMarks,
+  discardLegacyCatalog,
+  discardLegacyMarks,
+  hasLegacyMark,
+  legacyCatalogFor,
+  legacyMarksFor,
+  splitCatalogRecords,
+  splitMarkRecords,
+} from "./claim-legacy.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -12,14 +48,44 @@ let renaming = null;
 let busy = false;
 let appVer = "";
 let acctQuota = {};
+let stateSequence = 0;
 let claimable = {};
 let claimedState = {};
 let claimAllRunning = false;
+let claimAttempts = createClaimAttempts();
+let claimUnknown = new Map();
+let claimRecovery = { ok: true };
+let claimRecoveryReady = false;
+let reconcilingClaims = false;
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let acctRefreshBusy = {};
 let acctRefreshCooldown = {};
 let refreshTicker = null;
+
+// The login ZCode is running right now can be checked and claimed without saving it.
+const LIVE_CLAIM_ID = "live";
+// Local generation key for the live row: placeholder until applyState reads live_hash.
+const LIVE_ATTEMPT_REVISION = "live";
+let liveClaimRevision = LIVE_ATTEMPT_REVISION;
+let liveClaimHash = "";
+let liveClaimBackendRevision = "";
+let liveClaimSeq = 0;
+// 最近一次被采纳的资格结果所属的界面快照（liveHash）与代次；领取前必须仍然匹配。
+let liveClaimView = { hash: "" };
+// 无法归属的旧历史：检查状态必须显式三态。`ok: false` 表示「尚未确认/读取失败」，
+// 自动领取必须保持阻止——不能把未知当成「没有旧记录」。
+let legacyState = { ok: false, error: null };
+let legacyHistoryCounts = {};
+let legacyCheckSeq = 0;
+let legacyCheckPending = false;
+const pendingClaimResults = new Map();
+let legacySignature = "";
+// 账号 revision 快照：账号被更新为其他登录时用于清理旧身份的缓存。
+let accountRevisions = {};
+// Campaign impressions are rate limited upstream, so the automatic check is lazy.
+const LIVE_CLAIM_AUTO_MS = 30 * 60 * 1000;
+let liveClaimCheckedAt = 0;
 
 // 活动中心：已探测到的活动（accountId -> ClaimPlan[]，含 campaign 元数据）
 let activities = {};
@@ -127,9 +193,12 @@ function claimTimeRange(p) {
 const AUTO_CLAIM_INTERVAL_MS = 10 * 60 * 1000;
 const AUTO_CLAIM_FIRST_DELAY_MS = 2 * 60 * 1000;
 const AUTO_CLAIM_WAIT_MS = 45_000;
+const AUTO_CLAIM_PER_ACCOUNT_CAP = 5;
+const AUTO_CLAIM_ACCT_GAP_MS = 5_000;
 
 const AUTO_ABORT_WAIT_MS = 90_000;
 let autoClaimRunning = false;
+let autoScanRunning = false;
 let autoClaimCooldown = {};
 let autoAbortRequested = false;
 let claimActive = false;
@@ -229,11 +298,91 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
+function channelBadge(provider) {
+  const family = provider === "zai" || provider === "bigmodel" ? provider : "unknown";
+  const label = family === "zai" ? t("m.channelZai")
+    : family === "bigmodel" ? t("m.channelBigmodel") : t("m.channelUnknown");
+  return `<span class="channel-badge channel-${family}">${esc(label)}</span>`;
+}
+
 async function refresh() {
-  state = await invoke("get_state");
+  const sequence = ++stateSequence;
+  const next = await invoke("get_state");
+  if (sequence === stateSequence) applyState(next);
+}
+
+function applyState(next) {
+  state = next;
   if (state?.language) init(state.language);
+  quotaScheduler.applyAccounts(state?.accounts || []);
+  acctQuota = quotaScheduler.entries();
+  // 未保存的当前登录没有 quota_revision：首次资格查询会把它绑定到后端返回的
+  // 真实代次（liveClaimBackendRevision）。live_hash 变化说明换了登录：清空该代次、
+  // 旧登录的已领取缓存，并允许立即重查资格。
+  const nextLiveHash = state?.live_hash || LIVE_ATTEMPT_REVISION;
+  if (nextLiveHash !== liveClaimHash) {
+    liveClaimHash = nextLiveHash;
+    liveClaimSeq += 1;
+    liveClaimBackendRevision = "";
+    liveClaimCheckedAt = 0;
+    delete claimedState[LIVE_CLAIM_ID];
+    delete activities[LIVE_CLAIM_ID];
+  }
+  liveClaimRevision = liveClaimBackendRevision || liveClaimHash;
+  // 保存账号被「更新为其他登录」时 revision 会变：旧身份的已领取/活动缓存必须清空，
+  // 否则新登录会看到上一个登录的领取状态。
+  const nextRevisions = {};
+  for (const a of state?.accounts || []) {
+    nextRevisions[a.id] = a.quota_revision;
+    const previous = accountRevisions[a.id];
+    if (previous && previous !== a.quota_revision) {
+      liveClaimView.hash = "";
+      delete claimedState[a.id];
+      delete activities[a.id];
+    }
+  }
+  accountRevisions = nextRevisions;
+  claimFlow.applyAccounts(
+    state?.accounts || [],
+    liveClaimTarget() ? [{ id: LIVE_CLAIM_ID, revision: liveClaimRevision }] : [],
+  );
+  claimable = claimFlow.entries();
+  // 领取尝试也要登记 live 行：否则它的结果永远无法结算（refresh 恒为 false）。
+  const attemptAccounts = [...(state?.accounts || [])];
+  if (liveClaimTarget()) {
+    attemptAccounts.push({ id: LIVE_CLAIM_ID, quota_revision: liveClaimRevision });
+  }
+  claimAttempts = syncClaimAccounts(claimAttempts, attemptAccounts);
+  maybeLoadLiveClaim();
+  claimQueue.applyAccounts(state?.accounts || []);
   maybeStartProbe();
   startReminderTicker();
+  // 账号新增/更新、启动后出现 live、切换登录都会改变身份集合：重新建立旧数据检查。
+  const legacySig = (state?.accounts || [])
+    .map((a) => `${a.id}:${a.quota_revision}`)
+    .sort()
+    .join("|") + `|${liveClaimTarget() ? liveClaimHash : ""}`;
+  if (legacySig !== legacySignature) {
+    legacySignature = legacySig;
+    loadLegacyCounts();
+  }
+}
+
+function invalidateQuotaFor(id) {
+  ++stateSequence;
+  quotaScheduler.invalidate(id);
+  claimFlow.invalidate(id);
+  acctQuota = quotaScheduler.entries();
+  claimable = claimFlow.entries();
+}
+
+function quotaErrorMessage(code) {
+  const key = `q.error.${code}`;
+  return has(key) ? t(key) : t("q.refreshFailed");
+}
+
+function quotaErrors(data) {
+  return [...new Set((data.errors || []).map(e => quotaErrorMessage(e.code)))].join(" · ");
 }
 
 function uiLocked() {
@@ -253,39 +402,86 @@ async function guard(fn) {
 }
 
 async function loadAcctQuota(id, force = false) {
-  const cur = acctQuota[id] || {};
-  if (cur.busy) return;
-  acctQuota[id] = { busy: true };
-  if (!uiLocked()) render();
-  try {
-    const data = await invokeWithTimeout("get_account_quota", { id, force });
-    acctQuota[id] = { data, err: null, busy: false };
-  } catch (e) {
-    acctQuota[id] = { data: null, err: stripErr(e), busy: false };
-  }
-  if (!uiLocked()) render();
+  return quotaScheduler.request(id, { priority: "manual" });
 }
 
-async function loadClaimPreview(id) {
-  const cur = claimable[id] || {};
-  if (cur.busy) return;
-  claimable[id] = { plans: cur.plans || [], busy: true };
-  try {
-    const plans = await invokeWithTimeout("claim_preview", { id });
-    claimable[id] = { plans: plans || [], err: null, busy: false };
-  } catch (e) {
-    claimable[id] = { plans: cur.plans || [], err: String(e), busy: false };
-  }
+const requestQueue = createRequestQueue(3);
+
+const claimQueue = createClaimQueue({
+  run: runQueuedClaim,
+  canStart: () => claimRecoveryReady && claimRecovery.ok !== false && !claimActive && !claimAllRunning && !claimPending(),
+  allowAccount: (id) => !unknownClaimFor(id),
+  gapMs: AUTO_CLAIM_ACCT_GAP_MS,
+  retryDelayMs: AUTO_CLAIM_INTERVAL_MS,
+  perAccountLimit: AUTO_CLAIM_PER_ACCOUNT_CAP,
+  onChange: () => {
+    claimable = claimFlow.entries();
+    if (!uiLocked()) render();
+  },
+});
+
+const quotaScheduler = createQuotaScheduler({
+  invoke,
+  queue: requestQueue,
+  classifyData: (data) => {
+    const emptyPartial = data?.completion === "partial" && !data.plans?.length && !data.items?.length;
+    return data?.completion === "unavailable" || emptyPartial
+      ? quotaErrors(data) || t("q.refreshFailed") : null;
+  },
+  errorText: (error) => quotaErrorMessage(String(error)),
+  onChange: () => {
+    acctQuota = quotaScheduler.entries();
+    if (!uiLocked()) render();
+  },
+});
+
+const claimFlow = createClaimFlow({
+  invoke,
+  queue: requestQueue,
+  errorText: (error) => stripErr(error),
+  refreshState: () => refresh(),
+  isLive: (id) => id === LIVE_CLAIM_ID,
+  liveHash: () => liveClaimHash,
+  onResult: (result) => {
+    if (result.id === LIVE_CLAIM_ID) {
+      // 记录这条资格结果所属的界面快照；领取前必须仍然匹配。
+      liveClaimView.hash = result.liveHash || liveClaimHash;
+    }
+    if (legacyCheckPending) {
+      pendingClaimResults.set(result.id, result);
+      claimQueue.offer({ ...result, plans: [] });
+      return;
+    }
+    offerClaimResult(result);
+  },
+  onChange: () => {
+    claimable = claimFlow.entries();
+    syncLiveClaimRevision();
+    if (!uiLocked()) render();
+  },
+});
+
+function offerClaimResult(result) {
+  const eligiblePlans = (result.plans || []).filter((plan) => autoEligible({
+    plan,
+    isMarked: (planId) => isMarked(result.id, planId),
+    hasUnknown: Boolean(unknownClaimFor(result.id)),
+    hasLegacy: hasLegacyData(result.id),
+    holdUntil: claimHold[claimHoldKey(result.id, planIdOf(plan))] ?? 0,
+  }));
+  // 空结果撤销尚未开始的旧任务。
+  claimQueue.offer({ ...result, plans: eligiblePlans });
 }
 
-let claimWaiter = null;
-function waitForClaimResult(accountId, timeoutMs = 90000) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => { if (!done) { done = true; claimWaiter = null; clearTimeout(t); resolve(v); } };
-    const t = setTimeout(() => finish(null), timeoutMs);
-    claimWaiter = { accountId, finish };
-  });
+function finishLegacyCheck() {
+  legacyCheckPending = false;
+  const results = [...pendingClaimResults.values()];
+  pendingClaimResults.clear();
+  for (const result of results) offerClaimResult(result);
+}
+
+function loadClaimPreview(id) {
+  return claimFlow.preview(id);
 }
 
 async function awaitClaimPreviewFresh(id) {
@@ -301,15 +497,45 @@ async function awaitClaimPreviewFresh(id) {
 // 已领取状态（billing/current + 本地历史）：区分「无活动」与「已领取生效中」。
 // current 失败静默——可领列表优先展示，不受影响。
 async function fetchClaimed(id) {
+  // 异步已领取查询属于发起时的身份代次：live 用登录序号，存储账号用 revision。
+  // 返回前换了登录或账号被更新为另一登录，结果必须丢弃。
+  const liveSeq = id === LIVE_CLAIM_ID ? liveClaimSeq : null;
+  const revisionAtStart = id === LIVE_CLAIM_ID
+    ? null
+    : ((state?.accounts || []).find((a) => a.id === id)?.quota_revision ?? null);
+  const stale = (response = null) => {
+    if (liveSeq !== null) {
+      if (liveSeq !== liveClaimSeq) return true;
+      // 后端快照才是权威：缺失或不匹配都拒收（即使前端轮询尚未更新）。
+      if (!response?.liveHash || response.liveHash !== liveClaimHash) return true;
+      return false;
+    }
+    if (revisionAtStart === null) return false;
+    const row = (state?.accounts || []).find((a) => a.id === id);
+    const now = row?.quota_revision ?? null;
+    if (now !== revisionAtStart) return true;
+    if (!response?.revision || response.revision !== now) return true;
+    const scope = row?.identity?.scope || "";
+    if (!response?.identityScope || response.identityScope !== scope) return true;
+    return false;
+  };
   try {
     const r = await invokeWithTimeout("claim_current", { id });
-    claimedState[id] = { plans: r.plans || [], history: r.history || [], err: null };
+    if (stale(r)) return;
+    claimedState[id] = {
+      plans: r.plans || [],
+      history: r.history || [],
+      legacyHistory: r.legacyHistory || [],
+      err: null,
+    };
     // 已领取/待生效也进目录：服务端之后不再下发，只能靠目录在重启后继续展示
     upsertCatalog(id, r.plans || [], true);
   } catch (e) {
+    if (stale()) return;
     claimedState[id] = {
       plans: claimedState[id]?.plans || [],
       history: claimedState[id]?.history || [],
+      legacyHistory: claimedState[id]?.legacyHistory || [],
       err: String(e),
     };
   }
@@ -317,17 +543,338 @@ async function fetchClaimed(id) {
 
 const accountName = (id) => (state?.accounts || []).find((a) => a.id === id)?.name || id;
 
+// Only an unsaved live login needs its own row; a saved snapshot already covers it.
+const liveClaimTarget = () =>
+  state?.live_logged_in && !(state?.accounts || []).some((a) => a.is_active) ? LIVE_CLAIM_ID : null;
+
+function claimDisplayName(id) {
+  if (id === LIVE_CLAIM_ID) return idLabel(state?.live_identity) || t("m.status.unsaved");
+  return accountName(id);
+}
+
+async function maybeLoadLiveClaim() {
+  if (!liveClaimTarget()) return;
+  if (claimable[LIVE_CLAIM_ID]?.busy || claimActive || claimAllRunning || refreshClaim.running) return;
+  if (Date.now() - liveClaimCheckedAt < LIVE_CLAIM_AUTO_MS) return;
+  liveClaimCheckedAt = Date.now();
+  await loadClaimPreview(LIVE_CLAIM_ID);
+  if (!uiLocked()) render();
+}
+
+function newClaimId() {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi?.randomUUID) return cryptoApi.randomUUID();
+  return `claim-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function claimResultToast(payload, attempt) {
+  const name = payload.accountName || claimDisplayName(attempt.accountId);
+  if (payload.cancelled) return;
+  if (payload.unknown) {
+    claimUnknown.set(payload.claimId, { ...payload });
+    toast(t("m.claimUnconfirmed", { name }), "warn", t("m.claimUnconfirmedDetail"));
+    return;
+  }
+  if (payload.ok === false) {
+    let msg = payload.message || t("m.unknownErr");
+    if (payload.code === 1005 && payload.nextAt) {
+      msg += t("m.claimNextAt", { time: new Date(payload.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+    }
+    toast(t("m.claimFailed", { name, msg }), "err");
+    return;
+  }
+  const bits = [];
+  const now = payload.serverTime || Date.now();
+  for (const entitlement of Array.isArray(payload.entitlementStarts) ? payload.entitlementStarts : []) {
+    const time = entitlement?.effective_at;
+    if (!Number.isFinite(time) || time <= now || Number.isNaN(new Date(time).getTime())) continue;
+    const label = t("m.claimStartsAt", { time: new Date(time).toLocaleString(localeTag(), { hour12: false }) });
+    bits.push(entitlement?.name ? `${entitlement.name} · ${label}` : label);
+  }
+  // 权益真实生效的时刻在 entitlement 上（0 = 立即生效）；无 entitlement 明细时回退 effectiveAt。
+  const effectiveAt = payload.effectiveAt;
+  if (Number.isFinite(effectiveAt) && effectiveAt > now && !bits.length) {
+    bits.push(t("m.claimStartsAt", { time: new Date(effectiveAt).toLocaleString(localeTag(), { hour12: false }) }));
+  }
+  if (payload.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(payload.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
+  toast(t("m.claimOk", { name, plan: payload.planName }), "ok", bits.join(t("common.listSep")));
+}
+
+function handleClaimResult(payload) {
+  const claimId = payload?.claimId;
+  if (!claimId) return false;
+  const settled = settleAttempt(claimAttempts, claimId, payload);
+  if (settled.status !== "accepted") return false;
+  const attempt = settled.attempt;
+  claimResultToast(payload, attempt);
+  if (settled.refresh) {
+    const id = attempt.accountId;
+    const outcome = claimOutcomeOf(payload);
+    const settlement = claimSettlement(payload, Date.now(), AUTO_CLAIM_INTERVAL_MS);
+    claimQueue.record({ id, revision: attempt.revision, planId: attempt.planId }, {
+      ...outcome, cooldownUntil: autoClaimCooldownFor(payload),
+    });
+    // 统一结算处写入身份+套餐级 hold 与账号冷却：队列、定时扫描和到点领取都只读这份状态。
+    claimHold[claimHoldKey(id, attempt.planId)] = settlement.holdUntil;
+    if (settlement.cooldownUntil > 0) autoClaimCooldown[id] = settlement.cooldownUntil;
+    // 唯一的结算点：及时结果与迟到结果都走这里。settled.refresh 已保证账号代次仍然
+    // 匹配，所以标记与已领取刷新只落在发起领取的那个登录上。
+    if (outcome.status === "ok") {
+      markClaimed(id, attempt.planId);
+      if (id !== LIVE_CLAIM_ID) {
+        loadAcctQuota(id);
+        scheduleNext(id);
+      }
+      fetchClaimed(id);
+    }
+    claimFlow.afterClaim(id);
+  }
+  finishWaiter(claimAttempts, claimId, payload);
+  claimQueue.kick();
+  if (!uiLocked()) render();
+  return true;
+}
+
+async function performClaim(id, plan, { mode = "manual", timeoutMs = 90_000, retried = false } = {}) {
+  const live = id === LIVE_CLAIM_ID;
+  const account = live
+    ? { quota_revision: null, name: claimDisplayName(id) }
+    : (state?.accounts || []).find((a) => a.id === id);
+  if (!account || !plan) return { status: "skipped" };
+  // The live row's eligibility result belongs to one backend snapshot: if the login the
+  // UI shows has changed since, claiming it would submit the old plan for a new account.
+  if (live && liveClaimView.hash && liveClaimView.hash !== liveClaimHash) {
+    if (!uiLocked()) render();
+    toast(t("m.claimLoginChanged"), "warn", t("m.claimLoginChangedDetail"));
+    return { status: "scope_changed" };
+  }
+  // The live row has no stored revision: its eligibility read bound the row to the
+  // backend's own generation, and the claim must be submitted against that generation.
+  // A login change makes the backend reject it instead of claiming for the new account.
+  const attemptRevision = live ? (claimable[LIVE_CLAIM_ID]?.revision || liveClaimRevision) : account.quota_revision;
+  const claimId = newClaimId();
+  registerAttempt(claimAttempts, {
+    claimId,
+    accountId: id,
+    revision: attemptRevision,
+    planId: plan.plan_id,
+    mode,
+  });
+  if (!uiLocked()) render();
+  try {
+    await invoke("claim_start", {
+      id,
+      revision: attemptRevision,
+      planId: plan.plan_id,
+      claimId,
+      mode,
+    });
+  } catch (e) {
+    const scope = parseScopeError(e);
+    claimAttempts.attempts.delete(claimId);
+    claimAttempts.order = claimAttempts.order.filter((value) => value !== claimId);
+    if (scope?.notStarted && !retried) {
+      await refresh();
+      // Only retry while the account generation is unchanged: a login switch must never
+      // resubmit the old plan for the new account (live or stored).
+      const currentRevision = id === LIVE_CLAIM_ID
+        ? (claimable[LIVE_CLAIM_ID]?.revision || liveClaimRevision)
+        : (state?.accounts || []).find((a) => a.id === id)?.quota_revision;
+      if (currentRevision !== attemptRevision) {
+        if (!uiLocked()) render();
+        return { status: "scope_changed", error: stripErr(e) };
+      }
+      if (mode === "auto") return { status: "skipped" };
+      return performClaim(id, plan, { mode, timeoutMs, retried: true });
+    }
+    // The backend may still hold an unknown claim; never let local state drift.
+    await syncUnknownClaims();
+    const error = stripErr(e);
+    toast(t("m.claimAccountErr", { name: account.name, err: error }), "err");
+    return { status: "failed", error };
+  }
+  const payload = await waitForAttempt(claimAttempts, claimId, { timeoutMs });
+  if (payload) {
+    const attempt = claimAttempts.attempts.get(claimId);
+    return { ...claimOutcomeOf(payload), refresh: attempt?.needsRefresh === true };
+  }
+  const resolved = await resolveClaimTimeout({
+    invoke,
+    claimId,
+    mode,
+    attempt: claimAttempts.attempts.get(claimId),
+    handleResult: handleClaimResult,
+    onConfirming: () => {
+      const attempt = claimAttempts.attempts.get(claimId);
+      if (attempt) attempt.confirming = true;
+      if (!uiLocked()) render();
+      toast(t("m.claimConfirming"), "warn", t("m.claimConfirmingDetail"));
+    },
+    onTimeout: () => toast(t("m.claimTimeout"), "warn"),
+    autoWaitMs: AUTO_CLAIM_WAIT_MS,
+  });
+  const settledAttempt = claimAttempts.attempts.get(claimId);
+  return { ...resolved, refresh: settledAttempt?.needsRefresh === true };
+}
+
+async function syncUnknownClaims() {
+  try {
+    const result = await invoke("claim_sessions");
+    const next = new Map();
+    for (const session of result?.sessions || []) {
+      if (session?.status === "unknown") next.set(session.claimId, session);
+    }
+    claimUnknown = next;
+    if (result?.recovery) claimRecovery = result.recovery;
+  } catch { }
+}
+
+/// 只读本地旧历史条数：这些记录无法归给任何登录，处理前不得自动领取。
+/// 读取/解析失败必须保持 `legacyState.ok = false`（阻止自动领取）并提示原因。
+async function loadLegacyCounts() {
+  const seq = ++legacyCheckSeq;
+  legacyCheckPending = true;
+  const ids = (state?.accounts || []).map((a) => a.id);
+  if (liveClaimTarget()) ids.push(LIVE_CLAIM_ID);
+  if (!ids.length) {
+    legacyState = { ok: true, error: null };
+    legacyHistoryCounts = {};
+    finishLegacyCheck();
+    return;
+  }
+  try {
+    const rows = await invoke("claim_legacy_count", { ids });
+    if (seq !== legacyCheckSeq) return;
+    const next = {};
+    for (const row of rows || []) {
+      const count = Number(row?.count) || 0;
+      if (count > 0) next[row.accountId] = count;
+    }
+    legacyHistoryCounts = next;
+    legacyState = { ok: true, error: null };
+  } catch (e) {
+    if (seq !== legacyCheckSeq) return;
+    // 读取失败/文件损坏：保留「未知」状态并明确提示，而不是当作没有旧记录。
+    legacyHistoryCounts = {};
+    legacyState = { ok: false, error: stripErr(e) };
+    toast(t("m.legacyCheckFailed"), "err", stripErr(e));
+  }
+  finishLegacyCheck();
+  if (!uiLocked()) render();
+}
+
+const legacyHistoryCount = (id) => Math.max(
+  legacyHistoryCounts[id] || 0,
+  claimedState[id]?.legacyHistory?.length || 0,
+);
+
+/// 旧数据参与准入：旧标记、无 scope 目录、无身份历史，以及「检查未完成/失败」。
+const hasLegacyData = (id) => {
+  if (legacyCheckPending || !legacyState.ok) return true;
+  if (legacyHistoryCount(id) > 0) return true;
+  if (legacyMarksFor(claimMarksLegacy, id).length > 0) return true;
+  return legacyCatalogFor(catalogLegacy, id).length > 0;
+};
+
+async function recoverClaimSessions() {
+  try {
+    const result = await invoke("claim_sessions");
+    claimRecovery = result?.recovery || { ok: true };
+    if (claimRecovery.ok === false) {
+      toast(t("m.claimRecoveryPaused"), "err", t("m.claimRecoveryPausedDetail"));
+    }
+    const next = new Map();
+    for (const session of result?.sessions || []) {
+      if (session?.status === "unknown") {
+        next.set(session.claimId, session);
+        continue;
+      }
+      if (session?.status === "submitting") {
+        const account = (state?.accounts || []).find((a) => a.id === session.accountId);
+        if (!account) continue;
+        const attempt = registerAttempt(claimAttempts, {
+          claimId: session.claimId,
+          accountId: session.accountId,
+          revision: session.revision || account.quota_revision,
+          planId: session.planId,
+          mode: "manual",
+        });
+        attempt.confirming = true;
+        // Keep polling: the backend still owns the submission mutex.
+        waitForBackendResult({ invoke, claimId: session.claimId, mode: "all", handleResult: handleClaimResult })
+          .then(() => { if (!uiLocked()) render(); });
+      }
+    }
+    claimUnknown = next;
+  } catch {
+    claimRecovery = { ok: false };
+    toast(t("m.claimRecoveryPaused"), "err", t("m.claimRecoveryPausedDetail"));
+  } finally {
+    claimRecoveryReady = true;
+    claimQueue.kick();
+  }
+}
+
+function claimPending() {
+  for (const attempt of claimAttempts.attempts.values()) {
+    if (!attempt.handled) return true;
+  }
+  return false;
+}
+
+async function reconcileClaims() {
+  if (reconcilingClaims) return;
+  reconcilingClaims = true;
+  try {
+    await reconcilePendingClaims({ attempts: [...claimAttempts.attempts.values()], invoke, handleResult: handleClaimResult });
+    claimQueue.kick();
+    if (!uiLocked()) render();
+  } finally {
+    reconcilingClaims = false;
+  }
+}
+
+async function checkUnknownResult(id) {
+  quotaScheduler.poke(id);
+  await Promise.all([loadAcctQuota(id), loadClaimPreview(id)]);
+  if (!uiLocked()) render();
+}
+
+async function acknowledgeUnknown(claimId) {
+  await invoke("claim_acknowledge_unknown", { claimId }).catch(() => {});
+  claimUnknown.delete(claimId);
+  if (!uiLocked()) render();
+}
+
+function claimAttemptFor(id) {
+  for (const attempt of claimAttempts.attempts.values()) {
+    if (attempt.accountId === id && !attempt.handled) return attempt;
+  }
+  return null;
+}
+
+function unknownClaimFor(id) {
+  for (const claim of claimUnknown.values()) {
+    if (claim.accountId === id) return claim;
+  }
+  return null;
+}
+
 function autoPillTitle(s) {
   const bits = [t("btn.autoClaimTitle")];
-  if (autoClaimRunning) bits.push(t(s.auto_claim ? "m.autoClaimRound" : "m.autoClaimStopping"));
+  if (autoScanRunning) bits.push(t("m.autoClaimRound"));
+  if (claimQueue.activeId()) bits.push(t("m.claimQueueActive", { name: accountName(claimQueue.activeId()) }));
+  if (claimQueue.pendingCount()) bits.push(t("m.claimQueueWaiting", { n: claimQueue.pendingCount() }));
   if (lastAutoRound) {
     const d = new Date(lastAutoRound.at);
     const time = d.toDateString() === new Date().toDateString()
       ? d.toLocaleTimeString(localeTag(), { hour12: false })
       : `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${d.toLocaleTimeString(localeTag(), { hour12: false })}`;
-    bits.push(t("m.autoClaimLast", { time, claimed: lastAutoRound.claimed, skipped: lastAutoRound.skipped }));
-    if (lastAutoRound.noActivity) bits.push(t("m.autoClaimNoActivity"));
-    if (lastAutoRound.cooldownAll) bits.push(t("m.autoClaimCooldownAll"));
+    bits.push(t("m.autoClaimLast", {
+      time,
+      found: lastAutoRound.found ?? lastAutoRound.claimed ?? 0,
+      failed: lastAutoRound.failed ?? lastAutoRound.skipped ?? 0,
+    }));
   }
   return esc(bits.join(" · "));
 }
@@ -416,6 +963,7 @@ const actions = {
   async doDelete(id) {
     await guard(async () => {
       await invoke("delete_account", { id });
+      invalidateQuotaFor(id);
       toast(t("m.toastDeleted"));
       await refresh(); render();
     });
@@ -465,6 +1013,7 @@ const actions = {
   async updateFromLive(id) {
     await guard(async () => {
       const r = await invoke("update_account_from_live", { id });
+      invalidateQuotaFor(id);
       toast(t("m.toastSynced", { name: r.name }), "ok", t("m.toastSyncedDetail"));
       await refresh(); render();
     });
@@ -509,21 +1058,67 @@ const actions = {
     catch (e) { toast(stripErr(e), "err"); }
   },
   acctQuota(id) {
-    const dueAt = quotaDue[id];
-    loadAcctQuota(id, true).then(() => {
-      if (quotaDue[id] === dueAt) scheduleNext(id);
-    });
+    loadAcctQuota(id);
   },
 
   async resetDevice(id) {
-    if (renaming !== null) return;
-    try {
+    await guard(async () => {
       await invoke("reset_device", { id });
+      invalidateQuotaFor(id);
+      claimFlow.invalidate(id);
       await refresh();
       render();
       toast(t("m.resetDeviceOk", { name: claimDisplayName(id) }), "ok", t("m.resetDeviceOkDetail"));
-    } catch (e) {
-      toast(stripErr(e), "err");
+    });
+  },
+
+  async refreshClaimOne(id) {
+    if (claimFlow.busy(id)) return;
+    if (id !== LIVE_CLAIM_ID && !(state?.accounts || []).some((a) => a.id === id)) return;
+    const outcome = await claimFlow.refresh(id).catch((e) => ({ status: "failed", error: stripErr(e) }));
+    if (outcome.status === "ok" && outcome.activationError) {
+      toast(t("m.refreshClaimAcctErr", { name: claimDisplayName(id), err: stripErr(outcome.activationError) }), "warn");
+    } else if (outcome.status === "ok") {
+      const n = outcome.plans?.length || 0;
+      toast(t(n ? "m.refreshClaimAcctFound" : "m.refreshClaimAcctEmpty", { name: claimDisplayName(id), n }));
+    } else if (outcome.status === "scope_changed") {
+      toast(t("m.refreshClaimAcctChanged", { name: claimDisplayName(id) }), "warn");
+    } else if (outcome.status === "failed") {
+      toast(t("m.refreshClaimAcctErr", { name: claimDisplayName(id), err: stripErr(outcome.error || "") }), "err");
+    }
+    quotaScheduler.poke(id);
+    if (!uiLocked()) render();
+  },
+
+  async checkUnknown(id) {
+    await checkUnknownResult(id);
+    toast(t("m.claimChecked"), "ok", t("m.claimCheckedDetail"));
+  },
+
+  askRetryUnknown(claimId, id) {
+    if (id !== LIVE_CLAIM_ID && !(state?.accounts || []).some((a) => a.id === id)) return;
+    openConfirmModal({
+      kind: "warn",
+      icon: "alert",
+      title: t("m.claimRetry"),
+      desc: t("m.claimRetryDetail"),
+      yesLabel: t("m.claimRetryYes"),
+      onYes: () => actions.doRetryUnknown(claimId, id),
+    });
+  },
+
+  async doRetryUnknown(claimId, id) {
+    if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) return;
+    claimActive = true;
+    try {
+      await acknowledgeUnknown(claimId);
+      await refresh();
+      const plan = claimable[id]?.plans?.[0];
+      if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
+      await performClaim(id, plan, { mode: "manual", timeoutMs: 90_000 });
+    } finally {
+      claimActive = false;
+      claimQueue.kick();
     }
   },
 
@@ -544,8 +1139,98 @@ const actions = {
     });
   },
 
+  /// 旧数据确认：用户声明这些记录属于界面上当前这个登录 → 重新挂到身份作用域下，
+  /// 仍然压制自动领取（避免重复提交），但不再处于「未归属」状态。
+  /// 确认时固定账号代次与身份作用域；归属中途切换账号必须中止并保留旧记录。
+  async confirmLegacy(id) {
+    const live = id === LIVE_CLAIM_ID;
+    const row = live ? null : (state?.accounts || []).find((a) => a.id === id);
+    if (!live && !row) {
+      toast(t("m.legacyConfirmFailed"), "err", t("m.legacyCheckFailed"));
+      return;
+    }
+    const snapshotRevision = live ? liveClaimRevision : (row?.quota_revision ?? null);
+    const snapshotScope = claimScopeKey(id);
+    const snapshotLiveHash = live ? liveClaimHash : null;
+    let outcome;
+    try {
+      outcome = await invoke("claim_adopt_legacy_history", {
+        id,
+        revision: snapshotRevision,
+        identityScope: snapshotScope,
+        liveHash: snapshotLiveHash,
+      });
+    } catch (e) {
+      // 后端拒绝（快照已变/写入失败）：保留旧记录与保护，不得提示成功。
+      toast(t("m.legacyConfirmFailed"), "err", stripErr(e));
+      loadLegacyCounts();
+      return;
+    }
+    // 归属期间账号被切换：后端已归到用户确认的原身份，本地不得迁到新身份。
+    const currentRevision = live
+      ? liveClaimRevision
+      : ((state?.accounts || []).find((a) => a.id === id)?.quota_revision ?? null);
+    const currentScope = claimScopeKey(id);
+    if (currentRevision !== snapshotRevision || currentScope !== snapshotScope) {
+      toast(t("m.legacyConfirmAborted"), "warn", t("m.legacyConfirmAbortedDetail"));
+      loadLegacyCounts();
+      return;
+    }
+    // 已归属历史里的套餐继续压制自动领取（即使上游预览暂时仍返回该套餐）。
+    const planIds = Array.isArray(outcome?.planIds) ? outcome.planIds : [];
+    for (const planId of planIds) claimMarks[`${snapshotScope}|${planId}`] = Date.now();
+    const marks = confirmLegacyMarks(claimMarks, claimMarksLegacy, id, snapshotScope);
+    claimMarks = marks.marks;
+    claimMarksLegacy = marks.legacy;
+    saveMarks();
+    const cat = confirmLegacyCatalog(catalog, catalogLegacy, id, snapshotScope);
+    catalog = cat.catalog;
+    catalogLegacy = cat.legacy;
+    saveCatalog();
+    const skipped = Number(outcome?.skipped) || 0;
+    if (skipped > 0) legacyHistoryCounts[id] = skipped;
+    else delete legacyHistoryCounts[id];
+    if (claimedState[id]) claimedState[id].legacyHistory = [];
+    if (skipped > 0) toast(t("m.legacyConfirmedPartial", { count: skipped }), "warn");
+    else toast(t("m.legacyConfirmed"), "ok", t("m.legacyConfirmedDetail"));
+    render();
+  },
+
+  /// 旧数据清除：用户声明这些记录不是当前登录的 → 删除标记/目录，并清理无法归属的旧历史。
+  /// 只有显式操作后才允许自动领取重新尝试这些套餐；后端清理失败时保持原状态。
+  async dropLegacy(id) {
+    try {
+      await invoke("claim_drop_legacy_history", { id });
+    } catch (e) {
+      toast(t("m.legacyDropFailed"), "err", stripErr(e));
+      loadLegacyCounts();
+      return;
+    }
+    const marks = discardLegacyMarks(claimMarksLegacy, id);
+    claimMarksLegacy = marks.legacy;
+    saveMarks();
+    const cat = discardLegacyCatalog(catalogLegacy, id);
+    catalogLegacy = cat.legacy;
+    saveCatalog();
+    delete legacyHistoryCounts[id];
+    if (claimedState[id]) claimedState[id].legacyHistory = [];
+    toast(t("m.legacyDropped"), "warn", t("m.legacyDroppedDetail"));
+    render();
+  },
+
+  reloadLegacy() {
+    loadLegacyCounts();
+  },
+
   async claim(id) {
-    if (claimActive || claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
+    if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) {
+      toast(t("m.claimBusy"), "warn");
+      return;
+    }
+    if (unknownClaimFor(id)) {
+      toast(t("m.claimUnconfirmed", { name: claimDisplayName(id) }), "warn", t("m.claimCheckFirstDetail"));
+      return;
+    }
     // 数据源与行内条/弹框一致：探测发现的活动也要能直接领
     const plans = claimablePlansFor(id);
     const plan = plans[0];
@@ -554,132 +1239,108 @@ const actions = {
     // 从活动弹框里点「领取」时先关掉弹框，避免挡住验证码窗口
     document.querySelector(".act-mask")?.remove();
     try {
-      await invoke("claim_start", { id, planId: plan.plan_id });
       toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
-      const r = await waitForClaimResult(id);
-      if (!r) toast(t("m.claimTimeout"), "warn");
-      else if (r.ok !== false) {
-        markClaimed(id, plan.plan_id);
-        await fetchClaimed(id);
-      }
-    } catch (e) {
-      toast(stripErr(e), "err");
+      const outcome = await performClaim(id, plan, { mode: "manual", timeoutMs: 90_000 });
     } finally {
       claimActive = false;
+      claimQueue.kick();
     }
   },
 
   async claimAll() {
+    const pending = (state?.accounts || []).map((a) => a.id).filter((id) => unknownClaimFor(id));
     const ids = (state?.accounts || [])
       .map((a) => a.id)
-      .filter((id) => (claimable[id]?.plans || []).length > 0);
+      .filter((id) => !unknownClaimFor(id) && (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    const g = refreshGate("global");
-    if (!g.ok) { toastGate(g); return; }
+    if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) return;
+    if (pending.length) {
+      toast(t("m.claimBatchSkipped", { n: pending.length }), "warn", t("m.claimBatchSkippedDetail"));
+    }
     claimAllRunning = true;
     claimActive = true;
     try {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
-        const plan = claimable[id].plans[0];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
-        try {
-          await invoke("claim_start", { id, planId: plan.plan_id });
-        } catch (e) {
-          toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
-          continue;
-        }
-        const r = await waitForClaimResult(id, 120000);
-        if (!r) {
-          toast(t("m.claimAcctTimeout", { name }), "warn");
-          await cancelClaimIfMine(id, plan.plan_id);
-        } else if (r.ok !== false) {
-          markClaimed(id, plan.plan_id);
-          await fetchClaimed(id);
-        }
+        const plan = claimable[id]?.plans?.[0];
+        if (!plan) continue;
+        const outcome = await performClaim(id, plan, { mode: "all", timeoutMs: 120_000 });
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
       }
     } finally {
       claimAllRunning = false;
       claimActive = false;
+      claimQueue.kick();
     }
   },
 
   async refreshClaim() {
     const ids = (state?.accounts || []).map((a) => a.id);
+    if (liveClaimTarget()) ids.push(LIVE_CLAIM_ID);
     if (!ids.length) return;
-    // 自动轮次运行中允许抢跑（下面会先请求终止自动轮），因此这里不把 autoClaimRunning 判为忙
-    const g = refreshGate("global");
-    if (!g.ok) { toastGate(g); return; }
-    refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0, current: "" };
-    startRefreshTicker();
-    if (autoClaimRunning) {
-      autoAbortRequested = true;
-      const deadline = Date.now() + AUTO_ABORT_WAIT_MS;
-      while (autoClaimRunning && Date.now() < deadline) {
-        await new Promise((res) => setTimeout(res, 300));
-      }
-      if (autoClaimRunning) {
-        refreshClaim.running = false;
-        refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
-        toast(t("m.claimBusy"), "warn");
-        setTimeout(stopRefreshTickerIfIdle, 1100);
-        return;
-      }
+    const now = Date.now();
+    if (refreshClaim.running) return;
+    if (now < refreshClaim.cooldownUntil) {
+      toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
+      return;
     }
-    let okCount = 0;
+    refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0 };
+    startRefreshTicker();
+    let claimableCount = 0;
+    let failedCount = 0;
+    let skippedCount = 0;
     try {
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
-        refreshClaim.done = i + 1;
-        refreshClaim.current = name;
-        claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
-        if (!uiLocked()) render();
-        try {
-          const r = await invokeWithTimeout("claim_refresh", { id, force: true });
-          claimable[id] = { plans: r.plans || [], err: null, busy: false };
-          await fetchClaimed(id);
-          if ((r.plans || []).length) okCount++;
-          if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
-        } catch (e) {
-          claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-          toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
-        }
-        scheduleNext(id);
-        if (!uiLocked()) render();
-        if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 5000));
-      }
+      await claimFlow.refreshMany(ids, {
+        onItem: ({ id, done, outcome }) => {
+          refreshClaim.done = done;
+          const name = claimDisplayName(id);
+          if (outcome.status === "ok") {
+            if (outcome.plans?.length) claimableCount++;
+            if (outcome.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(outcome.activationError) }), "warn");
+          } else if (outcome.status === "skipped") {
+            skippedCount++;
+          } else {
+            failedCount++;
+            toast(t("m.refreshClaimAcctErr", { name, err: stripErr(outcome.error || "") }), "err");
+          }
+          if (id !== LIVE_CLAIM_ID) quotaScheduler.poke(id);
+          if (!uiLocked()) render();
+        },
+      });
     } finally {
       refreshClaim.running = false;
       refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
       if (!uiLocked()) render();
       setTimeout(stopRefreshTickerIfIdle, 1100);
     }
-    toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
+    void failedCount;
+    void skippedCount;
+    toast(t("m.refreshClaimDone", { n: ids.length, k: claimableCount }), "ok");
   },
 
   async acctRefreshClaim(id) {
-    const name = state?.accounts.find((a) => a.id === id)?.name || id;
-    const g = refreshGate(id);
-    if (!g.ok) { toastGate(g); return; }
+    if (claimFlow.busy(id)) return;
+    if (id !== LIVE_CLAIM_ID && !(state?.accounts || []).some((a) => a.id === id)) return;
     acctRefreshBusy[id] = true;
     acctRefreshCooldown[id] = 0;
     startRefreshTicker();
-    claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
     if (!uiLocked()) render();
     try {
-      const r = await invokeWithTimeout("claim_refresh", { id, force: true });
-      claimable[id] = { plans: r.plans || [], err: null, busy: false };
-      await fetchClaimed(id);
-      if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
-    } catch (e) {
-      claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-      toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
+      const outcome = await claimFlow.refresh(id).catch((e) => ({ status: "failed", error: stripErr(e) }));
+      if (outcome.status === "ok" && outcome.activationError) {
+        toast(t("m.refreshClaimAcctErr", { name: claimDisplayName(id), err: stripErr(outcome.activationError) }), "warn");
+      } else if (outcome.status === "ok") {
+        const n = outcome.plans?.length || 0;
+        toast(t(n ? "m.refreshClaimAcctFound" : "m.refreshClaimAcctEmpty", { name: claimDisplayName(id), n }));
+      } else if (outcome.status === "scope_changed") {
+        toast(t("m.refreshClaimAcctChanged", { name: claimDisplayName(id) }), "warn");
+      } else if (outcome.status === "failed") {
+        toast(t("m.refreshClaimAcctErr", { name: claimDisplayName(id), err: stripErr(outcome.error || "") }), "err");
+      }
+      quotaScheduler.poke(id);
     } finally {
       acctRefreshBusy[id] = false;
       acctRefreshCooldown[id] = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
-      scheduleNext(id);
       if (!uiLocked()) render();
       setTimeout(stopRefreshTickerIfIdle, 1100);
     }
@@ -688,10 +1349,6 @@ const actions = {
   async toggleAutoClaim() {
     if (autoToggleBusy) return;
     const next = !state.auto_claim;
-    if (next && (autoClaimRunning || claimActive || claimAllRunning || refreshClaim.running)) {
-      toast(t("m.claimBusy"), "warn");
-      return;
-    }
     autoToggleBusy = true;
     try {
       await invoke("set_behavior", { autoClaim: next });
@@ -747,26 +1404,16 @@ function stopRefreshTickerIfIdle() {
 }
 
 function autoClaimCooldownFor(r) {
-  const now = Date.now();
-  // plan 级终态/1005 由 claimHold 记忆（见 holdForClaim），账号级只拦交互卡死与流程异常
-  if (r.code === "interactive") return now + 60 * 60 * 1000;
-  if (Number.isFinite(r.code) && r.code >= 1000) return 0;
-  return now + AUTO_CLAIM_INTERVAL_MS;
+  // 规则集中在 claim-run（受测）：1005 用上游时间、业务码失败 60 分钟、其余退回扫描间隔。
+  return autoCooldownUntil(r, Date.now(), AUTO_CLAIM_INTERVAL_MS);
 }
 
 // (账号|套餐) 级领取记忆：终态不重试、1005 等到 nextAt，避免浪费验证码求解与上游写请求
 let claimHold = {};
-const claimHoldKey = (id, planId) => `${id}|${planId}`;
+const claimHoldKey = (id, planId) => `${claimScopeKey(id)}|${planId}`;
 function holdForClaim(r) {
-  const now = Date.now();
-  if (r.terminal && r.code === 1005) {
-    return Number.isFinite(r.nextAt) && r.nextAt > now ? r.nextAt : now + 60 * 60 * 1000;
-  }
-  if (r.terminal) return Infinity;
-  // 3007 / 挑战：拒码本身就是风控信号，3007 又不再自动重试，
-  // 若按 10 分钟重试等于反复弹验证码窗口 → 拉长到 60 分钟。
-  if (r.challenge || r.code === 3007) return now + 60 * 60 * 1000;
-  return now + 60 * 60 * 1000;
+  // 终态永不重试；1005 等到上游时间；挑战 / 3007 / 不确定结果统一 60 分钟。
+  return claimHoldUntil(r, Date.now());
 }
 
 /// 只在「待领取仍是自己发起的那一笔」时才取消：避免自动领取超时把用户手动的领取清掉。
@@ -774,8 +1421,12 @@ async function cancelClaimIfMine(id, planId) {
   try {
     const p = await invoke("claim_pending");
     if (p && p.accountId === id && (!planId || p.planId === planId)) {
-      await invoke("claim_cancel").catch(() => {});
-      return true;
+      const active = claimAttempts.attempts.values().find?.((a) => a.accountId === id && !a.handled)
+        || [...claimAttempts.attempts.values()].find((a) => a.accountId === id && !a.handled);
+      if (active) {
+        await invoke("claim_cancel", { claimId: active.claimId }).catch(() => {});
+        return true;
+      }
     }
   } catch { /* 查询失败则不动，不误伤 */ }
   return false;
@@ -783,18 +1434,45 @@ async function cancelClaimIfMine(id, planId) {
 // 已领取标记：同一账号对同一活动只领一次，且不必反复向上游查询「是否领过」
 const MARKS_KEY = "zsw-claim-marks";
 let claimMarks = {};
-const markKey = (id, planId) => `${id}|${planId}`;
+// 无身份前缀的旧标记：无法可靠归属，默认继续压制自动领取，等用户显式确认或清除。
+let claimMarksLegacy = [];
+const claimScopeKey = (id) => claimIdentityKey(id, {
+  live: id === LIVE_CLAIM_ID,
+  identity: claimIdentityFor(id),
+  liveHash: liveClaimHash,
+});
+const markKey = (id, planId) => `${claimScopeKey(id)}|${planId}`;
+
+/// 领取标记/目录/缓存分区使用的身份：live 用界面上展示的登录身份，存储账号用它自己
+/// 的身份（两者都带后端作用域）。保存账号被换成另一登录时，键随之变化。
+function claimIdentityFor(id) {
+  if (id === LIVE_CLAIM_ID) return state?.live_identity || null;
+  return (state?.accounts || []).find((a) => a.id === id)?.identity || null;
+}
 function loadMarks() {
-  try { claimMarks = JSON.parse(localStorage.getItem(MARKS_KEY) || "{}"); } catch { claimMarks = {}; }
+  let raw = {};
+  try { raw = JSON.parse(localStorage.getItem(MARKS_KEY) || "{}"); } catch { raw = {}; }
+  const split = splitMarkRecords(raw);
+  claimMarks = split.scoped;
+  claimMarksLegacy = split.legacy;
+  saveMarks();
 }
 function saveMarks() {
-  let keys = Object.keys(claimMarks);
+  const all = { ...claimMarks };
+  for (const record of claimMarksLegacy) all[record.key] = record.at;
+  let keys = Object.keys(all);
   if (keys.length > 300) {
-    keys.sort((a, b) => claimMarks[a] - claimMarks[b]).slice(0, keys.length - 300).forEach((k) => delete claimMarks[k]);
+    keys.sort((a, b) => all[a] - all[b]).slice(0, keys.length - 300).forEach((k) => delete all[k]);
   }
-  try { localStorage.setItem(MARKS_KEY, JSON.stringify(claimMarks)); } catch { /* ignore */ }
+  try { localStorage.setItem(MARKS_KEY, JSON.stringify(all)); } catch { /* ignore */ }
 }
-const isMarked = (id, planId) => !!claimMarks[markKey(id, planId)];
+/// "scoped"（已归属）/ "legacy"（待确认）/ null。两者都算已领，避免自动重复尝试。
+function markState(id, planId) {
+  if (claimMarks[markKey(id, planId)]) return "scoped";
+  if (hasLegacyMark(claimMarksLegacy, id, planId)) return "legacy";
+  return null;
+}
+const isMarked = (id, planId) => markState(id, planId) !== null;
 function markClaimed(id, planId) {
   if (!id || !planId) return;
   claimMarks[markKey(id, planId)] = Date.now();
@@ -805,31 +1483,51 @@ function markClaimed(id, planId) {
   if (claimable[id]?.plans) claimable[id].plans = claimable[id].plans.filter(keep);
 }
 
-/// 自动领取的准入集合：必须「已探测到活动 + 已开始 + 未过期 + 本账号未领过」。
+/// 自动领取的准入集合：必须「已探测到活动 + 已开始 + 未过期 + 本账号未领过 + 无待确认结果」。
 /// 没有探测数据时返回空集 —— 自动领取不生效，且不发任何上游请求。
+/// 时间窗与已领取判断统一走 claim-eligibility，避免与队列消费端出现两套规则。
 function autoTargets() {
   const now = Date.now();
   const out = [];
   for (const r of activityRows()) {
     if (r.status !== "claimable") continue;             // 已领取 / 已过期都不参与
-    if (isMarked(r.accountId, r.planId)) continue;      // 本账号已领过该活动
-    const startAt = r.startsAt ?? r.effectiveAt ?? null;
-    if (startAt && startAt > now) continue;             // 活动还没开始
-    if (r.endsAt && r.endsAt <= now) continue;          // 已过期
     // 必须用 claimablePlansFor（刷新 + 探测合并）——只读 claimable 会让「探测发现的活动」永远进不了自动领取
     const plan = claimablePlansFor(r.accountId).find((p) => (p.plan_id || p.planId) === r.planId);
     if (!plan) continue;                                // 无可用条目：不发请求，等下次探测
-    if ((claimHold[claimHoldKey(r.accountId, r.planId)] ?? 0) > now) continue;
+    const merged = {
+      ...plan,
+      starts_at: plan.starts_at ?? r.startsAt,
+      ends_at: plan.ends_at ?? r.endsAt,
+    };
+    if (!autoEligible({
+      plan: merged,
+      now,
+      isMarked: (pid) => isMarked(r.accountId, pid),
+      hasUnknown: Boolean(unknownClaimFor(r.accountId)),
+      hasLegacy: hasLegacyData(r.accountId),
+      holdUntil: claimHold[claimHoldKey(r.accountId, r.planId)] ?? 0,
+    })) continue;
     if ((autoClaimCooldown[r.accountId] ?? 0) > now) continue;
-    out.push({ accountId: r.accountId, plan });
+    // 记录批次生成时的代次：逐项提交前会重新校验，换登录/换账号后不得用旧 plan。
+    const liveRow = r.accountId === LIVE_CLAIM_ID;
+    const row = liveRow ? null : (state?.accounts || []).find((a) => a.id === r.accountId);
+    out.push({
+      accountId: r.accountId,
+      plan,
+      revision: liveRow ? liveClaimRevision : row?.quota_revision,
+      liveHash: liveRow ? liveClaimHash : null,
+    });
   }
   return out;
 }
 
 /// 统一领取流程：`auto`（自动领取 10 分钟轮）与 `effective`（到点自动领取）共用。
+/// 会话保护走 performClaim：一次提交一个 claimId，超时/取消不会误判为必然失败。
 async function runClaimTargets(targets, source) {
   autoClaimRunning = true; claimActive = true; autoAbortRequested = false;
   let roundClaimed = 0, roundSkipped = 0;
+  // 同账号出现 unknown 后，本轮不再自动启动它的后续项。
+  const blocked = new Set();
   if (!uiLocked()) render();
   try {
     for (const t of targets) {
@@ -838,30 +1536,46 @@ async function runClaimTargets(targets, source) {
       if (source === "effective" && !state?.claim_at_effective) break;
       const id = t.accountId;
       const plan = t.plan;
-      try {
-        await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
-      } catch (e) {
-        autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+      if (blocked.has(id)) {
         roundSkipped++;
         continue;
       }
-      const r = await waitForClaimResult(id, AUTO_CLAIM_WAIT_MS);
-      if (!r) {
-        await cancelClaimIfMine(id, plan.plan_id);
-        autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+      // 批次的每一项在真正提交前都要重新校验：身份代次、当前资格、标记、hold、冷却、待确认。
+      const live = id === LIVE_CLAIM_ID;
+      const account = live
+        ? { id, quota_revision: liveClaimRevision }
+        : (state?.accounts || []).find((a) => a.id === id) || null;
+      const planId = planIdOf(plan);
+      const admission = batchAdmission({
+        plan,
+        expected: { revision: t.revision, liveHash: t.liveHash },
+        account,
+        live: live ? { hash: liveClaimHash } : null,
+        currentPlans: claimablePlansFor(id),
+        isMarked: (pid) => isMarked(id, pid),
+        hasUnknown: Boolean(unknownClaimFor(id)),
+        hasLegacy: hasLegacyData(id),
+        holdUntil: claimHold[claimHoldKey(id, planId)] ?? 0,
+        cooldownUntil: autoClaimCooldown[id] ?? 0,
+      });
+      if (!admission.ok) {
         roundSkipped++;
+        logProbe(`skip ${id}/${planId}: ${admission.reason}`);
         continue;
       }
-      if (r.ok === false) {
-        claimHold[claimHoldKey(id, plan.plan_id)] = holdForClaim(r);
-        autoClaimCooldown[id] = autoClaimCooldownFor(r);
+      const outcome = await performClaim(id, plan, { mode: "auto", timeoutMs: AUTO_CLAIM_WAIT_MS });
+      const settlement = claimSettlement(outcome.payload || {}, Date.now(), AUTO_CLAIM_INTERVAL_MS);
+      if (outcome.status === "ok" && outcome.refresh) {
+        claimHold[claimHoldKey(id, planId)] = 0;
+        roundClaimed++;
+      } else {
+        if (outcome.status !== "skipped") {
+          claimHold[claimHoldKey(id, planId)] = settlement.holdUntil;
+          autoClaimCooldown[id] = settlement.cooldownUntil;
+        }
+        if (outcome.status === "unknown") blocked.add(id);
         roundSkipped++;
-        continue;
       }
-      markClaimed(id, plan.plan_id);
-      roundClaimed++;
-      await awaitClaimPreviewFresh(id).catch(() => {});
-      await fetchClaimed(id);
       if (!uiLocked()) render();
       await new Promise((res) => setTimeout(res, 1200));
     }
@@ -875,19 +1589,27 @@ async function runClaimTargets(targets, source) {
   }
 }
 
+/// 定时扫描（auto_claim 开关）：并发扫描全部账号资格，查到可领即入后台串行队列。
+/// 扫描与领取相互独立——扫描不会因已有领取而暂停，重复结果也不会重复提交（队列去重）。
 async function autoClaimTick() {
-  if (!state?.auto_claim || autoClaimRunning) return;
-  if (claimActive || claimAllRunning || refreshClaim.running) return;
-
-  // 准入完全由「已探测到的活动」决定：没有可领且已开始、未过期的活动时，
-  // 自动领取不生效，也不发任何上游请求（不再逐个账号 claim_refresh）。
-  const targets = autoTargets();
-  if (!targets.length) {
-    lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, noActivity: true };
+  if (!state?.auto_claim || autoScanRunning) return;
+  const ids = (state.accounts || []).map((a) => a.id);
+  if (!ids.length) return;
+  autoScanRunning = true;
+  const round = { at: Date.now(), found: 0, failed: 0 };
+  if (!uiLocked()) render();
+  try {
+    await claimFlow.refreshMany(ids, {
+      onItem: ({ outcome }) => {
+        if (outcome.status === "ok" && outcome.plans?.length) round.found++;
+        else if (outcome.status !== "ok" && outcome.status !== "skipped") round.failed++;
+      },
+    });
+  } finally {
+    autoScanRunning = false;
+    lastAutoRound = { ...round, at: Date.now() };
     if (!uiLocked()) render();
-    return;
   }
-  await runClaimTargets(targets, "auto");
 }
 
 /// 到点自动领取（独立开关）：只要求「已到点且尚未领取」，
@@ -904,6 +1626,55 @@ async function effectiveClaimTick() {
   await runClaimTargets(targets, "effective");
 }
 
+/// Serial claim queue worker: claims flow in via claimFlow.onResult -> claimQueue.offer.
+/// A scan result can go stale while it waits for a slot, so admission is re-checked
+/// here (window, persisted claim mark, unresolved result) before any submission.
+async function runQueuedClaim(job) {
+  if (!job.isCurrent() || unknownClaimFor(job.id)) return { status: "skipped" };
+  const planId = planIdOf(job.plan);
+  if (!autoEligible({
+    plan: job.plan,
+    isMarked: (pid) => isMarked(job.id, pid),
+    hasUnknown: Boolean(unknownClaimFor(job.id)),
+    hasLegacy: hasLegacyData(job.id),
+    holdUntil: claimHold[claimHoldKey(job.id, planId)] ?? 0,
+  })) {
+    return { status: "skipped" };
+  }
+  autoClaimRunning = true;
+  claimActive = true;
+  try {
+    const outcome = await performClaim(job.id, job.plan, { mode: "auto", timeoutMs: AUTO_CLAIM_WAIT_MS });
+    // 准备失败（claim_start 直接报错、无结果载荷）也必须写入 hold 与冷却：
+    // 否则队列结束后到点/定时路径会立刻再启动同一个套餐。
+    const settlement = claimSettlement(outcome.payload || {}, Date.now(), AUTO_CLAIM_INTERVAL_MS);
+    if (outcome.status === "ok") {
+      claimHold[claimHoldKey(job.id, planId)] = 0;
+    } else if (outcome.status !== "skipped") {
+      claimHold[claimHoldKey(job.id, planId)] = settlement.holdUntil;
+      autoClaimCooldown[job.id] = settlement.cooldownUntil;
+    }
+    return { ...outcome, cooldownUntil: settlement.cooldownUntil || autoClaimCooldownFor(outcome.payload || {}) };
+  } finally {
+    autoClaimRunning = false;
+    claimActive = false;
+  }
+}
+
+/// 当前登录行的资格查询会把该行绑定到后端返回的真实代次；后续领取必须用它。
+/// 领取尝试模型也要跟着换代次，否则成功结果会被判定为「不属于当前登录」。
+function syncLiveClaimRevision() {
+  const entry = claimable[LIVE_CLAIM_ID];
+  if (!entry?.revision) return;
+  // 已采纳过就不要再同步：重复重建尝试模型会让进行中的领取失去年份（epoch）归属。
+  if (entry.revision === liveClaimHash || entry.revision === liveClaimBackendRevision) return;
+  liveClaimBackendRevision = entry.revision;
+  liveClaimRevision = entry.revision;
+  claimAttempts = syncClaimAccounts(claimAttempts, [
+    ...(state?.accounts || []),
+    { id: LIVE_CLAIM_ID, quota_revision: entry.revision },
+  ]);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.floor(Math.random() * (b - a));
 function shuffle(list) {
@@ -945,7 +1716,12 @@ function activityRows() {
       grants: (p.grant_items || []).map((g) => `${g.name} ${fmtTokens(g.units)}${g.period ? " · " + g.period : ""}`),
     });
   };
-  for (const a of state?.accounts || []) {
+  // 未保存的当前登录也进活动汇总：活动弹框与行内条必须同源。
+  const activityAccounts = [...(state?.accounts || [])];
+  if (liveClaimTarget()) {
+    activityAccounts.push({ id: LIVE_CLAIM_ID, name: claimDisplayName(LIVE_CLAIM_ID) });
+  }
+  for (const a of activityAccounts) {
     // 可领来源与行内条完全一致（claimablePlansFor），避免两处显示不一致
     upsertPlanMeta(activities[a.id] || []);
     upsertPlanMeta(claimable[a.id]?.plans || []);
@@ -957,9 +1733,12 @@ function activityRows() {
     const claimedIds = new Set(active.map((p) => p.plan_id).filter(Boolean));
     for (const p of active) add(a, p, p.ends_at && p.ends_at < now ? "expired" : "claimed");
 
-    // 持久化目录兜底：重启后 / 已静默不探测时，历史活动仍能展示（含已过期）
+    // 持久化目录兜底：重启后 / 已静默不探测时，历史活动仍能展示（含已过期）。
+    // 只展示属于当前身份作用域的条目：保存账号被换成另一登录后，旧目录不得混入。
+    const rowScope = claimScopeKey(a.id);
     for (const e of Object.values(catalog)) {
       if (e.accountId !== a.id) continue;
+      if (e.scope && e.scope !== rowScope) continue;
       if (liveIds.has(e.planId) || claimedIds.has(e.planId)) continue;
       const expired = !!e.endsAt && e.endsAt < now;
       const key = `${a.id}|${e.campaignId}|${e.planId}`;
@@ -1327,30 +2106,25 @@ function scheduleClaimAtEffective() {
 }
 
 /// 到点领取一次性尝试：只在该账号当前仍有可领套餐时发起；不启动任何循环。
+/// 与手动/自动领取一致走 performClaim：会话归属、超时确认保护都在这一条路径上。
 async function claimForActivity(id) {
-  if (claimActive || claimAllRunning || refreshClaim.running) {
+  if (claimActive || claimAllRunning || claimPending() || claimQueue.activeId()) {
     toast(t("m.refreshBusyRunning"), "warn");
     return;
   }
-  const plan = (claimable[id]?.plans || [])[0];
+  const plan = (claimable[id]?.plans || claimablePlansFor(id))[0];
   if (!plan) return; // 无可领（已领 / 无资格）：不打扰、不发请求
   if (isMarked(id, plan.plan_id)) return; // 本账号已领过该活动，不重复领取
+  if (unknownClaimFor(id)) return; // 待确认结果不允许自动再领
   claimActive = true;
   try {
-    await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
-    toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
-    const r = await waitForClaimResult(id, AUTO_CLAIM_WAIT_MS);
-    if (!r) {
-      await cancelClaimIfMine(id, plan.plan_id);
+    const outcome = await performClaim(id, plan, { mode: "auto", timeoutMs: AUTO_CLAIM_WAIT_MS });
+    if (outcome.status === "failed") {
       toast(t("m.claimAcctTimeout", { name: accountName(id) }), "warn");
-    } else     if (r.ok !== false) {
-      markClaimed(id, plan.plan_id);
-      await fetchClaimed(id);
     }
-  } catch (e) {
-    toast(stripErr(e), "err");
   } finally {
     claimActive = false;
+    claimQueue.kick();
     if (!uiLocked()) render();
   }
 }
@@ -1359,9 +2133,11 @@ function quotaBarHtml(pct) {
   const used = pct == null ? null : Math.min(100, Math.max(0, pct));
   const remaining = used == null ? null : 100 - used;
   const danger = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
-  const txt = remaining == null ? "--" : remaining.toFixed(0) + "%";
-  const txtCls = (remaining ?? 100) >= 58 ? " in-fill" : "";
-  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct${txtCls}">${txt}</span></div>`;
+  const txt = remaining == null ? "--"
+    : remaining > 0 && remaining < 1 ? "<1%"
+    : remaining > 99 && remaining < 100 ? ">99%"
+    : remaining.toFixed(0) + "%";
+  return `<div class="qbar${danger}" style="--quota-remaining:${remaining ?? 100}%"><div class="qbar-fill"></div><span class="qbar-pct">${txt}</span></div>`;
 }
 
 function itemKind(it) {
@@ -1375,7 +2151,7 @@ function windowLabel(it) {
     if (it.window.startsWith("hours:")) return t("q.win.hours", { n: it.window.slice(6) });
     return has(`q.win.${it.window}`) ? t(`q.win.${it.window}`) : it.window;
   }
-  const m = it.name.match(/[（(]每\s*([^）)]+)[）)]/);
+  const m = it.name.match(/[（(]每\s*([^\u3011）)]+)[）)]/);
   if (m) return "每" + m[1].replace(/^每/, "");
   if (itemKind(it) === "duration") return t("q.monthlyShort");
   if (itemKind(it) === "prompt_count") return t("q.countShort");
@@ -1434,10 +2210,12 @@ function tierChipHtml(tier, code) {
 function tierBadgeFor(id) {
   const q = acctQuota[id];
   if (!q?.data) return "";
-  const plans = q.data.plans || [];
+  const allPlans = q.data.plans || [];
+  const plans = allPlans.filter(p => !planExpired(p));
   const pairs = plans.map((p) => [p.tier, p.tier_code]);
-  const list = (pairs.length ? pairs : q.data.plan_tier ? [[q.data.plan_tier, null]] : []).slice(0, 2);
-  if (!list.length) return `<span class="tier-b free">Free</span>`;
+  const list = (allPlans.length ? pairs : q.data.plan_tier && !planExpired({ expire: q.data.plan_expire })
+    ? [[q.data.plan_tier, null]] : []).slice(0, 2);
+  if (!list.length) return q.data.completion === "complete" && q.data.is_empty ? `<span class="tier-b free">Free</span>` : "";
   return list.map(([tier, code]) => tierChipHtml(tier, code)).join("");
 }
 
@@ -1457,16 +2235,24 @@ function grantLabel(plan) {
 // 否则重启后 activities（内存）为空，而「静默到 ends_at」又阻止重新探测 → 列表空白、无角标、无弹窗。
 const CATALOG_KEY = "zsw-activity-catalog";
 let catalog = {};
+// 无身份作用域的旧目录条目：不渲染到任何登录下，等用户显式确认或清除。
+let catalogLegacy = {};
 function loadCatalog() {
-  try { catalog = JSON.parse(localStorage.getItem(CATALOG_KEY) || "{}"); } catch { catalog = {}; }
+  let raw = {};
+  try { raw = JSON.parse(localStorage.getItem(CATALOG_KEY) || "{}"); } catch { raw = {}; }
+  const split = splitCatalogRecords(raw);
+  catalog = split.scoped;
+  catalogLegacy = split.legacy;
+  saveCatalog();
 }
 function saveCatalog() {
-  let keys = Object.keys(catalog);
+  const all = { ...catalog, ...catalogLegacy };
+  let keys = Object.keys(all);
   if (keys.length > 300) {
-    keys.sort((a, b) => (catalog[a].firstSeenAt || 0) - (catalog[b].firstSeenAt || 0));
-    keys.slice(0, keys.length - 300).forEach((k) => delete catalog[k]);
+    keys.sort((a, b) => (all[a].firstSeenAt || 0) - (all[b].firstSeenAt || 0));
+    keys.slice(0, keys.length - 300).forEach((k) => { delete all[k]; delete catalog[k]; delete catalogLegacy[k]; });
   }
-  try { localStorage.setItem(CATALOG_KEY, JSON.stringify(catalog)); } catch { /* ignore */ }
+  try { localStorage.setItem(CATALOG_KEY, JSON.stringify(all)); } catch { /* ignore */ }
 }
 function upsertCatalog(accountId, plans, claimedHint = false) {
   let added = 0;
@@ -1475,11 +2261,13 @@ function upsertCatalog(accountId, plans, claimedHint = false) {
     if (!planId) continue;
     const c = p.campaign || null;
     const meta = planMeta[planId] || {};
-    const k = `${accountId}|${planId}`;
+    const scope = claimScopeKey(accountId);
+    const k = `${scope}|${planId}`;
     const prev = catalog[k] || {};
     if (!prev.planId) added++;
     catalog[k] = {
       accountId,
+      scope,
       planId,
       campaignId: c?.campaign_id || c?.campaignId || prev.campaignId || meta.campaignId || "",
       title: c?.title || prev.title || meta.title || p.name || planId,
@@ -1519,27 +2307,94 @@ function claimablePlansFor(id) {
 }
 
 function claimStripHtml(id) {
-  const plan = claimablePlansFor(id)[0];
-  if (!plan) return "";
+  const c = claimable[id];
+  const plans = claimablePlansFor(id);
+  const plan = plans[0];
+  const attempt = claimAttemptFor(id);
+  const unknown = unknownClaimFor(id);
+  const live = id === LIVE_CLAIM_ID;
+  const queued = claimQueue.status(id);
+  const rows = [];
+  if (attempt?.confirming || (attempt?.done && !attempt.handled)) {
+    const status = attempt.confirming ? t("m.claimConfirming") : t("m.claimUnconfirmed", { name: claimDisplayName(id) });
+    rows.push(`<div class="claim-unknown"><span class="aq-status">${esc(status)}</span></div>`);
+  }
+  if (unknown) {
+    rows.push(`<div class="claim-unknown">
+      <span class="aq-err">${esc(t("m.claimUnconfirmed", { name: claimDisplayName(id) }))}</span>
+      <button class="btn-ghost" click="actions.checkUnknown('${id}')">${esc(t("m.claimCheck"))}</button>
+      <button class="btn-ghost" click="actions.askRetryUnknown('${unknown.claimId}','${id}')" ${claimActive || claimPending() || claimQueue.activeId() ? "disabled" : ""}>${esc(t("m.claimRetry"))}</button>
+    </div>`);
+  }
+  if (c?.err) {
+    rows.push(`<div class="claim-unknown">
+      <span class="aq-err" title="${esc(c.err)}">${esc(c.err)}</span>
+      <button class="btn-ghost" click="actions.refreshClaimOne('${id}')"
+        ${claimFlow.busy(id) ? "disabled" : ""}>${esc(t("m.refreshClaimRetry"))}</button>
+    </div>`);
+  }
+  if (!plan) return rows.join("");
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
   const camp = plan.campaign;
   const tr = camp && (camp.endsAt || camp.ends_at)
     ? claimTimeRange({ starts_at: camp.startsAt ?? camp.starts_at, ends_at: camp.endsAt ?? camp.ends_at })
     : null;
-  return `
-  <div class="claim-strip" click="actions.openActivity('${id}')" title="${esc(t("act.openDetail"))}">
+  rows.unshift(`
+  <div class="claim-strip${live ? " live" : ""}" title="${esc(plan.description || label)}">
     ${ic("gift", 15)}
+    ${live ? `<span class="claim-badge">${esc(t("m.claimLiveBadge"))}</span>` : ""}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
     ${tr ? `<span class="claim-grants${tr.pending ? " warn-line" : ""}">${esc(tr.text)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || claimActive || claimPending() || unknown || queued ? "disabled" : ""}>${ic("gift", 13)} ${t(queued === "running" ? "m.claimInProgress" : queued === "queued" ? "m.claimQueued" : "btn.claim")}</button>
+  </div>`);
+  return rows.join("");
+}
+
+function liveClaimSlotHtml() {
+  if (!liveClaimTarget()) return "";
+  const c = claimable[LIVE_CLAIM_ID];
+  const strip = claimStripHtml(LIVE_CLAIM_ID);
+  // 领取成功后服务端不再下发资格：当前登录同样需要「已领取/待生效」条。
+  const claimed = claimedStripHtml(LIVE_CLAIM_ID);
+  if (!strip && c?.busy) {
+    return `<div class="claim-strip live"><span class="aq-loading">${t("q.loading")}</span></div>`;
+  }
+  if (strip || claimed) return `${strip}${claimed}${legacyNoteHtml(LIVE_CLAIM_ID)}`;
+  if (c?.err) {
+    return `<div class="claim-strip live"><span class="claim-name">${esc(t("m.claimLiveBadge"))}</span><span class="aq-err" title="${esc(c.err)}">${esc(c.err)}</span></div>${legacyNoteHtml(LIVE_CLAIM_ID)}`;
+  }
+  return legacyNoteHtml(LIVE_CLAIM_ID);
+}
+
+/// 旧数据（无身份作用域的标记/目录/历史）提示：默认继续压制自动领取，
+/// 只有用户显式选择「归属当前登录」或「不是当前登录」后才处理。
+function legacyNoteHtml(id) {
+  // 检查未完成/失败：明确提示，并保持自动领取被阻止（不能把未知当没有）。
+  if (!legacyState.ok) {
+    return `<div class="legacy-note legacy-error">
+      <span class="legacy-title">${esc(t("m.legacyCheckFailed"))}</span>
+      <span class="legacy-hint">${esc(legacyState.error || "")}</span>
+      <button class="btn-ghost" click="actions.reloadLegacy()">${esc(t("m.legacyRetry"))}</button>
+    </div>`;
+  }
+  const marks = legacyMarksFor(claimMarksLegacy, id).length;
+  const items = legacyCatalogFor(catalogLegacy, id).length;
+  const history = legacyHistoryCount(id);
+  const count = marks + items + history;
+  if (!count) return "";
+  return `<div class="legacy-note">
+    <span class="legacy-title">${esc(t("m.legacyTitle", { count }))}</span>
+    <span class="legacy-hint">${esc(t("m.legacyDetail"))}</span>
+    <button class="btn-ghost" click="actions.confirmLegacy('${esc(id)}')">${esc(t("m.legacyConfirm"))}</button>
+    <button class="btn-ghost" click="actions.dropLegacy('${esc(id)}')">${esc(t("m.legacyDrop"))}</button>
   </div>`;
 }
 
 function slotRowsHtml(items) {
   const list = items || [];
-  const isWin = (it) => itemKind(it) !== "raw";
+  const isWin = (it) => Boolean(it.window) || itemKind(it) !== "raw";
   const wins = list.filter(isWin);
   const best = new Map();
   for (const it of list) {
@@ -1564,16 +2419,59 @@ function expireInfo(s) {
   return { text: soon && hasTime ? s : s.slice(0, 10), soon, warn };
 }
 
+function planExpired(plan) {
+  if (Number.isFinite(plan?.ends_at)) return plan.ends_at <= Date.now();
+  const s = plan?.expire;
+  if (typeof s !== "string" || !s) return false;
+  let value = s;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) value = `${s}T23:59:59.999`;
+  else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) value = `${s.replace(" ", "T")}:59.999`;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) && ms <= Date.now();
+}
+
+function planStartInfo(ms) {
+  if (!Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return null;
+  const pad = n => String(n).padStart(2, "0");
+  return {
+    text: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    pending: ms > Date.now(),
+  };
+}
+
+function planStartLabels(p) {
+  if (Array.isArray(p.entitlement_starts)) {
+    const entries = p.entitlement_starts.length ? p.entitlement_starts : [{}];
+    return entries.map(entry => {
+      const start = planStartInfo(entry?.effective_at);
+      const label = start ? t(start.pending ? "q.startsAt" : "q.startTime", { time: start.text })
+        : t("q.startUnknown");
+      return { label, detail: entry?.name ? `${entry.name} · ${label}` : label };
+    });
+  }
+  const start = planStartInfo(p.starts_at);
+  const label = start ? t(p.pending && !start.pending ? "q.pendingStartTime"
+    : start.pending ? "q.startsAt" : "q.startTime", { time: start.text })
+    : p.pending ? t("q.pendingNoTime") : null;
+  return label ? [{ label, detail: label }] : [];
+}
+
 function planGroupHtml(p) {
   const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
   const exp = expireInfo(p.expire);
+  const starts = planStartLabels(p);
   return `
   <div class="plan-grp">
     <div class="pg-head">
       ${p.tier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
+      ${p.scope_label ? `<span class="pg-scope">${esc(p.scope_label)}</span>` : ""}
+      ${starts.length ? `<span class="pg-start" title="${esc(starts[0].detail)}" aria-label="${esc(starts[0].detail)}">${esc(starts[0].label)}</span>` : ""}
       ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
+    ${starts.length > 1 ? starts.map(start => `<div class="pg-start-more">${esc(start.detail)}</div>`).join("") : ""}
     ${slotRowsHtml(p.items)}
   </div>`;
 }
@@ -1614,38 +2512,38 @@ function claimedStripHtml(id) {
 function acctQuotaSlot(id) {
   const strip = claimStripHtml(id);
   const q = acctQuota[id];
+  const messages = [];
   let inner = "";
-  if (q?.busy) {
-    inner = `<span class="aq-loading">${t("q.loading")}</span>`;
-  } else if (q?.err) {
-    const msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
-    inner = `<span class="aq-err">${esc(msg)}</span>`;
-  } else if (q?.data) {
-    const plans = q.data.plans || [];
-    if (plans.length >= 2) {
-      inner = plans.map(planGroupHtml).join("");
-    } else {
-      const items = q.data.items || [];
-      const wins = items.filter((it) => itemKind(it) === "prompt_count");
-      if (wins.length) {
-        inner = wins.map((it) => winRowHtml(it, " mini")).join("");
-      } else {
-        inner = slotRowsHtml(items);
-      }
+  if (q?.busy) messages.push(`<span class="aq-loading">${t("q.loading")}</span>`);
+  if (q?.data) {
+    const allPlans = q.data.plans || [];
+    const plans = allPlans.filter(p => !planExpired(p));
+    inner = allPlans.length ? plans.map(planGroupHtml).join("") : slotRowsHtml(q.data.items);
+    if (q.data.completion === "complete" && q.data.is_empty) messages.push(`<span class="aq-status">${t("q.noPlan")}</span>`);
+    else if (q.data.completion === "complete" && allPlans.length && !plans.length) messages.push(`<span class="aq-status">${t("q.noValidPlan")}</span>`);
+    if (q.data.completion === "partial") {
+      messages.push(`<span class="aq-err">${esc(t("q.partial"))} · ${esc(quotaErrors(q.data))}</span>`);
     }
     // 额度防线：服务器侧余额不含一次性赠送池，全部耗尽但赠送池生效中时提示，防误判白领
-    const exhaustedAll = plans.length > 0 && plans.every((p) => (p.percent_used ?? 100) >= 99.5);
+    const exhaustedAll = allPlans.length > 0 && allPlans.every((p) => (p.percent_used ?? 100) >= 99.5);
     // 「赠送池生效」以权益生效时刻为准：plan.starts_at 只是活动开始，effective_at 才代表额度可用；
     // 0/缺失视为立即生效（服务端约定）。
     const hasActiveBonus = (claimedState[id]?.plans || []).some((p) =>
       (!p.status || p.status === "active") && (p.effective_at == null || p.effective_at <= Date.now()));
-    if (exhaustedAll && hasActiveBonus) {
+    if (exhaustedAll && hasActiveBonus && plans.length) {
       inner += `<div class="q-bonus-hint">${esc(t("q.bonusActive"))}</div>`;
     }
   }
+  if (q?.err) messages.push(`<span class="aq-err" title="${esc(q.err)}">${esc(q.err)}</span>`);
+  if (q?.err && q?.data?.refreshed_at) {
+    const time = new Date(q.data.refreshed_at).toLocaleString(localeTag());
+    messages.push(`<span class="aq-status">${esc(t("q.staleAt", { time }))}</span>`);
+  }
+  inner += messages.length ? `<div class="aq-status-list">${messages.join("")}</div>` : "";
   const claimed = claimedStripHtml(id);
-  if (!strip && !claimed && !inner) return `<div class="row-quota-slot"></div>`;
-  return `<div class="row-quota-slot">${strip}${claimed}${inner}</div>`;
+  const legacy = legacyNoteHtml(id);
+  if (!strip && !claimed && !inner && !legacy) return `<div class="row-quota-slot"></div>`;
+  return `<div class="row-quota-slot">${strip}${claimed}${inner}${legacy}</div>`;
 }
 
 function captureScroll() {
@@ -1666,10 +2564,29 @@ function restoreScroll(cap) {
   const row = list.querySelector(`.row[data-id="${CSS.escape(cap.id)}"]`);
   if (row) {
     const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
-    list.scrollTop = delta - cap.offset;
+    list.scrollTop += delta - cap.offset;
   } else {
     list.scrollTop = cap.scrollTop;
   }
+}
+
+function updateApp(html) {
+  const list = $app.querySelector(":scope > .list");
+  if (!list) {
+    $app.innerHTML = html;
+    return;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  // .live-slot 必须一起替换：当前登录行的资格/领取状态在 list 之外，
+  // 只更新 list 会让它的异步结果永远画不出来。
+  for (const selector of [".topbar", ".toolbar", ".live-slot", ".section-head"]) {
+    const oldPart = $app.querySelector(`:scope > ${selector}`);
+    const newPart = template.content.querySelector(selector);
+    if (oldPart && newPart && oldPart.outerHTML !== newPart.outerHTML) oldPart.replaceWith(newPart);
+  }
+  const nextList = template.content.querySelector(".list");
+  if (nextList && list.innerHTML !== nextList.innerHTML) list.innerHTML = nextList.innerHTML;
 }
 
 function render() {
@@ -1692,25 +2609,6 @@ function renderInner() {
   const active = s.accounts.find((a) => a.is_active) || null;
   const unsaved = s.live_logged_in && !active;
 
-  const cdTop = cooldownLeft(refreshClaim.cooldownUntil);
-  const refreshTopOff = refreshClaim.running || claimAllRunning || claimActive || cdTop > 0;
-  const refreshTopLabel = refreshClaim.running
-    ? `${t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total })}${refreshClaim.current ? " · " + refreshClaim.current : ""}`
-    : cdTop > 0 ? `${t("btn.refreshClaim")} (${cdTop}s)` : t("btn.refreshClaim");
-  const refreshTopTitle = cdTop > 0 && !refreshClaim.running
-    ? t("btn.refreshClaimCooldownTitle", { n: cdTop })
-    : t("btn.refreshClaimTitle");
-  const actRows = activityRows();
-  const actCount = actRows.filter((r) => r.status === "claimable").length;
-  const lastProbeText = probe.lastSummary?.at
-    ? t("act.lastProbe", {
-      time: new Date(probe.lastSummary.at).toLocaleTimeString(localeTag(), { hour12: false }),
-      n: probe.lastSummary.hits,
-    })
-    : t("act.neverProbed");
-  // 只要列表里有条目（可领 / 已领取 / 已过期），入口就不算「空」
-  const actBtnTitle = `${actRows.length ? t("act.title") : t("m.activityNoneHint")} · ${lastProbeText}`;
-
   const dotCls = s.zcode_running ? "run" : s.live_logged_in ? "" : "off";
   const statusText = s.zcode_running
     ? t("m.status.running")
@@ -1724,9 +2622,9 @@ function renderInner() {
       <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <input class="rename-input" value="${esc(a.name)}" maxlength="40"
-            keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
-          <div class="row-meta">${t("btn.renameMeta")}</div>
+          <div class="row-name"><span class="row-name-ident"><input class="rename-input" value="${esc(a.name)}" maxlength="40"
+            keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">${channelBadge(a.identity?.provider)}</span></div>
+          <div class="row-meta"><span class="row-meta-text">${t("btn.renameMeta")}</span></div>
         </div>
         <div class="row-actions">
           <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
@@ -1738,27 +2636,22 @@ function renderInner() {
     const q = acctQuota[a.id];
     let meta = "";
     if (!a.has_config) meta += `<span class="no-cfg">${t("q.noCfg")}</span>`;
-    const exp = expireInfo(q?.data?.plan_expire);
+    const exp = planExpired({ expire: q?.data?.plan_expire }) ? null : expireInfo(q?.data?.plan_expire);
     if (exp) {
         meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
     }
     if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
-    const rowCd = cooldownLeft(acctRefreshCooldown[a.id]);
-    const rowOff = acctRefreshBusy[a.id] || claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning || rowCd > 0;
-    const rowTitle = rowCd > 0 && !acctRefreshBusy[a.id]
-      ? t("m.refreshCooldownSec", { n: rowCd })
-      : t("btn.acctRefreshTitle");
+    const claimQueryBusy = Boolean(claimable[a.id]?.busy);
     return `
     <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
       <div class="row-top">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
-          <div class="row-meta">${meta}<button class="row-meta-action" title="${esc(t("btn.resetDeviceTitle"))}" click="actions.resetDevice('${a.id}')">${esc(t("btn.resetDevice"))}</button></div>
+          <div class="row-name"><span class="row-name-ident"><span class="row-name-text" title="${esc(a.name)}">${esc(a.name)}</span>${channelBadge(a.identity?.provider)}</span>${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
+          <div class="row-meta">${meta ? `<span class="row-meta-text">${meta}</span>` : ""}<button class="row-meta-action" title="${esc(t("btn.resetDeviceTitle"))}" click="actions.resetDevice('${a.id}')">${esc(t("btn.resetDevice"))}</button></div>
         </div>
         <div class="row-actions">
-          <button class="icon-btn${rowOff ? " is-off" : ""}" title="${esc(rowTitle)}" aria-label="${esc(rowTitle)}"
-            click="actions.acctRefreshClaim('${a.id}')">${ic("refresh", 16)}${rowCd > 0 && !acctRefreshBusy[a.id] ? `<span class="ic-badge" data-cd-id="${a.id}">${rowCd}</span>` : ""}</button>
+          <button class="icon-btn${claimQueryBusy ? " is-checking" : ""}" title="${esc(t(claimQueryBusy ? "btn.checkEligibilityBusy" : "btn.checkEligibilityTitle"))}" aria-label="${esc(t("btn.checkEligibility"))}" aria-busy="${claimQueryBusy}" click="actions.refreshClaimOne('${a.id}')" ${claimQueryBusy ? "disabled" : ""}>${ic(claimQueryBusy ? "refresh" : "giftSearch", 16)}</button>
           <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
@@ -1780,9 +2673,9 @@ function renderInner() {
        </div>`
     : rows;
 
-  const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const claimableCount = s.accounts.filter((a) => !unknownClaimFor(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
 
-  $app.innerHTML = `
+  updateApp(`
     <header class="topbar">
       <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}</div>
       <div class="top-status${unsaved ? " unsaved" : ""}">
@@ -1797,18 +2690,25 @@ function renderInner() {
         ${ic("capture", 16)} ${t("btn.saveLogin")}
       </button>
       ${claimableCount > 0
-        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || claimActive || claimQueue.activeId() || claimPending() ? "disabled" : ""}
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
-      ${(s.accounts.length > 0)
-        ? `<button class="btn-ghost has-ic${refreshTopOff ? " is-off" : ""}" click="actions.refreshClaim()"
-            title="${esc(refreshTopTitle)}">${ic("refresh", 16)} <span id="refresh-claim-label">${esc(refreshTopLabel)}</span></button>`
+      ${(s.accounts.length > 0 || s.live_logged_in)
+        ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
+            ${refreshClaim.running || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
+            title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
+              ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
+              : esc(t("btn.refreshClaimTitle"))}">
+            ${ic("refresh", 16)} ${refreshClaim.running
+              ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
+              : esc(t("btn.refreshClaim"))}
+          </button>`
         : ""}
-      <button class="btn-ghost has-ic${actCount ? "" : " is-off"}" click="actions.openActivity()"
-        title="${esc(actBtnTitle)}">
-        ${ic("gift", 16)} ${esc(t("btn.activity"))}${actCount ? ` (${actCount})` : ""}
+      <button class="btn-ghost has-ic" click="actions.openActivity()"
+        title="${esc(t("btn.activity"))}">
+        ${ic("gift", 16)} ${esc(t("btn.activity"))}
       </button>
-      <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
+      <button class="tog-inline${s.auto_claim ? " on" : ""}${autoScanRunning || autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
         title="${autoPillTitle(s)}"
         click="actions.toggleAutoClaim()">
@@ -1823,13 +2723,15 @@ function renderInner() {
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
 
+    <div class="live-slot">${liveClaimSlotHtml()}</div>
+
     <div class="section-head">
       <h2>${t("m.accounts")}</h2>
       <span class="count">${t("m.count", { count: s.accounts.length })}</span>
     </div>
 
     <main class="list">${listHtml}</main>
-  `;
+  `);
   restoreScroll(scrollCap);
 }
 
@@ -1853,38 +2755,44 @@ listen("tray-action", (ev) => {
 });
 
 listen("claim://result", (ev) => {
-  const p = ev.payload || {};
-  if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
-  if (p.ok === false) {
-    let msg = p.message || t("m.unknownErr");
-    if (p.code === 1005 && p.nextAt) {
-      msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
-    }
-    toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
-  } else {
-    const bits = [];
-    const now = p.serverTime || Date.now();
-    const effAt = p.effectiveAt ?? null;
-    if (effAt && effAt > now) bits.push(t("m.claimEffectiveAt", { time: new Date(effAt).toLocaleString(localeTag(), { hour12: false }) }));
-    if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
-    toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
-  }
-  if (p.accountId) {
-    loadAcctQuota(p.accountId, true);
-    if (!autoClaimRunning) {
-      loadClaimPreview(p.accountId).then(() => { if (!uiLocked()) render(); });
-    }
-    scheduleNext(p.accountId);
-  }
+  handleClaimResult(ev.payload || {});
 });
 
-listen("captcha://interactive", () => {
-  if (!autoClaimRunning || !claimWaiter) return;
-  const id = claimWaiter.accountId;
-  cancelClaimIfMine(id).catch(() => {});
-  autoClaimCooldown[id] = Date.now() + 60 * 60 * 1000;
-  toast(t("m.autoClaimInteractive", { name: accountName(id) }), "warn", t("m.autoClaimInteractiveDetail"));
-  claimWaiter.finish({ ok: false, code: "interactive" });
+listen("claim://cancelled", (ev) => {
+  const claimId = ev.payload?.claimId;
+  if (!claimId) return;
+  const result = cancelAttempt(claimAttempts, claimId);
+  if (result.status !== "accepted") return;
+  if (result.refresh) claimQueue.record({ id: result.attempt.accountId, revision: result.attempt.revision, planId: result.attempt.planId }, { status: "cancelled" });
+  finishWaiter(claimAttempts, claimId, result.payload);
+  claimQueue.kick();
+  if (!uiLocked()) render();
+});
+
+listen("captcha://setup-failed", (ev) => {
+  const claimId = ev.payload?.claimId;
+  if (!claimId) return;
+  const attempt = claimAttempts.attempts.get(claimId);
+  if (!attempt || attempt.mode === "manual") return;
+  invoke("claim_cancel", { claimId }).catch(() => {});
+  if (claimAttempts.accounts[attempt.accountId]?.epoch === attempt.epoch) {
+    claimQueue.record({ id: attempt.accountId, revision: attempt.revision, planId: attempt.planId }, { status: "failed" });
+  }
+  closeWaiter(claimAttempts, claimId);
+  toast(t("m.claimSetupFailed", { name: claimDisplayName(attempt.accountId) }), "warn", t("m.claimSetupFailedDetail"));
+});
+
+listen("captcha://interactive", (ev) => {
+  const claimId = ev.payload?.claimId;
+  if (!claimId) return;
+  const attempt = claimAttempts.attempts.get(claimId);
+  if (!attempt || attempt.mode !== "auto") return;
+  invoke("claim_cancel", { claimId }).catch(() => {});
+  if (claimAttempts.accounts[attempt.accountId]?.epoch === attempt.epoch) {
+    claimQueue.record({ id: attempt.accountId, revision: attempt.revision, planId: attempt.planId }, { status: "failed", cooldownUntil: Date.now() + 60 * 60 * 1000 });
+  }
+  toast(t("m.autoClaimInteractive", { name: claimDisplayName(attempt.accountId) }), "warn", t("m.autoClaimInteractiveDetail"));
+  closeWaiter(claimAttempts, claimId);
 });
 
 listen("oauth://done", (ev) => {
@@ -1911,40 +2819,14 @@ listen("state-changed", () => {
   refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
 });
 
-const SWEEP_PERIOD = 5 * 60 * 1000;
-const SWEEP_JITTER = 0.2;
-const TICK_MS = 8000;
-let quotaDue = {};
-let ticking = false;
+const SWEEP_TICK_MS = 8000;
 
-function scheduleNext(id, base = Date.now()) {
-  const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
-  quotaDue[id] = base + Math.round(SWEEP_PERIOD * jitter);
-}
-function enrollAccounts() {
-  const live = new Set((state?.accounts || []).map((a) => a.id));
-  for (const id of live) if (!(id in quotaDue)) quotaDue[id] = Date.now();
-  for (const id of Object.keys(quotaDue)) if (!live.has(id)) delete quotaDue[id];
-}
-function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
+function scheduleNext(id) { quotaScheduler.scheduleNext(id); }
+function enrollAccounts() { quotaScheduler.applyAccounts(state?.accounts || []); }
+function pokeAccount(id) { if (id) quotaScheduler.poke(id); }
 
-async function sweepTick() {
-  if (ticking) return;
-  enrollAccounts();
-  const now = Date.now();
-  const due = (state?.accounts || []).find(
-    (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
-  );
-  if (!due) return;
-  ticking = true;
-  const dueAt = quotaDue[due.id];
-  try {
-    await loadAcctQuota(due.id);
-    if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
-    if (!uiLocked()) render();
-  } finally {
-    ticking = false;
-  }
+function sweepTick() {
+  quotaScheduler.sweep({ isBlocked: (id) => Boolean(claimable[id]?.busy) });
 }
 
 (async () => {
@@ -1956,10 +2838,12 @@ async function sweepTick() {
     setTimeout(dismissSplash, 350);
     enrollAccounts();
     sweepTick();
+    recoverClaimSessions().then(() => { loadLegacyCounts(); if (!uiLocked()) render(); });
     setInterval(() => {
-      invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+      refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
+      reconcileClaims().catch(() => {});
     }, 5000);
-    setInterval(sweepTick, TICK_MS);
+    setInterval(sweepTick, SWEEP_TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
     setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
     // 到点自动领取：每分钟检查「已到点且未领」的活动（无目标时不发任何请求）

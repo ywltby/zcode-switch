@@ -55,6 +55,7 @@ MOCK = r"""
       }
       if (command === 'claim_preview') return { accountId: args.id, revision: args.revision, plans: [] };
       if (command === 'claim_sessions') return { sessions: [], recovery: { ok: true } };
+      if (command === 'claim_legacy_count') return [];
       if (command.startsWith('plugin:event|')) return 1;
       if (['reveal_main','dismiss_splash'].includes(command)) return;
       throw new Error(`Unexpected synthetic command: ${command}`);
@@ -349,7 +350,7 @@ def main():
         expect(row("c")).not_to_contain_text("Synthetic Coding Pro")
         expect(row("c")).not_to_contain_text("刷新失败，显示")
 
-        assert not any("claim" in command and command not in ("claim_preview", "claim_sessions") for command in page.evaluate("quotaFixture.trace"))
+        assert not any("claim" in command and command not in ("claim_preview", "claim_sessions", "claim_legacy_count") for command in page.evaluate("quotaFixture.trace"))
         assert not errors, errors
         browser.close()
     print("PASS: synthetic A/B/C refresh, partial status, stale timestamp, credential update, state polling, late success/error, deletion, switching, and narrow layout. No real API requests.")

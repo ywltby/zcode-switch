@@ -42,6 +42,7 @@ MOCK = r"""
         return {accountId:args.id,revision:args.revision,plans:args.id === 'a0' ? [plan] : [],
           activated:true,activationError:null};
       }
+      if (command === 'claim_legacy_count') return [];
       if (command === 'claim_sessions') return {sessions:[],recovery:{ok:true}};
       if (command === 'claim_start') {
         f.starts.push(args);

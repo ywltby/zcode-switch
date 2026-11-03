@@ -135,8 +135,11 @@ fn finished_session_is_readable_and_finishing_twice_changes_nothing() {
 #[test]
 fn persist_failure_blocks_the_submission_and_keeps_verifying() {
     let path = temp_file();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // 先加载一个正常（不存在=空）的记录集，再把同名路径占成目录，
+    // 让后续 persist 失败——这样才能单独验证「写入失败不发送 POST」。
+    let mut registry = ClaimRegistry::load(path.clone());
     fs::create_dir_all(&path).unwrap();
-    let mut registry = ClaimRegistry::load(path);
     verifying(&mut registry, "c1", "zai:one", "p1");
     expect_submit_error(registry.begin_submit("c1"), SubmitError::PersistFailed);
     assert_eq!(registry.status("c1").unwrap().status, "verifying");
@@ -392,4 +395,63 @@ fn persisted_entitlement_times_do_not_include_raw_claim_secrets() {
     assert!(!raw.contains("synthetic-private-captcha"));
     let parsed: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(parsed["attempts"][0]["result"]["entitlementStarts"][0]["effective_at"], json!(1793113200000_i64));
+}
+
+/// 不可恢复的记录（schema 不支持 / phase 不认识 / 不可读）一律不覆盖原文件，
+/// 并且拒绝任何新领取会话——自动、到点、批量和手动都经过 try_start。
+#[test]
+fn unrecoverable_attempts_are_never_rewritten_and_block_new_claims() {
+    // 1) schema 不支持
+    let path = temp_file();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let unsupported = r#"{"schemaVersion":99,"attempts":[{"claimId":"c9","accountId":"account-a","revision":"rev-1","scope":"zai:one","planId":"p1","phase":"unknown","updatedAt":1}]}"#;
+    fs::write(&path, unsupported).unwrap();
+    let mut registry = ClaimRegistry::load(path.clone());
+    assert_eq!(
+        registry.recovery_error(),
+        Some("claim_attempts_unsupported")
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        unsupported,
+        "schema 不支持的记录不得被重写"
+    );
+    assert_eq!(
+        registry.try_start(session("c1", "zai:one", "p1")).unwrap_err(),
+        StartError::Recovery
+    );
+
+    // 2) phase 不认识（可能是新版本写入的）
+    let path = temp_file();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let unknown_phase = r#"{"schemaVersion":1,"attempts":[{"claimId":"c9","accountId":"account-a","revision":"rev-1","scope":"zai:one","planId":"p1","phase":"some-future-phase","updatedAt":1}]}"#;
+    fs::write(&path, unknown_phase).unwrap();
+    let mut registry = ClaimRegistry::load(path.clone());
+    assert_eq!(registry.recovery_error(), Some("claim_attempts_corrupt"));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        unknown_phase,
+        "未知 phase 的记录不得被重写/丢弃"
+    );
+    assert_eq!(
+        registry.try_start(session("c2", "zai:one", "p1")).unwrap_err(),
+        StartError::Recovery
+    );
+
+    // 3) 不可读（用目录占位模拟读失败）
+    let path = temp_file();
+    fs::create_dir_all(&path).unwrap();
+    let mut registry = ClaimRegistry::load(path.clone());
+    assert!(
+        registry
+            .recovery_error()
+            .is_some_and(|e| e.starts_with("claim_attempts_unreadable")),
+        "读取失败必须报告: {:?}",
+        registry.recovery_error()
+    );
+    assert!(path.is_dir(), "不可读的文件不得被删除或替换成空记录");
+    assert_eq!(
+        registry.try_start(session("c3", "zai:one", "p1")).unwrap_err(),
+        StartError::Recovery
+    );
 }

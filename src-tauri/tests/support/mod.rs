@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex};
 /// 有没有把凭证塞进 body 等）。仅测试使用。
 #[derive(Clone, Debug)]
 pub struct Recorded {
+    /// 去掉 query 的路径（路由与既有断言用）
     pub path: String,
+    /// 原始请求目标（含 query），用于断言 URL 参数
+    pub url: String,
     /// 键统一小写，便于大小写无关断言
     pub headers: BTreeMap<String, String>,
     pub body: String,
@@ -90,7 +93,7 @@ impl MockUpstream {
                 let req = read_request(&mut stream);
                 let Some((path, headers, body)) = req else { continue };
                 if let Ok(mut v) = serve_recorder.lock() {
-                    v.push(Recorded { path: path.clone(), headers, body });
+                    v.push(Recorded { url: path.clone(), path: path.split('?').next().unwrap_or(&path).to_string(), headers, body });
                 }
                 // 找第一条前缀匹配路由
                 let idx = serve_routes.iter().position(|r| path.starts_with(r.path));
@@ -179,8 +182,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, BTreeMap<St
     }
     body.truncate(content_length);
     Some((
-        // 去掉 query
-        path.split('?').next().unwrap_or(&path).to_string(),
+        // 保留原始请求目标（含 query），供 URL 参数断言
+        path,
         headers,
         String::from_utf8_lossy(&body).to_string(),
     ))
@@ -229,6 +232,86 @@ impl Drop for TempHome {
 }
 
 pub fn mock_creds() -> serde_json::Value {
-    // 明文 JWT（>20 字符即通过 claim_token 的直通分支），不含真实凭证
-    serde_json::json!({ "zcodejwttoken": "mock.jwt.token-for-tests-only-000000" })
+    // 完整合成身份（严格身份解析要求 provider 身份对 + 未过期 ZCode JWT），不含真实凭证。
+    // business token 与 ZCode JWT 故意不同串：两者相同会被判为 LoginRequired。
+    serde_json::json!({
+        "oauth:active_provider": "zai",
+        "oauth:zai:access_token": "mock.business.token-for-tests-only-000000000000",
+        "oauth:zai:user_info": "{\"id\":\"mock-user\"}",
+        "zcodejwttoken": "eyJhbGciOiJub25lIn0.eyJpZCI6ICJtb2NrLXVzZXIiLCAiZXhwIjogNDEwMjQ0NDgwMH0.synthetic-signature-000000",
+    })
+}
+
+/// 最小 HTTP 代理：记录请求行（绝对 URI 或 CONNECT），返回固定 JSON。
+/// 用它证明领取/活动/激活请求确实走了配置的出口，而不是直连。
+pub struct RecordingProxy {
+    pub url: String,
+    lines: Arc<Mutex<Vec<String>>>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RecordingProxy {
+    pub fn start(json_body: &'static str) -> RecordingProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording proxy");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).ok();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (record, sd) = (lines.clone(), shutdown.clone());
+        let handle = std::thread::spawn(move || loop {
+            if sd.load(Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first = text.lines().next().unwrap_or("").trim().to_string();
+                    record.lock().unwrap().push(first.clone());
+                    let response = if first.starts_with("CONNECT") {
+                        // 目标不可注入时（https 常量域名）我们只验证它尝试走代理。
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", json_body.len(), json_body)
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        });
+        RecordingProxy { url: format!("http://127.0.0.1:{port}"), lines, shutdown, handle: Some(handle) }
+    }
+
+    pub fn request_lines(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+}
+
+impl Drop for RecordingProxy {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 测试期间设置进程级代理，结束后恢复直连（避免污染同进程其他用例）。
+pub struct ProxyGuard;
+impl ProxyGuard {
+    pub fn set(url: &str) -> ProxyGuard {
+        zcode_switch_lib::set_traffic_proxy(Some(url.to_string()));
+        ProxyGuard
+    }
+    pub fn current() -> Option<String> {
+        zcode_switch_lib::traffic_proxy()
+    }
+}
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        zcode_switch_lib::set_traffic_proxy(None);
+    }
 }

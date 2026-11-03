@@ -45,6 +45,7 @@ MOCK = r"""
         return f.sessions[args.claimId]=f.session(args.claimId,args.id,'submitting');
       }
       if (command === 'claim_status') return f.sessions[args.claimId] || null;
+      if (command === 'claim_legacy_count') return [];
       if (command === 'claim_sessions') return {sessions:[f.session('unknown-a4','a4','unknown')],recovery:{ok:true}};
       if (command === 'claim_cancel') return {phase:'submitting',cancelled:false,submissionInFlight:true};
       throw new Error(`Unexpected synthetic command ${command}`);

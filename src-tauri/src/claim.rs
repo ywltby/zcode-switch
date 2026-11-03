@@ -7,6 +7,9 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(test)]
+mod tests;
+
 /// 上游基址：测试经 ZCODE_API_BASE 旁路指向本地 mock（默认官方）。
 pub const API_BASE_DEFAULT: &str = "https://zcode.z.ai";
 
@@ -86,28 +89,19 @@ pub struct CaptchaConfig {
     pub scene_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClaimOutcome {
-    pub account_id: String,
-    pub account_name: String,
-    pub plan_name: String,
-    pub starts_at: Option<i64>,
-    pub ends_at: Option<i64>,
-    /// 权益真实生效时间（ms）：`entitlements[].effective_at` 最小值；0 = 立即生效。
-    pub effective_at: Option<i64>,
-    pub server_time: Option<i64>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ClaimError {
     pub code: i64,
     pub message: String,
     pub next_at: Option<i64>,
+    /// The request may or may not have reached the server. A claim in this state
+    /// must never be retried automatically; the outcome has to be confirmed first.
+    pub unknown: bool,
 }
 
 impl ClaimError {
-    /// 3007：验证码校验失败（参数缺失/过期/已用），可换新验证码参数重试一次。
+    /// 3007：验证码校验失败（参数缺失/过期/已用）。拒码本身就是风控信号，
+    /// 换码连打只会加剧且白耗唯一重试额度：终态失败，不自动重试。
     pub fn is_captcha_rejected(&self) -> bool {
         self.code == 3007
     }
@@ -115,9 +109,10 @@ impl ClaimError {
     pub fn is_terminal(&self) -> bool {
         (1001..=1005).contains(&self.code)
     }
-    /// HTTP 401/403 但携带验证码挑战特征：是风控人机校验而非凭证失效，不得按登录过期处理。
+    /// 需要人机验证：HTTP 401/403 携带挑战特征（-2），以及验证码被拒（3007）。
+    /// 两者都不是终态，但都不能自动重试（3007 不自动换码）。
     pub fn is_challenge(&self) -> bool {
-        self.code == CLAIM_ERR_CHALLENGE
+        self.code == CLAIM_ERR_CHALLENGE || self.is_captcha_rejected()
     }
 }
 
@@ -130,6 +125,7 @@ impl From<String> for ClaimError {
             code: -1,
             message,
             next_at: None,
+            unknown: false,
         }
     }
 }
@@ -146,7 +142,41 @@ fn claim_error(code: i64, body: &Value) -> ClaimError {
         code,
         message: failure_message(code, body),
         next_at,
+        unknown: false,
     }
+}
+
+fn unknown_claim_error(message: String) -> ClaimError {
+    ClaimError {
+        code: -1,
+        message,
+        next_at: None,
+        unknown: true,
+    }
+}
+
+/// Structured scope-change error the frontend's `parseScopeError` understands.
+pub fn scope_payload(account_id: &str, revision: &str, not_started: bool) -> String {
+    serde_json::json!({
+        "code": "scope_changed",
+        "accountId": account_id,
+        "revision": revision,
+        "notStarted": not_started,
+    })
+    .to_string()
+}
+
+/// Display name of `plan_id` from a finished preview read; failures degrade to the id.
+pub fn claim_display_name(plans: Result<Vec<ClaimPlan>, String>, plan_id: &str) -> String {
+    plans
+        .ok()
+        .and_then(|plans| {
+            plans
+                .into_iter()
+                .find(|plan| plan.plan_id == plan_id)
+                .map(|plan| if plan.name.is_empty() { plan.plan_id } else { plan.name })
+        })
+        .unwrap_or_else(|| plan_id.to_string())
 }
 
 pub fn failure_payload(
@@ -164,22 +194,15 @@ pub fn failure_payload(
         "nextAt": err.next_at,
         "terminal": err.is_terminal(),
         "challenge": err.is_challenge(),
+        "unknown": err.unknown,
         "message": err.message,
     })
 }
 
-fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<String, String> {
-    let jwt = creds
-        .get("zcodejwttoken")
-        .and_then(|v| v.as_str())
-        .and_then(|v| decrypt_credential(v, secret));
-    if let Some(t) = jwt.filter(|t| t.trim().len() > 20) {
-        return Ok(t);
-    }
-    if let Some(t) = quota::zai_billing_token(creds, config, secret) {
-        return Ok(t);
-    }
-    Err(crate::i18n::tr("err.claim.no_jwt"))
+fn claim_token(creds: &Value, _config: Option<&Value>, secret: &str) -> Result<String, String> {
+    // 领取身份只用当前登录的 ZCode JWT：fallback 到配置里的其他 Key 会把别的账号
+    // 当成当前账号去提交领取。严格校验由 quota_auth 的身份解析完成。
+    crate::quota_auth::strict_zcode_jwt(creds, secret).map_err(|_| crate::i18n::tr("err.claim.no_jwt"))
 }
 
 fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
@@ -199,7 +222,10 @@ fn agent() -> ureq::Agent {
     .build()
 }
 
-pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
+/// 激活上报地址：与其它通道一样可通过 ZCODE_API_BASE 旁路到本地 mock（测试用）。
+pub(crate) fn event_report_url() -> String {
+    format!("{}/api/v1/event/report", api_base())
+}
 pub const ACTIVATION_EVENTS: [&str; 2] = ["app_launch", "app_daily_active"];
 const SCREEN_RESOLUTION: &str = "2560x1440";
 const ACTIVATION_TIMEOUT_SECS: u64 = 10;
@@ -271,7 +297,7 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
             device_mid,
         );
         let resp = agent
-            .post(EVENT_REPORT_URL)
+            .post(&event_report_url())
             .set("Content-Type", "application/json")
             .send_json(body)
             .map_err(|e| {
@@ -280,7 +306,7 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
             .into_string()
             .map_err(|e| crate::i18n::trf("err.claim.activate_req", &[("e", &e.to_string())]))?;
         let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        let code = business_code(&v).unwrap_or(-1);
         if code != 0 {
             return Err(failure_message(code, &v));
         }
@@ -308,57 +334,74 @@ pub fn preview_plans(
 fn http_err(prefix: &str, e: ureq::Error) -> String {
     if let ureq::Error::Status(code, resp) = e {
         let body = resp.into_string().unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|v| ["msg", "message", "error"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)))
+        let parsed = serde_json::from_str::<Value>(&body).ok();
+        let msg = parsed
+            .as_ref()
+            .map(crate::claim::error_message)
             .unwrap_or_default();
-        return format!("{prefix} HTTP {code}: {msg}");
+        // 非成功响应里的业务码同样要保留（风控 3012 常出现在 4xx/5xx 的 body 里）。
+        return match parsed.as_ref().and_then(business_code) {
+            Some(biz) => format!("{prefix} HTTP {code} (code {biz}): {msg}"),
+            None => format!("{prefix} HTTP {code}: {msg}"),
+        };
     }
     format!("{prefix} {e}")
 }
 
-/// claim 写请求的 HTTP 错误分类：401/403 若携带验证码挑战特征（响应头
-/// x-aliyun-captcha-verify-param 或 body 含 captcha 字样），归类为「需过人机校验」
-/// 而非凭证失效（zcode2api 实测教训：一次人机校验就把健康账号当登录过期会错杀）。
-fn classify_claim_http_err(prefix: &str, e: ureq::Error) -> ClaimError {
-    let status = match &e {
-        ureq::Error::Status(s, _) => *s,
-        _ => 0,
-    };
-    if status == 401 || status == 403 {
-        if let ureq::Error::Status(_, resp) = e {
-            let challenged = resp.header("x-aliyun-captcha-verify-param").is_some();
-            let body = resp.into_string().unwrap_or_default();
-            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            if challenged || body.to_lowercase().contains("captcha") {
-                return ClaimError {
-                    code: CLAIM_ERR_CHALLENGE,
-                    message: crate::i18n::tr("claim.fail.challenge"),
-                    next_at: None,
-                };
-            }
-            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-            if code > 0 {
-                return claim_error(code, &v);
-            }
-            let msg = ["msg", "message", "error"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from))
-                .unwrap_or_default();
-            return ClaimError {
-                code: -1,
-                message: format!("{prefix} HTTP {status}: {msg}"),
-                next_at: None,
-            };
+/// 业务码提取：顶层 code / provider_code，或 data.code、data.provider_code、error.code
+/// （数字或数字字符串）。上游不同通道把风控码放在不同层级，且可能外层 code=0 而
+/// 内层 provider_code=3012——任何非零码都必须优先于 0 返回，否则风控会被判成成功。
+/// 同一响应里出现多个非零码时，显式风控（3012）与已知 claim 业务码优先，
+/// 不能被外层通用错误码遮住；其余情况按层级顺序取第一个非零码。
+pub fn business_code(body: &Value) -> Option<i64> {
+    fn pick(v: &Value) -> Option<i64> {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    }
+    let mut candidates: Vec<i64> = Vec::new();
+    for (outer, inner) in [
+        (None, "code"),
+        (None, "provider_code"),
+        (Some("data"), "code"),
+        (Some("data"), "provider_code"),
+        (Some("error"), "code"),
+    ] {
+        let value = match outer {
+            Some(key) => body.get(key).and_then(|v| v.get(inner)),
+            None => body.get(inner),
+        };
+        if let Some(code) = value.and_then(pick) {
+            candidates.push(code);
         }
     }
-    ClaimError {
-        code: -1,
-        message: http_err(prefix, e),
-        next_at: None,
+    // 显式风控 / 已知 claim 业务码优先于通用错误码。
+    if let Some(code) = candidates.iter().copied().find(|c| *c == 3012) {
+        return Some(code);
     }
+    const KNOWN: [i64; 8] = [1001, 1002, 1003, 1004, 1005, 3001, 3007, 401];
+    if let Some(code) = candidates.iter().copied().find(|c| KNOWN.contains(c)) {
+        return Some(code);
+    }
+    // 没有可识别的非零码：有显式 0 才算成功；完全没有业务码必须返回 None（未知）。
+    if let Some(code) = candidates.iter().copied().find(|c| *c != 0) {
+        return Some(code);
+    }
+    candidates.iter().any(|c| *c == 0).then_some(0)
+}
+
+/// 上游错误描述：msg / message，或 error 字符串 / error.message。
+pub fn error_message(body: &Value) -> String {
+    ["msg", "message"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(|x| x.as_str()).map(String::from))
+        .or_else(|| {
+            body.get("error").and_then(|e| {
+                e.as_str()
+                    .map(String::from)
+                    .or_else(|| e.get("message").and_then(|m| m.as_str()).map(String::from))
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
@@ -372,7 +415,7 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
         .into_string()
         .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    let code = business_code(&v).unwrap_or(-1);
     if code != 0 {
         return Err(failure_message(code, &v));
     }
@@ -461,6 +504,16 @@ pub fn probe_marketing_only(
     marketing_touch_plans(home, creds, config, device_mid)
 }
 
+/// 活动探测用的带错版本：调用方据此把风控信号送进冷却状态机。
+pub(crate) fn probe_marketing_checked(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<Vec<ClaimPlan>, String> {
+    marketing_touch_plans_checked(home, creds, config, device_mid)
+}
+
 /// 营销触达通道：新版活动（客户端弹窗/banner）只经 marketing/touch 下发，billing/preview 不返回。
 /// deliveries 的按钮带可领 plan_id（action.type = claim_zcode_plan），payload 在 background/hero 的
 /// args.zcode_plan 内嵌完整套餐结构（字段与 preview plans 同构）。任何失败静默降级为空列表并记本地
@@ -471,30 +524,38 @@ pub fn marketing_touch_plans(
     config: Option<&Value>,
     device_mid: Option<String>,
 ) -> Vec<ClaimPlan> {
-    let fail = |detail: &str| -> Vec<ClaimPlan> {
-        flowlog::log("claim", "marketing-fail", detail);
-        Vec::new()
-    };
+    match marketing_touch_plans_checked(home, creds, config, device_mid) {
+        Ok(plans) => plans,
+        Err(detail) => {
+            flowlog::log("claim", "marketing-fail", &detail);
+            Vec::new()
+        }
+    }
+}
+
+/// 同一条 marketing 请求，但把失败原因交回调用方：风控（3012 / unusual activity）
+/// 必须能被准备阶段看到并中止，其余失败仍由调用方静默降级。
+fn marketing_touch_plans_checked(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<Vec<ClaimPlan>, String> {
     let secret = zcrypto::default_secret(home);
-    let token = match claim_token(creds, config, &secret) {
-        Ok(t) => t,
-        Err(e) => return fail(&e),
-    };
+    let token = claim_token(creds, config, &secret)?;
     let mut req = agent().get(&marketing_touch_url());
     for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
         req = req.set(&k, &v);
     }
-    let resp = match req.call() {
-        Ok(r) => r,
-        Err(e) => return fail(&http_err("marketing", e)),
-    };
-    let resp = match resp.into_string() {
-        Ok(s) => s,
-        Err(e) => return fail(&crate::i18n::trf("err.http.read", &[("e", &e.to_string())])),
-    };
+    let resp = req
+        .call()
+        .map_err(|e| http_err("marketing", e))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
-    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
-        return fail(&format!("code {}", v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1)));
+    let code = business_code(&v).unwrap_or(-1);
+    if code != 0 {
+        return Err(failure_message(code, &v));
     }
     let mut payloads: Vec<ClaimPlan> = Vec::new();
     let mut button_ids: Vec<String> = Vec::new();
@@ -533,7 +594,7 @@ pub fn marketing_touch_plans(
     let mut out: Vec<ClaimPlan> = payloads;
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
     out.dedup_by(|a, b| a.plan_id == b.plan_id);
-    out
+    Ok(out)
 }
 
 fn collect_strings(v: &Value, keys: &[&str], out: &mut Vec<String>) {
@@ -784,7 +845,7 @@ pub fn fetch_active_plans(
         .into_string()
         .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    let code = business_code(&v).unwrap_or(-1);
     if code != 0 {
         return Err(failure_message(code, &v));
     }
@@ -835,7 +896,16 @@ pub fn collect_claimable_plans(
     device_mid: String,
 ) -> Result<Vec<ClaimPlan>, String> {
     let plans = preview_plans(home, creds, config, Some(device_mid.clone()))?;
-    let extra = marketing_touch_plans(home, creds, config, Some(device_mid));
+    let extra = match marketing_touch_plans_checked(home, creds, config, Some(device_mid)) {
+        Ok(plans) => plans,
+        // 风控必须上抛：准备阶段据此中止（不开验证码、不提交）。
+        Err(error) if crate::risk::is_risk_signal(&error) => return Err(error),
+        // 其他 marketing 失败照旧静默：本地列表不决定最终资格（beta.11 约定）。
+        Err(detail) => {
+            flowlog::log("claim", "marketing-fail", &detail);
+            Vec::new()
+        }
+    };
     Ok(merge_marketing_plans(plans, extra))
 }
 
@@ -861,17 +931,66 @@ pub fn submit_claim(
     if let Some(r) = captcha_region.filter(|r| !r.trim().is_empty()) {
         req = req.set("X-Aliyun-Captcha-Verify-Region", r.trim());
     }
-    let resp = req
-        .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| classify_claim_http_err(&crate::i18n::tr("err.claim.claim_req"), e))?
-        .into_string()
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: crate::i18n::trf("err.http.read", &[("e", &e.to_string())]),
-            next_at: None,
-        })?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    let sent = req.send_json(serde_json::json!({ "plan_id": plan_id }));
+    let response = match sent {
+        Ok(response) => response,
+        // 分类规则：
+        // - 401/403 且带验证码挑战特征 = 人机校验，不是登录失效（challenge，确定失败）；
+        // - 响应体里有业务码时保留它（terminal / nextAt 都来自业务码）；
+        // - 4xx 是确定的客户端拒绝；5xx、传输/读取失败说明 POST 可能已被服务端处理 → unknown。
+        Err(ureq::Error::Status(status, response)) => {
+            let challenged = response.header("x-aliyun-captcha-verify-param").is_some();
+            let body = response.into_string().unwrap_or_default();
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let server_msg = ["msg", "message", "error"]
+                .iter()
+                .find_map(|k| value.get(k).and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or_default();
+            if (401..=403).contains(&status)
+                && (challenged || body.to_lowercase().contains("captcha"))
+            {
+                return Err(ClaimError {
+                    code: CLAIM_ERR_CHALLENGE,
+                    message: crate::i18n::tr("claim.fail.challenge"),
+                    next_at: None,
+                    unknown: false,
+                });
+            }
+            if let Some(code) = business_code(&value).filter(|c| *c != 0) {
+                let mut error = claim_error(code, &value);
+                // 5xx 即使带业务码，也不能断言请求没生效。
+                error.unknown = status >= 500;
+                return Err(error);
+            }
+            let message = format!(
+                "{} HTTP {status}: {server_msg}",
+                crate::i18n::tr("err.claim.claim_req")
+            );
+            return Err(ClaimError {
+                code: -1,
+                message,
+                next_at: None,
+                unknown: status >= 500,
+            });
+        }
+        Err(error) => {
+            return Err(unknown_claim_error(http_err(
+                &crate::i18n::tr("err.claim.claim_req"),
+                error,
+            )))
+        }
+    };
+    let resp = response.into_string().map_err(|error| {
+        unknown_claim_error(crate::i18n::trf("err.http.read", &[("e", &error.to_string())]))
+    })?;
+    let v: Value = match serde_json::from_str(&resp) {
+        Ok(value) => value,
+        Err(_) => return Err(unknown_claim_error(crate::i18n::tr("err.claim.claim_req"))),
+    };
+    // 有效 JSON 但缺业务码/业务码不可识别：无法判断结果，按 unknown 保守处理。
+    let Some(code) = business_code(&v) else {
+        return Err(unknown_claim_error(crate::i18n::tr("err.claim.claim_req")));
+    };
     if code != 0 {
         return Err(claim_error(code, &v));
     }
@@ -882,21 +1001,27 @@ static CAPTCHA_CONFIG_CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::In
     std::sync::OnceLock::new();
 const CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
-    // 缓存 600s（上游配置低频变化）；失败回退上次成功值，再无则内置默认，
-    // 保证领取流程不因配置接口抖动而中断。
+/// 带错版本：明确失败（含风控）直接返回错误，供领取准备阶段判断是否中止。
+pub fn fetch_captcha_config_checked() -> Result<CaptchaConfig, String> {
     let cache = CAPTCHA_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - CONFIG_TTL, None)));
     let mut slot = cache.lock().unwrap_or_else(|p| p.into_inner());
     if slot.1.is_some() && slot.0.elapsed() < CONFIG_TTL {
         return Ok(slot.1.clone().unwrap());
     }
-    match fetch_captcha_config_remote() {
-        Ok(cfg) => {
-            *slot = (std::time::Instant::now(), Some(cfg.clone()));
-            Ok(cfg)
-        }
+    let cfg = fetch_captcha_config_remote()?;
+    *slot = (std::time::Instant::now(), Some(cfg.clone()));
+    Ok(cfg)
+}
+
+pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
+    // 缓存 600s（上游配置低频变化）；失败回退上次成功值，再无则内置默认，
+    // 保证领取流程不因配置接口抖动而中断。
+    match fetch_captcha_config_checked() {
+        Ok(cfg) => Ok(cfg),
         Err(e) => {
             flowlog::log("claim", "captcha-config-fail", &e);
+            let cache = CAPTCHA_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - CONFIG_TTL, None)));
+            let mut slot = cache.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(cfg) = &slot.1 {
                 return Ok(cfg.clone());
             }
@@ -926,6 +1051,18 @@ pub fn reset_captcha_config_cache_for_tests() {
     }
 }
 
+/// 仅供测试：清空领取/活动请求的版本保鲜缓存（changelog 与探测值都会影响结果）。
+#[doc(hidden)]
+pub fn reset_app_version_cache_for_tests() {
+    quota::reset_app_version_cache_for_tests();
+}
+
+/// 仅供测试：OAuth 登录协议使用的固定版本（必须与领取/活动版本保鲜隔离）。
+#[doc(hidden)]
+pub fn oauth_probe_version_for_tests() -> String {
+    quota::CLIENT_APP_VERSION.to_string()
+}
+
 fn fetch_captcha_config_remote() -> Result<CaptchaConfig, String> {
     let mut req = agent().get(&client_configs_url());
     for (k, v) in quota::zai_billing_headers("") {
@@ -933,12 +1070,14 @@ fn fetch_captcha_config_remote() -> Result<CaptchaConfig, String> {
     }
     let resp = req
         .call()
-        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
+        .map_err(|e| http_err(&crate::i18n::tr("err.claim.config_req"), e))?
         .into_string()
         .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
-        return Err(crate::i18n::tr("err.claim.config_unavailable"));
+    let code = business_code(&v).unwrap_or(-1);
+    if code != 0 {
+        // 保留业务码与上游原因：风控（含嵌套 provider_code=3012）要能被调用方识别。
+        return Err(failure_message(code, &v));
     }
     let c = v.pointer("/data/configs/captcha").cloned().unwrap_or(Value::Null);
     let s = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
@@ -1041,6 +1180,10 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         .iter()
         .find_map(|k| body.get(k).and_then(|x| x.as_str()).map(String::from))
         .unwrap_or_default();
+    let known = matches!(
+        code,
+        1001 | 1002 | 1003 | 1004 | 1005 | 3001 | 3007 | 401
+    );
     let base = crate::i18n::tr(match code {
         1001 => "claim.fail.1001",
         1002 => "claim.fail.1002",
@@ -1052,6 +1195,13 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         401 => "claim.fail.401",
         _ => "claim.fail.generic",
     });
+    // 未映射的业务码（3012 风控、上游新增码）必须原样带出：冷却状态机与界面提示
+    // 都靠它判断，不能只剩一句通用文案。
+    let base = if known || code <= 0 {
+        base
+    } else {
+        format!("{base} (code {code})")
+    };
     if server_msg.is_empty() {
         base
     } else {
