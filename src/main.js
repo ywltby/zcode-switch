@@ -9,6 +9,7 @@ import { createQuotaScheduler } from "./refresh-scheduler.js";
 import { createClaimFlow, parseScopeError } from "./claim-flow.js";
 import { createClaimQueue } from "./claim-queue.js";
 import { createRequestQueue } from "./request-queue.js";
+import { createStalePreview } from "./stale-preview.js";
 import {
   cancelAttempt,
   closeWaiter,
@@ -50,6 +51,7 @@ let appVer = "";
 let acctQuota = {};
 let stateSequence = 0;
 let claimable = {};
+let stalePreview = null;
 let claimedState = {};
 let claimAllRunning = false;
 let claimAttempts = createClaimAttempts();
@@ -210,6 +212,13 @@ let lastAutoRound = null;
 let autoToggleBusy = false;
 
 const REQ_TIMEOUT_MS = 60_000;
+// claim_refresh 单次最多 2×10s（激活上报）+ 25s（preview）+ 25s（marketing）：
+// 看门狗必须长于它，否则正常的长请求会被误判；但只要它不生效，一轮卡住就会让
+// busy 与 autoScanRunning 永久为真，之后每轮扫描都被 busy 直接跳过。
+const CLAIM_CMD_TIMEOUT_MS = 120_000;
+// 队列是领取与额度共用的三槽位：请求可能长时间排不上，这段等待也要有上限，
+// 否则「排队中」既不会触发执行期看门狗，也不释放 busy。
+const CLAIM_QUEUE_TIMEOUT_MS = 240_000;
 
 // 前端异常落盘：界面冻结时用户看不到 DevTools，问题必须可回传
 function logClientError(msg) {
@@ -440,8 +449,10 @@ const quotaScheduler = createQuotaScheduler({
 });
 
 const claimFlow = createClaimFlow({
-  invoke,
+  invoke: (cmd, args) => invokeWithTimeout(cmd, args, CLAIM_CMD_TIMEOUT_MS),
   queue: requestQueue,
+  timeoutMs: CLAIM_QUEUE_TIMEOUT_MS,
+  timeoutText: () => t("m.refreshTimeout"),
   errorText: (error) => stripErr(error),
   refreshState: () => refresh(),
   isLive: (id) => id === LIVE_CLAIM_ID,
@@ -458,8 +469,13 @@ const claimFlow = createClaimFlow({
     }
     offerClaimResult(result);
   },
+  // 后台重查（quiet）只更新归属快照，不进入领取队列。
+  onQuietResult: (result) => {
+    if (result.id === LIVE_CLAIM_ID) liveClaimView.hash = result.liveHash || liveClaimHash;
+  },
   onChange: () => {
     claimable = claimFlow.entries();
+    stalePreview?.sync(claimable);
     syncLiveClaimRevision();
     noteLiveBusy();
     if (!uiLocked()) render();
@@ -1614,6 +1630,31 @@ async function autoClaimTick() {
     autoScanRunning = false;
     lastAutoRound = { ...round, at: Date.now() };
     if (!uiLocked()) render();
+  }
+}
+
+/// 错误行的低频重读：与「自动领取」开关解耦。开关关闭时原本没有任何周期性资格读取，
+/// 一条失败的 preview 会一直挂在界面上；这里只重读已经报错的行，并对连续失败退避，
+/// 避免把上游限流撞得更久。开关打开时由 autoClaimTick 全量扫描，这里不再重复请求。
+// 注意：stalePreview 在文件顶部声明为 let，此处才赋值——claimFlow 的 onChange 可能
+// 在模块初始化期间触发，那时这里还没有执行。
+stalePreview = createStalePreview({ max: 3 });
+
+async function stalePreviewTick() {
+  if (!state || state.auto_claim) return;
+  if (claimActive || claimAllRunning || refreshClaim.running || autoClaimRunning || autoScanRunning) return;
+  if (claimRecoveryReady && claimRecovery.ok === false) return;
+  const now = Date.now();
+  stalePreview.prime(claimable, { now });
+  const ids = stalePreview.targets(claimable, {
+    now,
+    eligible: (id) => !claimFlow.busy(id)
+      && (id === LIVE_CLAIM_ID || (state.accounts || []).some((a) => a.id === id)),
+  });
+  for (const id of ids) {
+    // quiet：只更新这一行的资格显示，绝不复用会入队领取的结果处理。
+    const outcome = await claimFlow.preview(id, { quiet: true }).catch(() => ({ status: "failed" }));
+    stalePreview.settle(id, outcome?.status === "ok", Date.now());
   }
 }
 
@@ -2853,6 +2894,9 @@ function sweepTick() {
     setInterval(sweepTick, SWEEP_TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
     setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
+    // 错误行重读：tick 很密（纯内存判定），真正的请求受 30m 起始退避限制。
+    setTimeout(stalePreviewTick, 2 * 60_000);
+    setInterval(stalePreviewTick, 5 * 60_000);
     // 到点自动领取：每分钟检查「已到点且未领」的活动（无目标时不发任何请求）
     setTimeout(effectiveClaimTick, 30_000);
     setInterval(effectiveClaimTick, 60_000);
