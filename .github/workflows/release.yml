@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -27,6 +36,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Linux system deps
         if: runner.os == 'Linux'
@@ -55,7 +66,7 @@ jobs:
         id: notes
         shell: bash
         run: |
-          f="docs/releases/${GITHUB_REF_NAME}.md"
+          f="docs/releases/${RELEASE_TAG}.md"
           {
             echo 'body<<ZSW_NOTES_EOF'
             if [ -f "$f" ]; then tail -n +2 "$f"; echo; echo '---'; echo; fi
@@ -67,8 +78,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Z·SWITCH ${{ github.ref_name }}'
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: 'Z·SWITCH ${{ inputs.tag || github.ref_name }}'
           releaseBody: |
             ${{ steps.notes.outputs.body }}
             见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。
@@ -87,7 +98,7 @@ jobs:
 
             SHA-256 校验和见各 `checksums-*.txt`。
           releaseDraft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           args: --bundles ${{ matrix.bundles }} ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
 
       - name: Upload portable exe + checksums (windows)
@@ -96,11 +107,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VER="${GITHUB_REF_NAME#v}"
+          VER="${RELEASE_TAG#v}"
           cp "src-tauri/target/release/zcode-switch.exe" "zcode-switch_${VER}_portable.exe"
           SETUP=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -1)
-          sha256sum "zcode-switch_${VER}_portable.exe" "$SETUP" | sed 's| .*/| |' > "checksums-Windows-${GITHUB_REF_NAME}.txt"
-          gh release upload "$GITHUB_REF_NAME" "zcode-switch_${VER}_portable.exe" "checksums-Windows-${GITHUB_REF_NAME}.txt" --clobber
+          sha256sum "zcode-switch_${VER}_portable.exe" "$SETUP" | sed 's| .*/| |' > "checksums-Windows-${RELEASE_TAG}.txt"
+          gh release upload "$RELEASE_TAG" "zcode-switch_${VER}_portable.exe" "checksums-Windows-${RELEASE_TAG}.txt" --clobber
 
       - name: Upload checksums
         if: runner.os != 'Windows'
@@ -111,5 +122,5 @@ jobs:
           TGT="${{ matrix.rust_target }}"
           [ -n "$TGT" ] || TGT="native"
           find src-tauri/target -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) \
-            | xargs sha256sum | sed 's| .*/| |' > "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt"
-          gh release upload "$GITHUB_REF_NAME" "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt" --clobber
+            | xargs sha256sum | sed 's| .*/| |' > "checksums-${RUNNER_OS}-${TGT}-${RELEASE_TAG}.txt"
+          gh release upload "$RELEASE_TAG" "checksums-${RUNNER_OS}-${TGT}-${RELEASE_TAG}.txt" --clobber

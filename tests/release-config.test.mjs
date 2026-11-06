@@ -11,7 +11,7 @@ const prereleaseRule = yml.match(/^\s*prerelease:\s*(.+)$/m)?.[1]?.trim() ?? "";
 const isPrerelease = (tag) => tag.includes("-");
 
 test("release workflow uses the pre-merge prerelease rule", () => {
-  assert.equal(prereleaseRule, "${{ contains(github.ref_name, '-') }}");
+  assert.equal(prereleaseRule, "${{ contains(inputs.tag || github.ref_name, '-') }}");
 });
 
 test("beta, rc and final tags map to the expected release state", () => {
@@ -31,6 +31,6 @@ test("foreign release identity is gone and the project notes are back", () => {
 });
 
 test("release body pulls the per-version notes from docs/releases", () => {
-  assert.ok(yml.includes('docs/releases/${GITHUB_REF_NAME}.md'), "按标签读取本版说明");
+  assert.ok(yml.includes('docs/releases/${RELEASE_TAG}.md'), "按标签读取本版说明");
   assert.ok(yml.includes("${{ steps.notes.outputs.body }}"), "说明注入到 releaseBody");
 });
